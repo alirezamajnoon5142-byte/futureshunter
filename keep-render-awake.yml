@@ -1,0 +1,29 @@
+name: Keep FuturesHunter Awake
+
+on:
+  schedule:
+    # Every 5 minutes, offset from the top of the hour.
+    - cron: '3-58/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping FuturesHunter health endpoint
+        shell: bash
+        run: |
+          URL="https://futureshunter-v66.onrender.com/health"
+          for attempt in 1 2 3; do
+            echo "Ping attempt $attempt..."
+            if curl --fail --silent --show-error --max-time 70 "$URL"; then
+              echo
+              echo "FuturesHunter is awake."
+              exit 0
+            fi
+            sleep 20
+          done
+
+          echo "Health endpoint did not respond successfully."
+          exit 1
