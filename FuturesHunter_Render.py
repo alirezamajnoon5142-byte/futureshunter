@@ -5,7 +5,13 @@ import json
 import os
 import time
 import threading
-from datetime import datetime
+import hashlib
+import re
+import xml.etree.ElementTree as ET
+import html as html_lib
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -24,7 +30,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # admin / original subscriber
-WEBSITE_URL = os.getenv("WEBSITE_URL", "https://xautguard-hq5ehhqr.manus.space/")
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://futureshunter-v66.onrender.com")
 
 
 # ============================================================
@@ -4305,7 +4311,7 @@ def telegram_status_message():
 
     focus = ", ".join(sorted(FOCUS_SYMBOLS)) or "none"
     return (
-        "✅ FuturesHunter V6.6 is online.\n\n"
+        "✅ FuturesHunter V6.7 MacroHunter is online.\n\n"
         f"Subscribers: {subscriber_count}\n"
         f"Base universe: top {TOP_N} liquid contracts\n"
         f"Focus: {focus}\n"
@@ -4808,7 +4814,7 @@ def run_full_scan(symbols, details, oi_metrics):
 async def main():
     print()
     print("=" * 90)
-    print("MEXC FUTURES HUNTER V6.6 — ADAPTIVE 50 FACTORS")
+    print("MEXC FUTURES HUNTER V6.7 — MACRO + ADAPTIVE 50 FACTORS")
     print("=" * 90)
 
     print()
@@ -4846,10 +4852,10 @@ async def main():
     print("Press Ctrl+C to stop.")
 
     send_telegram(
-        "✅ FuturesHunter V6.6 is online.\n\n"
+        "✅ FuturesHunter V6.7 MacroHunter is online.\n\n"
         "Weighted 50-factor scoring + breakout mode + "
-        "WATCH/ARMED/ENTRY + shadow-rejection tracking active.\n\n"
-        "Try /watch or /why ZEC."
+        "WATCH/ARMED/ENTRY + macro/crypto-news risk layer + shadow tracking active.\n\n"
+        "Try /macro, /news, /calendar, /watch or /why ZEC."
     )
 
     next_full_scan = 0
@@ -4920,6 +4926,1075 @@ async def main():
 
 
 # ============================================================
+# V6.7 MACRO + CRYPTO NEWS INTELLIGENCE
+# ============================================================
+#
+# Purpose:
+# - monitor macro / central-bank / economic-release headlines
+# - monitor crypto-specific headlines and exchange incidents
+# - maintain a lightweight high-impact economic calendar
+# - classify headlines with transparent deterministic rules
+# - use macro as a RISK / CONFIRMATION layer, never as a standalone entry trigger
+# - expose /macro /news /calendar /risk /sources in Telegram
+#
+# This is intentionally lightweight so it can run on Render Free without
+# a paid LLM/API.  Failed news sources fail open and never stop the scanner.
+
+V67_VERSION = "6.7"
+NEWS_REFRESH_SECONDS = int(os.getenv("NEWS_REFRESH_SECONDS", "180"))
+NEWS_LOOKBACK_HOURS = float(os.getenv("NEWS_LOOKBACK_HOURS", "8"))
+NEWS_MAX_ITEMS = int(os.getenv("NEWS_MAX_ITEMS", "80"))
+NEWS_ALERT_MIN_IMPACT = int(os.getenv("NEWS_ALERT_MIN_IMPACT", "3"))
+NEWS_ALERT_COOLDOWN = int(os.getenv("NEWS_ALERT_COOLDOWN", "600"))
+CALENDAR_URL = os.getenv(
+    "ECON_CALENDAR_URL",
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+)
+
+MACRO_NEWS_FILE = BASE_DIR / "macro_news_v67.json"
+MACRO_RUNTIME_FILE = BASE_DIR / "macro_runtime_v67.json"
+MACRO_LOCK = threading.RLock()
+NEWS_SESSION = requests.Session()
+NEWS_SESSION.headers.update({
+    "User-Agent": (
+        "FuturesHunter/6.7 (+market-risk-monitor; "
+        "contact=local-render-service)"
+    )
+})
+
+# Official feeds first; crypto media feeds are supplemental.
+V67_RSS_SOURCES = [
+    {
+        "name": "Federal Reserve Monetary Policy",
+        "url": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+        "kind": "macro",
+        "priority": 1.30,
+    },
+    {
+        "name": "Federal Reserve Speeches",
+        "url": "https://www.federalreserve.gov/feeds/speeches.xml",
+        "kind": "macro",
+        "priority": 1.10,
+    },
+    {
+        "name": "US BLS",
+        "url": "https://www.bls.gov/feed/bls_latest.rss",
+        "kind": "macro",
+        "priority": 1.25,
+    },
+    {
+        "name": "ECB",
+        "url": "https://www.ecb.europa.eu/rss/press.html",
+        "kind": "macro",
+        "priority": 1.25,
+    },
+    {
+        "name": "Bank of England",
+        "url": "https://www.bankofengland.co.uk/rss/news",
+        "kind": "macro",
+        "priority": 1.20,
+    },
+    {
+        "name": "Coinbase Blog",
+        "url": "https://www.coinbase.com/blog/rss.xml",
+        "kind": "crypto",
+        "priority": 1.10,
+    },
+    {
+        "name": "Coinbase Status",
+        "url": "https://status.coinbase.com/history.rss",
+        "kind": "crypto",
+        "priority": 1.25,
+    },
+    {
+        "name": "CoinDesk",
+        "url": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "kind": "crypto",
+        "priority": 0.95,
+    },
+    {
+        "name": "Cointelegraph",
+        "url": "https://cointelegraph.com/rss",
+        "kind": "crypto",
+        "priority": 0.90,
+    },
+    {
+        "name": "Decrypt",
+        "url": "https://decrypt.co/feed",
+        "kind": "crypto",
+        "priority": 0.90,
+    },
+]
+
+# Additional RSS feeds can be supplied from Render as comma-separated URLs.
+for _extra_url in os.getenv("NEWS_SOURCES_EXTRA", "").split(","):
+    _extra_url = _extra_url.strip()
+    if _extra_url:
+        V67_RSS_SOURCES.append({
+            "name": urlparse(_extra_url).netloc or "Extra source",
+            "url": _extra_url,
+            "kind": "crypto",
+            "priority": 0.80,
+        })
+
+# GDELT is used as a free broad-news discovery layer, including coverage that
+# mentions CoinGecko, Cryptonary, Coinbase, BoJ and other sources/entities.
+V67_GDELT_QUERIES = [
+    {
+        "name": "GDELT Macro",
+        "kind": "macro",
+        "priority": 0.85,
+        "query": (
+            '("Federal Reserve" OR FOMC OR "Bank of Japan" OR BOJ OR ECB OR '
+            '"Bank of England" OR CPI OR inflation OR payrolls OR PCE OR '
+            'tariffs OR sanctions OR "bond yields" OR recession)'
+        ),
+    },
+    {
+        "name": "GDELT Crypto",
+        "kind": "crypto",
+        "priority": 0.82,
+        "query": (
+            '(bitcoin OR ethereum OR cryptocurrency OR crypto OR stablecoin OR '
+            'Coinbase OR CoinGecko OR Cryptonary OR Binance OR MEXC OR '
+            '"spot ETF" OR hack OR exploit OR liquidation)'
+        ),
+    },
+    {
+        "name": "GDELT CoinGecko/Cryptonary/Coinbase",
+        "kind": "crypto",
+        "priority": 0.88,
+        "query": (
+            '(domain:coingecko.com OR domain:cryptonary.com OR domain:coinbase.com)'
+        ),
+    },
+]
+
+# Deterministic headline language. Positive = broadly risk-on / crypto-positive;
+# negative = broadly risk-off / crypto-negative. Macro is never allowed to
+# create a technical entry on its own.
+V67_MACRO_PHRASES = {
+    "rate cut": 12,
+    "cuts rates": 12,
+    "cut rates": 10,
+    "dovish": 9,
+    "quantitative easing": 12,
+    "stimulus": 8,
+    "liquidity injection": 9,
+    "easing": 6,
+    "inflation cools": 7,
+    "inflation falls": 7,
+    "cpi falls": 7,
+    "soft landing": 5,
+    "ceasefire": 6,
+    "rate hike": -12,
+    "hikes rates": -12,
+    "hike rates": -10,
+    "hawkish": -9,
+    "higher for longer": -10,
+    "quantitative tightening": -8,
+    "inflation accelerates": -8,
+    "inflation rises": -7,
+    "hotter than expected": -7,
+    "tariff": -5,
+    "sanctions": -6,
+    "war": -7,
+    "attack": -7,
+    "missile": -7,
+    "recession": -6,
+    "bank failure": -10,
+    "banking crisis": -11,
+    "emergency meeting": -8,
+}
+
+V67_CRYPTO_PHRASES = {
+    "etf approved": 13,
+    "etf approval": 13,
+    "spot etf approval": 14,
+    "record inflows": 9,
+    "institutional adoption": 8,
+    "strategic reserve": 9,
+    "crypto reserve": 9,
+    "buys bitcoin": 7,
+    "bitcoin purchase": 6,
+    "network upgrade": 4,
+    "partnership": 3,
+    "listing": 3,
+    "hack": -14,
+    "hacked": -14,
+    "exploit": -13,
+    "security breach": -13,
+    "outage": -9,
+    "withdrawals halted": -12,
+    "withdrawal suspended": -12,
+    "insolvency": -15,
+    "bankruptcy": -14,
+    "liquidation cascade": -10,
+    "mass liquidations": -9,
+    "delisting": -7,
+    "delist": -6,
+    "ban crypto": -12,
+    "crypto ban": -12,
+    "lawsuit": -7,
+    "enforcement action": -8,
+    "sec charges": -8,
+    "fraud": -9,
+    "rug pull": -12,
+}
+
+V67_HIGH_IMPACT_TERMS = (
+    "fomc", "federal reserve", "fed chair", "powell", "interest rate",
+    "rate decision", "bank of japan", "boj", "ecb", "bank of england",
+    "cpi", "consumer price index", "pce", "payroll", "nonfarm",
+    "unemployment", "gdp", "inflation", "emergency", "war", "attack",
+    "hack", "exploit", "security breach", "outage", "etf approved",
+    "etf approval", "insolvency", "bankruptcy", "sanctions",
+)
+
+V67_CENTRAL_BANK_TERMS = (
+    "federal reserve", "fomc", "fed chair", "powell",
+    "bank of japan", "boj", "ecb", "european central bank",
+    "bank of england", "boe", "interest rate", "policy rate",
+)
+
+V67_RELEVANT_CALENDAR_CURRENCIES = {
+    item.strip().upper()
+    for item in os.getenv("MACRO_CURRENCIES", "USD,JPY,EUR,GBP,CNY").split(",")
+    if item.strip()
+}
+
+# In-memory snapshot.  The news thread mutates it under MACRO_LOCK.
+MACRO_STATE = {
+    "updated_at": 0.0,
+    "macro_score": 0.0,
+    "crypto_score": 0.0,
+    "combined_score": 0.0,
+    "regime": "NEUTRAL",
+    "confidence": 0,
+    "event_risk": "LOW",
+    "headlines": [],
+    "upcoming_events": [],
+    "source_status": {},
+    "market_reaction": 0.0,
+    "market_reaction_text": "WAITING FOR MARKET DATA",
+    "last_error": None,
+}
+
+
+def _strip_html(value):
+    value = html_lib.unescape(str(value or ""))
+    value = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _parse_news_time(value):
+    if not value:
+        return time.time()
+
+    text = str(value).strip()
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        pass
+
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return time.time()
+
+
+def _entry_child_text(node, local_names):
+    wanted = {name.lower() for name in local_names}
+    for child in list(node):
+        local = child.tag.split("}")[-1].lower()
+        if local in wanted and child.text:
+            return child.text.strip()
+    return ""
+
+
+def _entry_link(node):
+    for child in list(node):
+        local = child.tag.split("}")[-1].lower()
+        if local != "link":
+            continue
+        href = child.attrib.get("href")
+        if href:
+            return href.strip()
+        if child.text:
+            return child.text.strip()
+    return ""
+
+
+def _fetch_rss_source(source):
+    response = NEWS_SESSION.get(source["url"], timeout=14)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    items = []
+
+    for node in root.iter():
+        local = node.tag.split("}")[-1].lower()
+        if local not in {"item", "entry"}:
+            continue
+
+        title = _strip_html(_entry_child_text(node, {"title"}))
+        if not title:
+            continue
+
+        summary = _strip_html(
+            _entry_child_text(node, {"description", "summary", "content"})
+        )
+        published = _entry_child_text(
+            node,
+            {"pubdate", "published", "updated", "date"},
+        )
+        link = _entry_link(node)
+
+        items.append({
+            "title": title,
+            "summary": summary[:700],
+            "link": link,
+            "source": source["name"],
+            "kind": source["kind"],
+            "priority": source["priority"],
+            "published_ts": _parse_news_time(published),
+        })
+
+        if len(items) >= 12:
+            break
+
+    return items
+
+
+def _fetch_gdelt_source(source):
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {
+        "query": source["query"],
+        "mode": "ArtList",
+        "maxrecords": 35,
+        "format": "json",
+        "sort": "HybridRel",
+        "formatdatetime": "true",
+    }
+    response = NEWS_SESSION.get(url, params=params, timeout=18)
+    response.raise_for_status()
+    payload = response.json()
+    articles = payload.get("articles", []) if isinstance(payload, dict) else []
+
+    items = []
+    for article in articles[:35]:
+        if not isinstance(article, dict):
+            continue
+        title = _strip_html(article.get("title"))
+        if not title:
+            continue
+        domain = article.get("domain") or urlparse(article.get("url", "")).netloc
+        source_name = domain or source["name"]
+        items.append({
+            "title": title,
+            "summary": "",
+            "link": article.get("url", ""),
+            "source": source_name,
+            "source_group": source["name"],
+            "kind": source["kind"],
+            "priority": source["priority"],
+            "published_ts": _parse_news_time(
+                article.get("seendate") or article.get("date")
+            ),
+        })
+    return items
+
+
+def _headline_key(item):
+    raw = f"{item.get('title','')}|{item.get('link','')}".lower().encode(
+        "utf-8", errors="ignore"
+    )
+    return hashlib.sha1(raw).hexdigest()[:20]
+
+
+def _classify_headline(item):
+    text = (
+        f"{item.get('title','')} {item.get('summary','')} "
+        f"{item.get('source','')}"
+    ).lower()
+
+    macro_raw = 0
+    crypto_raw = 0
+    matched = []
+
+    for phrase, value in V67_MACRO_PHRASES.items():
+        if phrase in text:
+            macro_raw += value
+            matched.append(phrase)
+
+    for phrase, value in V67_CRYPTO_PHRASES.items():
+        if phrase in text:
+            crypto_raw += value
+            matched.append(phrase)
+
+    # Source/topic context gets influence but no forced directional opinion.
+    is_central_bank = any(term in text for term in V67_CENTRAL_BANK_TERMS)
+    is_high_impact = any(term in text for term in V67_HIGH_IMPACT_TERMS)
+
+    impact = 1
+    max_abs = max(abs(macro_raw), abs(crypto_raw))
+    if max_abs >= 12 or (is_central_bank and is_high_impact):
+        impact = 3
+    elif max_abs >= 6 or is_high_impact:
+        impact = 2
+
+    if "unexpected" in text or "surprise" in text or "emergency" in text:
+        impact = 3
+
+    # Coinbase status incidents deserve extra attention even if the title is terse.
+    if "coinbase status" in item.get("source", "").lower():
+        if any(word in text for word in ("incident", "degraded", "outage", "delayed")):
+            crypto_raw -= 8
+            impact = max(impact, 3)
+
+    return {
+        "macro_raw": macro_raw,
+        "crypto_raw": crypto_raw,
+        "impact": impact,
+        "matched": matched[:8],
+        "central_bank": is_central_bank,
+    }
+
+
+def _dedupe_news(items):
+    best = {}
+    for item in items:
+        key = _headline_key(item)
+        item["key"] = key
+        previous = best.get(key)
+        if previous is None or num(item.get("priority")) > num(previous.get("priority")):
+            best[key] = item
+    return list(best.values())
+
+
+def _fetch_calendar():
+    try:
+        response = NEWS_SESSION.get(CALENDAR_URL, timeout=14)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            return [], "unexpected calendar format"
+
+        events = []
+        now_ts = time.time()
+        for event in payload:
+            if not isinstance(event, dict):
+                continue
+
+            currency = str(
+                event.get("country")
+                or event.get("currency")
+                or ""
+            ).upper().strip()
+            impact = str(event.get("impact") or "").strip().lower()
+            title = str(event.get("title") or event.get("event") or "").strip()
+            if not title:
+                continue
+            if currency and currency not in V67_RELEVANT_CALENDAR_CURRENCIES:
+                continue
+            if impact not in {"high", "medium"}:
+                continue
+
+            event_ts = _parse_news_time(event.get("date") or event.get("datetime"))
+            minutes = (event_ts - now_ts) / 60.0
+            if -45 <= minutes <= 24 * 60:
+                events.append({
+                    "title": title,
+                    "currency": currency or "GLOBAL",
+                    "impact": impact.upper(),
+                    "event_ts": event_ts,
+                    "minutes": minutes,
+                    "forecast": event.get("forecast"),
+                    "previous": event.get("previous"),
+                })
+
+        events.sort(key=lambda item: item["event_ts"])
+        return events[:20], None
+    except Exception as error:
+        return [], str(error)
+
+
+def _age_decay(age_hours):
+    # News loses most influence after a few hours; official event headlines still
+    # remain visible in /news even when their score contribution has decayed.
+    if age_hours <= 0.5:
+        return 1.0
+    if age_hours <= 2:
+        return 0.80
+    if age_hours <= 4:
+        return 0.55
+    if age_hours <= 8:
+        return 0.30
+    return 0.10
+
+
+def _derive_macro_state(items, upcoming_events):
+    now_ts = time.time()
+    macro_total = 0.0
+    crypto_total = 0.0
+    evidence = 0.0
+    recent_count = 0
+
+    for item in items:
+        age_hours = max(0.0, (now_ts - num(item.get("published_ts"))) / 3600.0)
+        if age_hours > NEWS_LOOKBACK_HOURS:
+            continue
+        classification = item.get("classification") or {}
+        decay = _age_decay(age_hours)
+        priority = max(0.5, num(item.get("priority")) or 1.0)
+        impact_weight = 0.65 + 0.25 * num(classification.get("impact", 1))
+        weight = decay * priority * impact_weight
+        macro_total += num(classification.get("macro_raw")) * weight
+        crypto_total += num(classification.get("crypto_raw")) * weight
+        evidence += abs(num(classification.get("macro_raw"))) * weight
+        evidence += abs(num(classification.get("crypto_raw"))) * weight
+        if classification.get("impact", 1) >= 2:
+            recent_count += 1
+
+    macro_score = max(-100.0, min(100.0, macro_total * 1.8))
+    crypto_score = max(-100.0, min(100.0, crypto_total * 1.8))
+    combined = max(-100.0, min(100.0, macro_score * 0.60 + crypto_score * 0.40))
+
+    if combined >= 30:
+        regime = "RISK_ON"
+    elif combined <= -30:
+        regime = "RISK_OFF"
+    elif macro_score * crypto_score < 0 and abs(macro_score) >= 20 and abs(crypto_score) >= 20:
+        regime = "MIXED"
+    else:
+        regime = "NEUTRAL"
+
+    event_risk = "LOW"
+    for event in upcoming_events:
+        minutes = num(event.get("minutes"))
+        impact = str(event.get("impact", "")).upper()
+        if impact == "HIGH" and -15 <= minutes <= 15:
+            event_risk = "EXTREME"
+            break
+        if impact == "HIGH" and -30 <= minutes <= 75:
+            event_risk = "HIGH"
+        elif event_risk == "LOW" and impact == "MEDIUM" and -15 <= minutes <= 45:
+            event_risk = "MEDIUM"
+
+    confidence = min(95, int(25 + min(50, evidence) + min(20, recent_count * 3)))
+    if not items:
+        confidence = 10
+
+    return {
+        "macro_score": round(macro_score, 1),
+        "crypto_score": round(crypto_score, 1),
+        "combined_score": round(combined, 1),
+        "regime": regime,
+        "event_risk": event_risk,
+        "confidence": confidence,
+    }
+
+
+def _format_age(timestamp):
+    seconds = max(0, int(time.time() - num(timestamp)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h"
+
+
+def _news_bias_label(item):
+    cls = item.get("classification") or {}
+    macro = num(cls.get("macro_raw"))
+    crypto = num(cls.get("crypto_raw"))
+    score = macro + crypto
+    if score >= 7:
+        return "🟢 +"
+    if score <= -7:
+        return "🔴 -"
+    return "⚪"
+
+
+def get_macro_snapshot():
+    with MACRO_LOCK:
+        return json.loads(json.dumps(_clean_json_value(MACRO_STATE)))
+
+
+def _update_market_confirmation(oi_metrics):
+    values = []
+    labels = []
+    for symbol in ("BTC_USDT", "ETH_USDT"):
+        metric = oi_metrics.get(symbol, {}) if isinstance(oi_metrics, dict) else {}
+        p5 = metric.get("price5")
+        p15 = metric.get("price15")
+        if p5 is not None:
+            values.append(max(-3.0, min(3.0, num(p5))))
+            labels.append(f"{symbol.split('_')[0]} 5m {num(p5):+.2f}%")
+        elif p15 is not None:
+            values.append(max(-3.0, min(3.0, num(p15) * 0.6)))
+            labels.append(f"{symbol.split('_')[0]} 15m {num(p15):+.2f}%")
+
+    reaction = sum(values) / len(values) if values else 0.0
+    text = ", ".join(labels) if labels else "warming up OI/price history"
+
+    with MACRO_LOCK:
+        MACRO_STATE["market_reaction"] = round(reaction, 3)
+        MACRO_STATE["market_reaction_text"] = text
+
+
+def _macro_gate(result):
+    state = get_macro_snapshot()
+    direction = result.get("direction")
+    event_risk = state.get("event_risk", "LOW")
+    combined = num(state.get("combined_score"))
+    crypto = num(state.get("crypto_score"))
+    reaction = num(state.get("market_reaction"))
+
+    reasons = []
+    action = "ALLOW"
+
+    # Scheduled event risk is the strongest gate because price discovery can be
+    # discontinuous around CPI/rate decisions.  Macro never creates an entry.
+    if event_risk == "EXTREME":
+        action = "BLOCK"
+        reasons.append("high-impact macro event inside the ±15m danger window")
+    elif event_risk == "HIGH":
+        action = "CAUTION"
+        reasons.append("high-impact macro event is close")
+
+    # Strong headline conflict only blocks when BTC/ETH price reaction broadly
+    # confirms the conflict.  This avoids blindly trading headline semantics.
+    long_conflict = direction == "LONG" and (combined <= -42 or crypto <= -50)
+    short_conflict = direction == "SHORT" and (combined >= 42 or crypto >= 50)
+    market_confirms_long_conflict = reaction <= -0.20
+    market_confirms_short_conflict = reaction >= 0.20
+
+    if long_conflict and market_confirms_long_conflict:
+        action = "BLOCK"
+        reasons.append("risk-off news and BTC/ETH reaction conflict with LONG")
+    elif short_conflict and market_confirms_short_conflict:
+        action = "BLOCK"
+        reasons.append("risk-on news and BTC/ETH reaction conflict with SHORT")
+    elif long_conflict or short_conflict:
+        if action != "BLOCK":
+            action = "CAUTION"
+        reasons.append("headline regime conflicts, but market reaction is not confirming")
+
+    return {
+        "action": action,
+        "reasons": reasons,
+        "snapshot": state,
+    }
+
+
+def _build_macro_message():
+    state = get_macro_snapshot()
+    score = num(state.get("combined_score"))
+    arrow = "🟢" if score >= 30 else "🔴" if score <= -30 else "⚪"
+    events = state.get("upcoming_events", [])
+    next_event = None
+    for event in events:
+        if num(event.get("minutes")) >= -15:
+            next_event = event
+            break
+
+    next_text = "No high/medium event found in the next 24h"
+    if next_event:
+        mins = num(next_event.get("minutes"))
+        if mins >= 0:
+            when = f"in {int(mins)}m"
+        else:
+            when = f"{abs(int(mins))}m ago / cooling window"
+        next_text = (
+            f"{next_event.get('currency')} {next_event.get('title')} "
+            f"({next_event.get('impact')}) — {when}"
+        )
+
+    return (
+        "🌍 FUTURESHUNTER V6.7 MACRO\n\n"
+        f"{arrow} Regime: {state.get('regime')}\n"
+        f"Combined macro/crypto bias: {score:+.1f}/100\n"
+        f"Macro score: {num(state.get('macro_score')):+.1f}\n"
+        f"Crypto-news score: {num(state.get('crypto_score')):+.1f}\n"
+        f"Confidence: {int(num(state.get('confidence')))}%\n"
+        f"Event risk: {state.get('event_risk')}\n"
+        f"BTC/ETH reaction: {state.get('market_reaction_text')}\n\n"
+        f"Next event: {next_text}\n\n"
+        "Macro can delay/block an entry; it never creates one by itself."
+    )
+
+
+def _build_news_message(limit=8):
+    state = get_macro_snapshot()
+    headlines = state.get("headlines", [])[:limit]
+    if not headlines:
+        return "📰 No macro/crypto headlines cached yet. The news engine may still be warming up."
+
+    lines = ["📰 FUTURESHUNTER NEWS", ""]
+    for item in headlines:
+        lines.append(
+            f"{_news_bias_label(item)} [{item.get('source')}] "
+            f"{item.get('title')} ({_format_age(item.get('published_ts'))})"
+        )
+    lines.extend([
+        "",
+        "Sources include official central-bank/BLS feeds, Coinbase, crypto media, and GDELT discovery.",
+    ])
+    return "\n".join(lines)
+
+
+def _build_calendar_message(limit=8):
+    state = get_macro_snapshot()
+    events = state.get("upcoming_events", [])[:limit]
+    if not events:
+        return "📅 No relevant high/medium-impact events found in the cached weekly calendar."
+
+    lines = [f"📅 MACRO CALENDAR — risk {state.get('event_risk')}", ""]
+    for event in events:
+        mins = num(event.get("minutes"))
+        if mins >= 0:
+            timing = f"in {int(mins)}m"
+        else:
+            timing = f"{abs(int(mins))}m ago"
+        lines.append(
+            f"• {event.get('currency')} | {event.get('impact')} | "
+            f"{event.get('title')} — {timing}"
+        )
+    return "\n".join(lines)
+
+
+def _build_risk_message():
+    state = get_macro_snapshot()
+    return (
+        "🛡️ FUTURESHUNTER RISK LAYER\n\n"
+        f"Macro regime: {state.get('regime')}\n"
+        f"Event risk: {state.get('event_risk')}\n"
+        f"Combined score: {num(state.get('combined_score')):+.1f}/100\n"
+        f"Market confirmation: {state.get('market_reaction_text')}\n\n"
+        "EXTREME event risk blocks new entries. Strong headline conflict only blocks when "
+        "BTC/ETH price reaction confirms the conflict."
+    )
+
+
+def _build_sources_message():
+    state = get_macro_snapshot()
+    statuses = state.get("source_status", {})
+    if not statuses:
+        return "📡 News sources have not completed the first refresh yet."
+    lines = ["📡 NEWS SOURCE STATUS", ""]
+    for name, info in sorted(statuses.items()):
+        ok = bool(info.get("ok"))
+        icon = "✅" if ok else "⚠️"
+        count = int(num(info.get("count")))
+        suffix = f"{count} items" if ok else str(info.get("error", "failed"))[:80]
+        lines.append(f"{icon} {name}: {suffix}")
+    return "\n".join(lines[:20])
+
+
+def _build_news_alert(item):
+    cls = item.get("classification") or {}
+    bias = _news_bias_label(item)
+    tags = ", ".join(cls.get("matched", [])[:4]) or "high-impact topic"
+    return (
+        "⚡ FUTURESHUNTER NEWS SHOCK\n\n"
+        f"{bias} {item.get('title')}\n"
+        f"Source: {item.get('source')}\n"
+        f"Impact: {int(num(cls.get('impact', 1)))}/3\n"
+        f"Macro impulse: {num(cls.get('macro_raw')):+.0f}\n"
+        f"Crypto impulse: {num(cls.get('crypto_raw')):+.0f}\n"
+        f"Matched: {tags}\n\n"
+        "No trade is created from news alone; technical + price/OI confirmation still required."
+    )
+
+
+def _send_calendar_warnings(events, runtime):
+    now_ts = time.time()
+    sent = runtime.setdefault("calendar_alerts", {})
+    changed = False
+
+    for event in events:
+        if str(event.get("impact", "")).upper() != "HIGH":
+            continue
+        minutes = num(event.get("minutes"))
+        if not (0 <= minutes <= 60):
+            continue
+        bucket = "15" if minutes <= 15 else "60"
+        key = hashlib.sha1(
+            f"{event.get('event_ts')}|{event.get('title')}|{bucket}".encode("utf-8")
+        ).hexdigest()[:18]
+        if sent.get(key):
+            continue
+        message = (
+            "⚠️ MACRO EVENT WARNING\n\n"
+            f"{event.get('currency')} {event.get('title')}\n"
+            f"Impact: {event.get('impact')}\n"
+            f"Expected in ~{max(0, int(minutes))} minutes\n\n"
+            + (
+                "New FuturesHunter entries are gated inside the ±15m danger window."
+                if minutes <= 15
+                else "FuturesHunter is increasing event-risk caution."
+            )
+        )
+        send_telegram(message)
+        sent[key] = now_ts
+        changed = True
+
+    # Trim old alert ids.
+    cutoff = now_ts - 7 * 24 * 3600
+    runtime["calendar_alerts"] = {
+        key: ts for key, ts in sent.items() if num(ts) >= cutoff
+    }
+    return changed
+
+
+def refresh_macro_news(initial=False):
+    all_items = []
+    source_status = {}
+
+    for source in V67_RSS_SOURCES:
+        try:
+            items = _fetch_rss_source(source)
+            all_items.extend(items)
+            source_status[source["name"]] = {"ok": True, "count": len(items)}
+        except Exception as error:
+            source_status[source["name"]] = {
+                "ok": False,
+                "count": 0,
+                "error": str(error)[:160],
+            }
+
+    for source in V67_GDELT_QUERIES:
+        try:
+            items = _fetch_gdelt_source(source)
+            all_items.extend(items)
+            source_status[source["name"]] = {"ok": True, "count": len(items)}
+        except Exception as error:
+            source_status[source["name"]] = {
+                "ok": False,
+                "count": 0,
+                "error": str(error)[:160],
+            }
+
+    items = _dedupe_news(all_items)
+    for item in items:
+        item["classification"] = _classify_headline(item)
+
+    items.sort(key=lambda item: num(item.get("published_ts")), reverse=True)
+    cutoff = time.time() - max(NEWS_LOOKBACK_HOURS * 3600, 2 * 3600)
+    items = [item for item in items if num(item.get("published_ts")) >= cutoff]
+    items = items[:NEWS_MAX_ITEMS]
+
+    events, calendar_error = _fetch_calendar()
+    derived = _derive_macro_state(items, events)
+
+    runtime = load_json(MACRO_RUNTIME_FILE, {})
+    seen = set(runtime.get("seen_news", []))
+    first_success = not bool(runtime.get("initialized"))
+    new_high_impact = []
+
+    for item in items:
+        key = item.get("key")
+        cls = item.get("classification") or {}
+        if key and key not in seen and int(num(cls.get("impact"))) >= NEWS_ALERT_MIN_IMPACT:
+            new_high_impact.append(item)
+        if key:
+            seen.add(key)
+
+    runtime["initialized"] = True
+    runtime["seen_news"] = list(seen)[-1200:]
+    _send_calendar_warnings(events, runtime)
+    save_json(MACRO_RUNTIME_FILE, runtime)
+
+    with MACRO_LOCK:
+        market_reaction = MACRO_STATE.get("market_reaction", 0.0)
+        market_text = MACRO_STATE.get("market_reaction_text", "WAITING FOR MARKET DATA")
+        MACRO_STATE.update(derived)
+        MACRO_STATE["updated_at"] = time.time()
+        MACRO_STATE["headlines"] = items
+        MACRO_STATE["upcoming_events"] = events
+        MACRO_STATE["source_status"] = source_status
+        MACRO_STATE["market_reaction"] = market_reaction
+        MACRO_STATE["market_reaction_text"] = market_text
+        MACRO_STATE["last_error"] = calendar_error
+
+    save_json(MACRO_NEWS_FILE, get_macro_snapshot())
+
+    # Do not dump old headlines into Telegram on first startup.  Subsequent
+    # genuinely new high-impact items can alert, capped to avoid spam.
+    if not initial and not first_success:
+        for item in new_high_impact[:3]:
+            send_telegram(_build_news_alert(item))
+
+    print(
+        f"Macro/news refresh: {derived['regime']} "
+        f"{derived['combined_score']:+.1f}, event risk {derived['event_risk']}, "
+        f"{len(items)} recent headlines, {len(events)} calendar events"
+    )
+    return get_macro_snapshot()
+
+
+def macro_news_loop():
+    # Initial baseline prevents a flood of historical headlines.
+    try:
+        refresh_macro_news(initial=True)
+    except Exception as error:
+        print(f"Initial macro/news refresh error: {error}")
+
+    while True:
+        time.sleep(max(60, NEWS_REFRESH_SECONDS))
+        try:
+            refresh_macro_news(initial=False)
+        except Exception as error:
+            print(f"Macro/news refresh error: {error}")
+            with MACRO_LOCK:
+                MACRO_STATE["last_error"] = str(error)[:200]
+
+
+def start_macro_news_thread():
+    thread = threading.Thread(
+        target=macro_news_loop,
+        name="FuturesHunterMacroNews",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+# -------------------- V6.7 wrappers around V6.6 --------------------
+
+_V66_HANDLE_TELEGRAM_COMMAND = handle_telegram_command
+_V66_BUILD_ALERT_MESSAGE = build_alert_message
+_V66_RUN_FULL_SCAN = run_full_scan
+_V66_BUILD_WHY_MESSAGE = build_why_message
+_V66_BUILD_WELCOME_MESSAGE = build_welcome_message
+_V66_TELEGRAM_STATUS_MESSAGE = telegram_status_message
+
+
+def build_welcome_message():
+    return (
+        "🐆 Welcome to FuturesHunter V6.7 MacroHunter\n\n"
+        "Adaptive 50-factor MEXC scanner + macro/crypto-news risk layer.\n"
+        "News never creates a trade by itself; price, volume, OI and technicals must still confirm.\n\n"
+        f"🌐 Health: {WEBSITE_URL}\n\n"
+        "Commands: /latest /watch /why ZEC /macro /news /calendar /risk /sources /shadow /stats /status /website /stop"
+    )
+
+
+def telegram_status_message():
+    base = _V66_TELEGRAM_STATUS_MESSAGE()
+    if "V6.7" not in base:
+        base = base.replace("V6", "V6.7", 1)
+    state = get_macro_snapshot()
+    return (
+        base
+        + "\n"
+        + f"Macro: {state.get('regime')} ({num(state.get('combined_score')):+.1f})\n"
+        + f"Event risk: {state.get('event_risk')}\n"
+        + f"News refresh: every {max(60, NEWS_REFRESH_SECONDS) // 60} min"
+    )
+
+
+def build_why_message(symbol_query):
+    base = _V66_BUILD_WHY_MESSAGE(symbol_query)
+    state = get_macro_snapshot()
+    return (
+        base
+        + "\n\n🌍 V6.7 MACRO LAYER\n"
+        + f"Regime: {state.get('regime')} | event risk {state.get('event_risk')}\n"
+        + f"Macro {num(state.get('macro_score')):+.1f} | crypto news {num(state.get('crypto_score')):+.1f}\n"
+        + f"BTC/ETH: {state.get('market_reaction_text')}"
+    )
+
+
+def handle_telegram_command(chat_id, text):
+    parts = (text or "").strip().split()
+    command = parts[0].lower() if parts else ""
+
+    if command == "/macro":
+        send_to_chat(chat_id, _build_macro_message())
+        return
+    if command == "/news":
+        send_to_chat(chat_id, _build_news_message())
+        return
+    if command == "/calendar":
+        send_to_chat(chat_id, _build_calendar_message())
+        return
+    if command == "/risk":
+        send_to_chat(chat_id, _build_risk_message())
+        return
+    if command == "/sources":
+        send_to_chat(chat_id, _build_sources_message())
+        return
+    if command == "/refreshnews":
+        # Useful for the owner; the refresh runs in this command thread and can
+        # take several seconds, so it is intentionally manual rather than spammy.
+        send_to_chat(chat_id, "🔄 Refreshing macro + crypto news now...")
+        try:
+            refresh_macro_news(initial=False)
+            send_to_chat(chat_id, _build_macro_message())
+        except Exception as error:
+            send_to_chat(chat_id, f"News refresh failed: {error}")
+        return
+
+    return _V66_HANDLE_TELEGRAM_COMMAND(chat_id, text)
+
+
+def build_alert_message(result):
+    base = _V66_BUILD_ALERT_MESSAGE(result).replace(
+        "FUTURES HUNTER V6.6", "FUTURES HUNTER V6.7 MACROHUNTER"
+    )
+    gate = result.get("macro_gate") or _macro_gate(result)
+    state = gate.get("snapshot", get_macro_snapshot())
+    reasons = gate.get("reasons") or []
+    reason_text = "; ".join(reasons[:2]) if reasons else "no macro conflict detected"
+    return (
+        base
+        + "\n\n🌍 MACRO / NEWS LAYER\n"
+        + f"Regime: {state.get('regime')} ({num(state.get('combined_score')):+.1f}/100)\n"
+        + f"Event risk: {state.get('event_risk')}\n"
+        + f"Crypto news: {num(state.get('crypto_score')):+.1f}\n"
+        + f"BTC/ETH reaction: {state.get('market_reaction_text')}\n"
+        + f"Gate: {gate.get('action')} — {reason_text}"
+    )
+
+
+def run_full_scan(symbols, details, oi_metrics):
+    _update_market_confirmation(oi_metrics)
+    best = _V66_RUN_FULL_SCAN(symbols, details, oi_metrics)
+    if best is None:
+        return None
+
+    gate = _macro_gate(best)
+    best["macro_gate"] = gate
+
+    if gate["action"] == "BLOCK":
+        print()
+        print(
+            f"MACRO GATE: {best['symbol']} {best['direction']} ENTRY held as ARMED — "
+            + "; ".join(gate.get("reasons", []))
+        )
+        # Important: macro/news can suppress/delay a technical entry, but never
+        # promote a non-entry into an entry.
+        return None
+
+    if gate["action"] == "CAUTION":
+        print(
+            f"MACRO CAUTION: {best['symbol']} {best['direction']} — "
+            + "; ".join(gate.get("reasons", []))
+        )
+
+    return best
+
+
+# ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
 
@@ -4929,7 +6004,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "6.6",
+                "version": "6.7",
+                "macro_regime": get_macro_snapshot().get("regime"),
+                "event_risk": get_macro_snapshot().get("event_risk"),
                 "uptime_seconds": int(max(0, time.time() - STARTED_AT)),
                 "time": local_time(),
             }).encode("utf-8")
@@ -4966,6 +6043,7 @@ def start_health_server():
 if __name__ == "__main__":
     try:
         start_health_server()
+        start_macro_news_thread()
         asyncio.run(
             main()
         )
