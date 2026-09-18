@@ -5995,6 +5995,1268 @@ def run_full_scan(symbols, details, oi_metrics):
 
 
 # ============================================================
+# V6.8 DURABLE PERSISTENCE + RESEARCH LAB
+# ============================================================
+#
+# Goals:
+# - persist scanner state outside Render's ephemeral filesystem
+# - persist every ENTRY before Telegram delivery (at-least-once delivery)
+# - retry unsent Telegram ENTRY alerts after transient failures/restarts
+# - preserve paper-trade / alert / shadow state across restarts
+# - preserve OI continuity from durable minute samples
+# - farm every full-scan setup in a compact research table
+# - record live market samples for later horizon-return / MFE / MAE analysis
+# - detect downtime and backfill candle closes for research continuity
+#
+# This layer deliberately does NOT auto-change the trading rules. It gathers
+# evidence so later versions can be promoted only after shadow/out-of-sample
+# validation.
+
+try:
+    import psycopg
+    from psycopg.types.json import Jsonb
+except Exception:
+    psycopg = None
+    Jsonb = None
+
+V68_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+V68_DB_LOCK = threading.RLock()
+V68_DB_CONN = None
+V68_DB_READY = False
+V68_DB_LAST_ERROR = ""
+V68_RESEARCH_VERSION = "6.8"
+V68_DOWNTIME_THRESHOLD_SECONDS = int(
+    os.getenv("V68_DOWNTIME_THRESHOLD_SECONDS", "180")
+)
+V68_BACKFILL_MAX_HOURS = float(os.getenv("V68_BACKFILL_MAX_HOURS", "12"))
+V68_RETRY_UNSENT_SECONDS = int(os.getenv("V68_RETRY_UNSENT_SECONDS", "300"))
+V68_RESEARCH_LOOKBACK_HOURS = int(os.getenv("V68_RESEARCH_LOOKBACK_HOURS", "24"))
+
+
+def _v68_json(value):
+    if Jsonb is None:
+        return value
+    return Jsonb(_clean_json_value(value))
+
+
+def _v68_db_connect():
+    global V68_DB_CONN, V68_DB_LAST_ERROR
+
+    if not V68_DATABASE_URL or psycopg is None:
+        return None
+
+    with V68_DB_LOCK:
+        try:
+            if V68_DB_CONN is None or getattr(V68_DB_CONN, "closed", True):
+                V68_DB_CONN = psycopg.connect(
+                    V68_DATABASE_URL,
+                    autocommit=True,
+                    connect_timeout=6,
+                )
+            return V68_DB_CONN
+        except Exception as error:
+            V68_DB_LAST_ERROR = str(error)[:240]
+            V68_DB_CONN = None
+            return None
+
+
+def _v68_db_execute(sql, params=None, fetch=None):
+    global V68_DB_CONN, V68_DB_LAST_ERROR
+
+    params = params or ()
+    conn = _v68_db_connect()
+    if conn is None:
+        return None
+
+    try:
+        with V68_DB_LOCK:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+        V68_DB_LAST_ERROR = ""
+        return True
+    except Exception as error:
+        V68_DB_LAST_ERROR = str(error)[:240]
+        try:
+            conn.close()
+        except Exception:
+            pass
+        V68_DB_CONN = None
+        print(f"V6.8 database warning: {V68_DB_LAST_ERROR}")
+        return None
+
+
+def _v68_db_executemany(sql, rows):
+    global V68_DB_CONN, V68_DB_LAST_ERROR
+
+    if not rows:
+        return True
+
+    conn = _v68_db_connect()
+    if conn is None:
+        return None
+
+    try:
+        with V68_DB_LOCK:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+        V68_DB_LAST_ERROR = ""
+        return True
+    except Exception as error:
+        V68_DB_LAST_ERROR = str(error)[:240]
+        try:
+            conn.close()
+        except Exception:
+            pass
+        V68_DB_CONN = None
+        print(f"V6.8 database batch warning: {V68_DB_LAST_ERROR}")
+        return None
+
+
+def v68_init_database():
+    global V68_DB_READY, V68_DB_LAST_ERROR
+
+    if not V68_DATABASE_URL:
+        V68_DB_READY = False
+        V68_DB_LAST_ERROR = "DATABASE_URL is not configured"
+        print("V6.8 persistence: DATABASE_URL missing — running in local fallback mode.")
+        return False
+
+    if psycopg is None:
+        V68_DB_READY = False
+        V68_DB_LAST_ERROR = "psycopg is not installed"
+        print("V6.8 persistence: psycopg missing — check requirements.txt.")
+        return False
+
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS fh_state (
+            key TEXT PRIMARY KEY,
+            value JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fh_signal_queue (
+            signal_key TEXT PRIMARY KEY,
+            signal_ts DOUBLE PRECISION NOT NULL,
+            signal_time TIMESTAMPTZ NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            score DOUBLE PRECISION,
+            message TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            telegram_sent BOOLEAN NOT NULL DEFAULT FALSE,
+            telegram_sent_at TIMESTAMPTZ,
+            telegram_attempts INTEGER NOT NULL DEFAULT 0,
+            side_effects_done BOOLEAN NOT NULL DEFAULT FALSE,
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_signal_queue_unsent
+        ON fh_signal_queue (telegram_sent, signal_time)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fh_research_scans (
+            id BIGSERIAL PRIMARY KEY,
+            scan_ts BIGINT NOT NULL,
+            scan_time TIMESTAMPTZ NOT NULL,
+            symbol TEXT NOT NULL,
+            selected_direction TEXT,
+            signal_state TEXT,
+            selected_regime TEXT,
+            best_score DOUBLE PRECISION,
+            long_score DOUBLE PRECISION,
+            short_score DOUBLE PRECISION,
+            long_raw SMALLINT,
+            short_raw SMALLINT,
+            raw_score SMALLINT,
+            weighted_score DOUBLE PRECISION,
+            oi_score SMALLINT,
+            price DOUBLE PRECISION,
+            open_interest DOUBLE PRECISION,
+            funding DOUBLE PRECISION,
+            spread DOUBLE PRECISION,
+            turnover DOUBLE PRECISION,
+            watch_threshold DOUBLE PRECISION,
+            armed_threshold DOUBLE PRECISION,
+            entry_threshold DOUBLE PRECISION,
+            long_factors SMALLINT[],
+            short_factors SMALLINT[],
+            selected_factors SMALLINT[],
+            long_group JSONB,
+            short_group JSONB,
+            metrics JSONB,
+            reject_reasons TEXT[],
+            hard_reject_reasons TEXT[],
+            macro JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (scan_ts, symbol)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_research_time
+        ON fh_research_scans (scan_time DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_research_symbol_time
+        ON fh_research_scans (symbol, scan_time DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_research_state_time
+        ON fh_research_scans (signal_state, scan_time DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fh_market_samples (
+            sample_ts BIGINT NOT NULL,
+            sample_time TIMESTAMPTZ NOT NULL,
+            symbol TEXT NOT NULL,
+            price DOUBLE PRECISION,
+            open_interest DOUBLE PRECISION,
+            funding DOUBLE PRECISION,
+            turnover DOUBLE PRECISION,
+            source TEXT NOT NULL DEFAULT 'LIVE',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (sample_ts, symbol, source)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_market_symbol_time
+        ON fh_market_samples (symbol, sample_ts DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fh_downtime_gaps (
+            id BIGSERIAL PRIMARY KEY,
+            last_seen_ts DOUBLE PRECISION,
+            resumed_ts DOUBLE PRECISION NOT NULL,
+            gap_seconds DOUBLE PRECISION NOT NULL,
+            backfill_status TEXT NOT NULL DEFAULT 'PENDING',
+            note TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (resumed_ts)
+        )
+        """,
+    ]
+
+    for statement in statements:
+        if _v68_db_execute(statement) is None:
+            V68_DB_READY = False
+            return False
+
+    V68_DB_READY = True
+    V68_DB_LAST_ERROR = ""
+    _v68_state_set("schema_version", {"version": V68_RESEARCH_VERSION})
+    print("V6.8 persistence: POSTGRES CONNECTED + RESEARCH LAB ACTIVE")
+    return True
+
+
+def _v68_state_set(key, value):
+    if not V68_DB_READY and key != "schema_version":
+        return False
+
+    result = _v68_db_execute(
+        """
+        INSERT INTO fh_state (key, value, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        """,
+        (str(key), _v68_json(value)),
+    )
+    return bool(result)
+
+
+def _v68_state_get(key, default=None):
+    if not V68_DB_READY:
+        return default
+
+    row = _v68_db_execute(
+        "SELECT value FROM fh_state WHERE key = %s",
+        (str(key),),
+        fetch="one",
+    )
+    if not row:
+        return default
+    return row[0]
+
+
+# Mirror the important JSON state files into Postgres. OI history is handled
+# separately through fh_market_samples so we don't rewrite a huge JSON blob
+# every minute.
+_V68_ORIGINAL_LOAD_JSON = load_json
+_V68_ORIGINAL_SAVE_JSON = save_json
+
+V68_MIRRORED_JSON_NAMES = set()
+for _v68_name in (
+    "ALERT_STATE_FILE",
+    "TRADES_FILE",
+    "MARKET_STATE_FILE",
+    "SHADOW_TRADES_FILE",
+    "MACRO_RUNTIME_FILE",
+):
+    _v68_path = globals().get(_v68_name)
+    if isinstance(_v68_path, Path):
+        V68_MIRRORED_JSON_NAMES.add(_v68_path.name)
+
+
+def load_json(path, default):
+    path_obj = Path(path)
+
+    if path_obj.exists():
+        return _V68_ORIGINAL_LOAD_JSON(path_obj, default)
+
+    if V68_DB_READY and path_obj.name in V68_MIRRORED_JSON_NAMES:
+        restored = _v68_state_get(f"file:{path_obj.name}", None)
+        if restored is not None:
+            return restored
+
+    return default
+
+
+def save_json(path, data):
+    path_obj = Path(path)
+    _V68_ORIGINAL_SAVE_JSON(path_obj, data)
+
+    if V68_DB_READY and path_obj.name in V68_MIRRORED_JSON_NAMES:
+        _v68_state_set(f"file:{path_obj.name}", data)
+
+
+_V68_ORIGINAL_SAVE_SUBSCRIBERS = save_subscribers
+
+
+def save_subscribers(subscribers):
+    _V68_ORIGINAL_SAVE_SUBSCRIBERS(subscribers)
+    if V68_DB_READY:
+        _v68_state_set("telegram_subscribers", sorted(str(x) for x in subscribers))
+
+
+def _v68_restore_subscribers():
+    if not V68_DB_READY:
+        return 0
+
+    saved = _v68_state_get("telegram_subscribers", []) or []
+    restored = 0
+    with SUBSCRIBER_LOCK:
+        for item in saved:
+            normalized = _normalize_chat_id(item)
+            if normalized and normalized not in SUBSCRIBERS:
+                SUBSCRIBERS.add(normalized)
+                restored += 1
+    return restored
+
+
+_V68_ORIGINAL_SAVE_LATEST_SIGNAL = save_latest_signal
+
+
+def save_latest_signal(message, result):
+    _V68_ORIGINAL_SAVE_LATEST_SIGNAL(message, result)
+    if V68_DB_READY:
+        _v68_state_set(
+            "latest_signal",
+            {
+                "time": time.time(),
+                "time_text": local_time(),
+                "message": message,
+                "symbol": result.get("symbol"),
+                "direction": result.get("direction"),
+                "score": result.get("best_score"),
+            },
+        )
+
+
+def _v68_restore_latest_signal_file():
+    if LATEST_SIGNAL_FILE.exists() or not V68_DB_READY:
+        return
+    payload = _v68_state_get("latest_signal", None)
+    if payload:
+        try:
+            LATEST_SIGNAL_FILE.write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as error:
+            print(f"Latest-signal restore warning: {error}")
+
+
+def _v68_persist_market_samples(details, source="LIVE", timestamp=None):
+    if not V68_DB_READY or not details:
+        return False
+
+    now = float(timestamp if timestamp is not None else time.time())
+    sample_ts = int(now // 60) * 60
+    sample_dt = datetime.fromtimestamp(sample_ts, tz=timezone.utc)
+    rows = []
+
+    for symbol, ticker in details.items():
+        if not isinstance(ticker, dict):
+            continue
+        rows.append((
+            sample_ts,
+            sample_dt,
+            str(symbol),
+            num(ticker.get("lastPrice")),
+            num(ticker.get("holdVol")) if ticker.get("holdVol") is not None else None,
+            num(ticker.get("fundingRate")) if ticker.get("fundingRate") is not None else None,
+            num(ticker.get("amount24")) if ticker.get("amount24") is not None else None,
+            source,
+        ))
+
+    return bool(_v68_db_executemany(
+        """
+        INSERT INTO fh_market_samples (
+            sample_ts, sample_time, symbol, price,
+            open_interest, funding, turnover, source
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (sample_ts, symbol, source)
+        DO UPDATE SET
+            price = EXCLUDED.price,
+            open_interest = EXCLUDED.open_interest,
+            funding = EXCLUDED.funding,
+            turnover = EXCLUDED.turnover
+        """,
+        rows,
+    ))
+
+
+def _v68_restore_oi_history():
+    if not V68_DB_READY:
+        return None
+
+    cutoff = time.time() - HISTORY_RETENTION
+    rows = _v68_db_execute(
+        """
+        SELECT sample_ts, symbol, open_interest, price
+        FROM fh_market_samples
+        WHERE sample_ts >= %s
+          AND source = 'LIVE'
+          AND open_interest IS NOT NULL
+          AND price IS NOT NULL
+        ORDER BY sample_ts ASC
+        """,
+        (int(cutoff),),
+        fetch="all",
+    )
+
+    if rows is None:
+        return None
+
+    history = {}
+    for sample_ts, symbol, open_interest, price in rows:
+        history.setdefault(symbol, []).append({
+            "time": float(sample_ts),
+            "oi": float(open_interest),
+            "price": float(price),
+        })
+
+    return history
+
+
+def _v68_get_candles_range(symbol, interval, start_ts, end_ts):
+    url = f"{MEXC_REST}/api/v1/contract/kline/{symbol}"
+    params = {
+        "interval": interval,
+        "start": int(start_ts),
+        "end": int(end_ts),
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            return None
+        data = payload.get("data") or {}
+        if not data.get("time"):
+            return None
+        frame = pd.DataFrame({
+            "time": data.get("time", []),
+            "open": data.get("open", []),
+            "high": data.get("high", []),
+            "low": data.get("low", []),
+            "close": data.get("close", []),
+            "volume": data.get("vol", []),
+        })
+        for column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        return frame.dropna().reset_index(drop=True)
+    except Exception as error:
+        print(f"Backfill candle warning {symbol}: {error}")
+        return None
+
+
+def _v68_backfill_gap_market_samples(symbols, last_seen_ts, resumed_ts):
+    if not V68_DB_READY or not last_seen_ts:
+        return 0
+
+    gap = float(resumed_ts) - float(last_seen_ts)
+    if gap <= V68_DOWNTIME_THRESHOLD_SECONDS:
+        return 0
+
+    max_seconds = V68_BACKFILL_MAX_HOURS * 3600
+    start_ts = max(float(last_seen_ts), float(resumed_ts) - max_seconds)
+    end_ts = float(resumed_ts)
+    inserted = 0
+
+    print(
+        f"V6.8 downtime backfill: {gap / 60:.1f} min gap; "
+        f"rebuilding candle samples for {len(symbols)} market(s)."
+    )
+
+    for symbol in symbols:
+        frame = _v68_get_candles_range(symbol, "Min1", start_ts, end_ts)
+        if frame is None or frame.empty:
+            continue
+
+        rows = []
+        for _, candle in frame.iterrows():
+            ts = int(num(candle["time"]))
+            rows.append((
+                ts,
+                datetime.fromtimestamp(ts, tz=timezone.utc),
+                symbol,
+                num(candle["close"]),
+                None,
+                None,
+                None,
+                "BACKFILL_KLINE",
+            ))
+
+        result = _v68_db_executemany(
+            """
+            INSERT INTO fh_market_samples (
+                sample_ts, sample_time, symbol, price,
+                open_interest, funding, turnover, source
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (sample_ts, symbol, source) DO NOTHING
+            """,
+            rows,
+        )
+        if result:
+            inserted += len(rows)
+        time.sleep(0.11)
+
+    _v68_db_execute(
+        """
+        UPDATE fh_downtime_gaps
+        SET backfill_status = %s,
+            note = %s
+        WHERE resumed_ts = %s
+        """,
+        (
+            "DONE" if inserted else "NO_DATA",
+            f"{inserted} one-minute candle samples; OI/funding unavailable in backfill",
+            float(resumed_ts),
+        ),
+    )
+    return inserted
+
+
+def _v68_record_downtime(last_seen_ts, resumed_ts):
+    if not V68_DB_READY or not last_seen_ts:
+        return 0.0
+
+    gap = float(resumed_ts) - float(last_seen_ts)
+    if gap <= V68_DOWNTIME_THRESHOLD_SECONDS:
+        return 0.0
+
+    _v68_db_execute(
+        """
+        INSERT INTO fh_downtime_gaps (
+            last_seen_ts, resumed_ts, gap_seconds, backfill_status, note
+        )
+        VALUES (%s, %s, %s, 'PENDING', %s)
+        ON CONFLICT (resumed_ts) DO NOTHING
+        """,
+        (
+            float(last_seen_ts),
+            float(resumed_ts),
+            gap,
+            "Research candle backfill pending; live OI/funding cannot be reconstructed exactly",
+        ),
+    )
+    return gap
+
+
+_V68_ORIGINAL_SAVE_SCAN_SNAPSHOT = save_scan_snapshot
+
+
+def _v68_compact_macro_snapshot():
+    state = get_macro_snapshot() or {}
+    return {
+        "regime": state.get("regime"),
+        "combined_score": state.get("combined_score"),
+        "macro_score": state.get("macro_score"),
+        "crypto_score": state.get("crypto_score"),
+        "confidence": state.get("confidence"),
+        "event_risk": state.get("event_risk"),
+        "market_reaction": state.get("market_reaction"),
+        "market_reaction_text": state.get("market_reaction_text"),
+        "updated_at": state.get("updated_at"),
+    }
+
+
+def _v68_compact_metrics(result):
+    tf5 = result.get("5m", {}) or {}
+    tf15 = result.get("15m", {}) or {}
+    tf1h = result.get("1h", {}) or {}
+    return {
+        "rsi5": tf5.get("rsi"),
+        "rsi15": tf15.get("rsi"),
+        "rsi1h": tf1h.get("rsi"),
+        "adx15": tf15.get("adx"),
+        "adx1h": tf1h.get("adx"),
+        "rv5": tf5.get("rv"),
+        "rv15": tf15.get("rv"),
+        "atr15_pctile": tf15.get("atr_pctile"),
+        "roc5": tf5.get("roc"),
+        "roc15": tf15.get("roc"),
+        "trend5": tf5.get("trend"),
+        "trend15": tf15.get("trend"),
+        "trend1h": tf1h.get("trend"),
+        "ema20_distance_atr": result.get("ema20_distance_atr"),
+        "live_distance_atr": result.get("live_distance_atr"),
+        "oi_metrics": result.get("oi_metrics", {}),
+        "risk_plan": result.get("risk_plan", {}),
+    }
+
+
+def _v68_store_research_results(results):
+    if not V68_DB_READY or not results:
+        return 0
+
+    scan_ts = int(time.time() // max(60, FULL_SCAN_INTERVAL)) * max(60, FULL_SCAN_INTERVAL)
+    scan_dt = datetime.fromtimestamp(scan_ts, tz=timezone.utc)
+    macro_snapshot = _v68_compact_macro_snapshot()
+    rows = []
+    factor_names_saved = False
+
+    for result in results:
+        try:
+            tf5 = result.get("5m", {})
+            tf15 = result.get("15m", {})
+            tf1h = result.get("1h", {})
+            funding = num(result.get("funding"))
+            spread = num(result.get("spread"))
+            oi_metrics = result.get("oi_metrics", {}) or {}
+
+            long_raw, long_parts = score_direction(
+                "LONG", tf5, tf15, tf1h, funding, spread, oi_metrics
+            )
+            short_raw, short_parts = score_direction(
+                "SHORT", tf5, tf15, tf1h, funding, spread, oi_metrics
+            )
+            long_weighted, long_group = weighted_factor_score(long_parts)
+            short_weighted, short_group = weighted_factor_score(short_parts)
+
+            factor_names = list(long_parts.keys())
+            if not factor_names_saved:
+                _v68_state_set(
+                    "research_factor_schema",
+                    {
+                        "version": "v6_50_factor_order",
+                        "names": factor_names,
+                    },
+                )
+                factor_names_saved = True
+
+            rows.append((
+                scan_ts,
+                scan_dt,
+                result.get("symbol"),
+                result.get("direction"),
+                result.get("signal_state"),
+                result.get("regime"),
+                num(result.get("best_score")),
+                num(result.get("long_score")),
+                num(result.get("short_score")),
+                int(long_raw),
+                int(short_raw),
+                int(num(result.get("raw_score"))),
+                num(result.get("weighted_score")),
+                int(num(result.get("oi_score"))),
+                num(result.get("price")),
+                num(result.get("oi")),
+                funding,
+                spread,
+                num(result.get("turnover")),
+                num(result.get("watch_threshold")),
+                num(result.get("armed_threshold")),
+                num(result.get("entry_threshold")),
+                [int(long_parts[name]) for name in factor_names],
+                [int(short_parts[name]) for name in factor_names],
+                [int(result.get("parts", {}).get(name, 0)) for name in factor_names],
+                _v68_json(long_group),
+                _v68_json(short_group),
+                _v68_json(_v68_compact_metrics(result)),
+                [str(x) for x in result.get("reject_reasons", [])],
+                [str(x) for x in result.get("hard_reject_reasons", [])],
+                _v68_json(macro_snapshot),
+            ))
+        except Exception as error:
+            print(f"Research row warning {result.get('symbol')}: {error}")
+
+    if not rows:
+        return 0
+
+    stored = _v68_db_executemany(
+        """
+        INSERT INTO fh_research_scans (
+            scan_ts, scan_time, symbol, selected_direction,
+            signal_state, selected_regime, best_score,
+            long_score, short_score, long_raw, short_raw,
+            raw_score, weighted_score, oi_score, price,
+            open_interest, funding, spread, turnover,
+            watch_threshold, armed_threshold, entry_threshold,
+            long_factors, short_factors, selected_factors,
+            long_group, short_group, metrics,
+            reject_reasons, hard_reject_reasons, macro
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (scan_ts, symbol)
+        DO UPDATE SET
+            selected_direction = EXCLUDED.selected_direction,
+            signal_state = EXCLUDED.signal_state,
+            selected_regime = EXCLUDED.selected_regime,
+            best_score = EXCLUDED.best_score,
+            long_score = EXCLUDED.long_score,
+            short_score = EXCLUDED.short_score,
+            long_raw = EXCLUDED.long_raw,
+            short_raw = EXCLUDED.short_raw,
+            raw_score = EXCLUDED.raw_score,
+            weighted_score = EXCLUDED.weighted_score,
+            oi_score = EXCLUDED.oi_score,
+            price = EXCLUDED.price,
+            open_interest = EXCLUDED.open_interest,
+            funding = EXCLUDED.funding,
+            spread = EXCLUDED.spread,
+            turnover = EXCLUDED.turnover,
+            long_factors = EXCLUDED.long_factors,
+            short_factors = EXCLUDED.short_factors,
+            selected_factors = EXCLUDED.selected_factors,
+            long_group = EXCLUDED.long_group,
+            short_group = EXCLUDED.short_group,
+            metrics = EXCLUDED.metrics,
+            reject_reasons = EXCLUDED.reject_reasons,
+            hard_reject_reasons = EXCLUDED.hard_reject_reasons,
+            macro = EXCLUDED.macro
+        """,
+        rows,
+    )
+
+    return len(rows) if stored else 0
+
+
+def save_scan_snapshot(results):
+    _V68_ORIGINAL_SAVE_SCAN_SNAPSHOT(results)
+    stored = _v68_store_research_results(results)
+    if stored:
+        print(f"V6.8 Research Lab: persisted {stored} full-scan setup(s).")
+
+
+def _v68_signal_key(result, signal_ts=None):
+    signal_ts = float(signal_ts if signal_ts is not None else time.time())
+    minute = int(signal_ts // 60)
+    raw = (
+        f"{minute}|{result.get('symbol')}|{result.get('direction')}|"
+        f"{num(result.get('price')):.12g}|{num(result.get('best_score')):.1f}"
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:28]
+
+
+def _v68_queue_signal(result, message):
+    if not V68_DB_READY:
+        return None
+
+    signal_ts = time.time()
+    key = _v68_signal_key(result, signal_ts)
+    signal_dt = datetime.fromtimestamp(signal_ts, tz=timezone.utc)
+
+    _v68_db_execute(
+        """
+        INSERT INTO fh_signal_queue (
+            signal_key, signal_ts, signal_time, symbol,
+            direction, score, message, payload
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (signal_key) DO NOTHING
+        """,
+        (
+            key,
+            signal_ts,
+            signal_dt,
+            result.get("symbol"),
+            result.get("direction"),
+            num(result.get("best_score")),
+            message,
+            _v68_json(result),
+        ),
+    )
+
+    row = _v68_db_execute(
+        """
+        SELECT signal_key, signal_ts, message, payload,
+               telegram_sent, side_effects_done
+        FROM fh_signal_queue
+        WHERE signal_key = %s
+        """,
+        (key,),
+        fetch="one",
+    )
+    return row
+
+
+def _v68_mark_signal_side_effects(signal_key):
+    _v68_db_execute(
+        """
+        UPDATE fh_signal_queue
+        SET side_effects_done = TRUE
+        WHERE signal_key = %s
+        """,
+        (signal_key,),
+    )
+
+
+def _v68_mark_signal_delivery(signal_key, sent, error_text=""):
+    _v68_db_execute(
+        """
+        UPDATE fh_signal_queue
+        SET telegram_attempts = telegram_attempts + 1,
+            telegram_sent = CASE WHEN %s THEN TRUE ELSE telegram_sent END,
+            telegram_sent_at = CASE WHEN %s THEN NOW() ELSE telegram_sent_at END,
+            last_error = %s
+        WHERE signal_key = %s
+        """,
+        (
+            bool(sent),
+            bool(sent),
+            None if sent else str(error_text or "Telegram delivery failed")[:240],
+            signal_key,
+        ),
+    )
+
+
+def _v68_apply_signal_side_effects(signal_key, message, result, trades, alert_state):
+    if not isinstance(result, dict):
+        return False
+
+    row = _v68_db_execute(
+        "SELECT side_effects_done FROM fh_signal_queue WHERE signal_key = %s",
+        (signal_key,),
+        fetch="one",
+    )
+    if row and bool(row[0]):
+        return True
+
+    try:
+        # Durable bookkeeping happens before Telegram delivery. If Telegram is
+        # temporarily unavailable, the setup still exists and is tracked.
+        save_latest_signal(message, result)
+        log_signal(result)
+
+        if not has_open_trade_for_symbol(trades, result.get("symbol")):
+            trade = create_paper_trade(result, trades)
+            trade["v68_signal_key"] = signal_key
+            save_json(TRADES_FILE, trades)
+
+        record_alert_state(result, alert_state)
+        _v68_mark_signal_side_effects(signal_key)
+        return True
+    except Exception as error:
+        print(f"V6.8 signal bookkeeping warning: {error}")
+        return False
+
+
+def _v68_retry_unsent_signals(trades, alert_state, max_count=12):
+    if not V68_DB_READY:
+        return 0
+
+    rows = _v68_db_execute(
+        """
+        SELECT signal_key, signal_ts, message, payload,
+               telegram_sent, side_effects_done
+        FROM fh_signal_queue
+        WHERE telegram_sent = FALSE
+        ORDER BY signal_time ASC
+        LIMIT %s
+        """,
+        (int(max_count),),
+        fetch="all",
+    )
+    if not rows:
+        return 0
+
+    delivered = 0
+    for signal_key, signal_ts, message, payload, sent, side_done in rows:
+        result = payload if isinstance(payload, dict) else {}
+        if not side_done:
+            _v68_apply_signal_side_effects(
+                signal_key,
+                message,
+                result,
+                trades,
+                alert_state,
+            )
+
+        age_minutes = max(0.0, (time.time() - float(signal_ts)) / 60.0)
+        outgoing = message
+        if age_minutes >= 10:
+            outgoing = (
+                f"♻️ RECOVERED UNSENT FUTURESHUNTER ALERT\n"
+                f"Original setup was ~{int(age_minutes)}m ago. Do not treat this as a fresh entry.\n\n"
+                + message
+            )
+
+        ok = send_telegram(outgoing)
+        _v68_mark_signal_delivery(
+            signal_key,
+            ok,
+            "" if ok else "retry failed",
+        )
+        if ok:
+            delivered += 1
+            print(f"V6.8 durable queue: recovered Telegram signal {signal_key}.")
+        else:
+            # Avoid hammering Telegram if connectivity is down.
+            break
+        time.sleep(0.25)
+
+    return delivered
+
+
+def _v68_research_summary_message():
+    if not V68_DB_READY:
+        return (
+            "🧪 FuturesHunter V6.8 Research Lab\n\n"
+            "Database: OFFLINE / not configured\n"
+            f"Reason: {V68_DB_LAST_ERROR or 'DATABASE_URL missing'}"
+        )
+
+    hours = max(1, V68_RESEARCH_LOOKBACK_HOURS)
+    row = _v68_db_execute(
+        f"""
+        SELECT
+            COUNT(*) AS scans,
+            COUNT(*) FILTER (WHERE selected_direction = 'LONG') AS longs,
+            COUNT(*) FILTER (WHERE selected_direction = 'SHORT') AS shorts,
+            COUNT(*) FILTER (WHERE signal_state = 'ENTRY') AS entries,
+            COUNT(*) FILTER (
+                WHERE signal_state = 'ENTRY' AND selected_direction = 'LONG'
+            ) AS long_entries,
+            COUNT(*) FILTER (
+                WHERE signal_state = 'ENTRY' AND selected_direction = 'SHORT'
+            ) AS short_entries,
+            AVG(long_score),
+            AVG(short_score)
+        FROM fh_research_scans
+        WHERE scan_time >= NOW() - INTERVAL '{hours} hours'
+        """,
+        fetch="one",
+    )
+
+    queue = _v68_db_execute(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE telegram_sent = FALSE),
+            COUNT(*)
+        FROM fh_signal_queue
+        """,
+        fetch="one",
+    ) or (0, 0)
+
+    gaps = _v68_db_execute(
+        "SELECT COUNT(*) FROM fh_downtime_gaps",
+        fetch="one",
+    ) or (0,)
+
+    if not row:
+        return "🧪 Research Lab connected, but no full-scan rows have been stored yet."
+
+    scans, longs, shorts, entries, long_entries, short_entries, avg_long, avg_short = row
+    return (
+        "🧪 FUTURESHUNTER V6.8 RESEARCH LAB\n\n"
+        f"Window: last {hours}h\n"
+        f"Farmed setup rows: {int(scans or 0)}\n"
+        f"Selected LONG / SHORT: {int(longs or 0)} / {int(shorts or 0)}\n"
+        f"ENTRY states LONG / SHORT: {int(long_entries or 0)} / {int(short_entries or 0)}\n"
+        f"Avg LONG score: {num(avg_long):.1f}\n"
+        f"Avg SHORT score: {num(avg_short):.1f}\n"
+        f"Durable signals total: {int(queue[1] or 0)}\n"
+        f"Unsent Telegram queue: {int(queue[0] or 0)}\n"
+        f"Recorded downtime gaps: {int(gaps[0] or 0)}\n\n"
+        "Research data is observational; V6.8 does not auto-change thresholds or weights."
+    )
+
+
+def _v68_db_status_message():
+    status = "CONNECTED" if V68_DB_READY and _v68_db_connect() is not None else "DEGRADED"
+    queue = (0, 0)
+    scans = 0
+    samples = 0
+    if V68_DB_READY:
+        queue_row = _v68_db_execute(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE telegram_sent = FALSE) FROM fh_signal_queue",
+            fetch="one",
+        )
+        scan_row = _v68_db_execute("SELECT COUNT(*) FROM fh_research_scans", fetch="one")
+        sample_row = _v68_db_execute("SELECT COUNT(*) FROM fh_market_samples", fetch="one")
+        if queue_row:
+            queue = queue_row
+        if scan_row:
+            scans = int(scan_row[0] or 0)
+        if sample_row:
+            samples = int(sample_row[0] or 0)
+
+    return (
+        "🗄️ FUTURESHUNTER V6.8 PERSISTENCE\n\n"
+        f"Postgres: {status}\n"
+        f"Signals stored: {int(queue[0] or 0)}\n"
+        f"Signals waiting for Telegram: {int(queue[1] or 0)}\n"
+        f"Research rows: {scans}\n"
+        f"Market samples: {samples}\n"
+        f"Last DB error: {V68_DB_LAST_ERROR or 'none'}"
+    )
+
+
+# Add Research Lab commands on top of V6.7's Telegram command set.
+_V68_V67_HANDLE_TELEGRAM_COMMAND = handle_telegram_command
+_V68_V67_BUILD_WELCOME_MESSAGE = build_welcome_message
+_V68_V67_TELEGRAM_STATUS_MESSAGE = telegram_status_message
+
+
+def build_welcome_message():
+    base = _V68_V67_BUILD_WELCOME_MESSAGE()
+    if "/research" not in base:
+        base += "\n\nV6.8: /research /dbstatus"
+    return base.replace("V6.7 MacroHunter", "V6.8 Research Lab")
+
+
+def telegram_status_message():
+    base = _V68_V67_TELEGRAM_STATUS_MESSAGE().replace("V6.7", "V6.8")
+    db_text = "CONNECTED" if V68_DB_READY else "LOCAL FALLBACK"
+    return base + f"\nPersistence: {db_text}\nResearch Lab: {'ACTIVE' if V68_DB_READY else 'WAITING FOR DATABASE_URL'}"
+
+
+def handle_telegram_command(chat_id, text):
+    parts = (text or "").strip().split()
+    command = parts[0].lower() if parts else ""
+
+    if command in {"/research", "/lab", "/bias"}:
+        send_to_chat(chat_id, _v68_research_summary_message())
+        return
+
+    if command in {"/dbstatus", "/persistence"}:
+        send_to_chat(chat_id, _v68_db_status_message())
+        return
+
+    return _V68_V67_HANDLE_TELEGRAM_COMMAND(chat_id, text)
+
+
+# V6.8 main: same live decision engine as V6.7, with durable state / signal queue
+# and Research Lab farming around it.
+async def main():
+    print()
+    print("=" * 90)
+    print("MEXC FUTURES HUNTER V6.8 — DURABLE RESEARCH LAB + MACROHUNTER")
+    print("=" * 90)
+
+    v68_init_database()
+    _v68_restore_subscribers()
+    _v68_restore_latest_signal_file()
+
+    print()
+    print("Telegram: " + ("CONNECTED" if telegram_ready() else "NOT CONFIGURED"))
+
+    if not telegram_ready():
+        print("Check your Telegram environment variables.")
+        return
+
+    start_telegram_command_thread()
+    print("Telegram subscriber command listener: ACTIVE")
+
+    history = _v68_restore_oi_history()
+    if history is None:
+        history = _V68_ORIGINAL_LOAD_JSON(HISTORY_FILE, {})
+    elif history:
+        print(f"V6.8 OI restore: recovered durable history for {len(history)} market(s).")
+
+    alert_state = load_json(ALERT_STATE_FILE, {})
+    trades = load_json(TRADES_FILE, [])
+
+    imported = import_recent_logged_signals(trades)
+    if imported:
+        print(f"Imported {imported} recent local paper signal(s) into tracking.")
+
+    # Recover any setup that reached the durable queue but crashed before all
+    # local side effects / Telegram delivery completed.
+    _v68_retry_unsent_signals(trades, alert_state, max_count=25)
+
+    resumed_ts = time.time()
+    last_seen_ts = _v68_state_get("last_cycle_ts", None) if V68_DB_READY else None
+    gap_seconds = _v68_record_downtime(last_seen_ts, resumed_ts)
+
+    print()
+    print("OI snapshots: every 60 seconds + durable market samples")
+    print(f"Adaptive full scan: every {FULL_SCAN_INTERVAL // 60} minutes")
+    print("States: WATCH → ARMED → ENTRY")
+    print(f"Focus symbols: {', '.join(sorted(FOCUS_SYMBOLS)) or 'none'}")
+    print("Research Lab: EVERY full-scan setup + LONG/SHORT factor vectors")
+    print("Durable signal queue: persist BEFORE Telegram")
+    print("Paper/shadow/alert state: mirrored to Postgres")
+    print(f"Paper trade expiry: {TRADE_EXPIRY_HOURS} hours")
+
+    send_telegram(
+        "✅ FuturesHunter V6.8 Research Lab is online.\n\n"
+        "V6.7 trading logic is unchanged. Durable signal queue + persistent "
+        "paper/shadow state + research farming are active.\n\n"
+        "Try /research, /dbstatus, /macro, /watch or /why ZEC."
+    )
+
+    if gap_seconds > V68_DOWNTIME_THRESHOLD_SECONDS:
+        send_telegram(
+            "♻️ FuturesHunter recovered from downtime.\n\n"
+            f"Detected gap: ~{gap_seconds / 60:.1f} minutes.\n"
+            "Existing queued signals/state were preserved. Candle closes will be "
+            "backfilled for research; historical OI/funding cannot be reconstructed exactly."
+        )
+
+    next_full_scan = 0.0
+    next_unsent_retry = time.time() + V68_RETRY_UNSENT_SECONDS
+    gap_backfilled = not bool(gap_seconds)
+
+    while True:
+        cycle_start = time.time()
+
+        try:
+            print()
+            print(f"[{local_time()}] Updating market + OI data...")
+
+            symbols = await get_top_symbols()
+            details = await get_detailed_tickers(symbols)
+
+            if not gap_backfilled and last_seen_ts:
+                _v68_backfill_gap_market_samples(
+                    symbols,
+                    float(last_seen_ts),
+                    resumed_ts,
+                )
+                gap_backfilled = True
+
+            _v68_persist_market_samples(details, source="LIVE")
+            oi_metrics = update_oi_history(history, details)
+
+            now = time.time()
+            if V68_DB_READY:
+                _v68_state_set("last_cycle_ts", now)
+                _v68_state_set("last_symbols", list(symbols))
+
+            # Track both actual paper signals and rejected/developing shadow trades.
+            track_open_trades(trades)
+            track_shadow_trades()
+
+            if now >= next_unsent_retry:
+                _v68_retry_unsent_signals(
+                    trades,
+                    alert_state,
+                    max_count=6,
+                )
+                next_unsent_retry = now + V68_RETRY_UNSENT_SECONDS
+
+            if now >= next_full_scan:
+                best = run_full_scan(
+                    symbols,
+                    details,
+                    oi_metrics,
+                )
+
+                next_full_scan = now + FULL_SCAN_INTERVAL
+                if V68_DB_READY:
+                    _v68_state_set("last_full_scan_ts", now)
+
+                if best is not None:
+                    if should_send_alert(best, alert_state, trades):
+                        message = build_alert_message(best).replace(
+                            "V6.7 MACROHUNTER",
+                            "V6.8 RESEARCH LAB",
+                        )
+
+                        if V68_DB_READY:
+                            queued = _v68_queue_signal(best, message)
+                            if queued:
+                                signal_key, signal_ts, stored_message, payload, already_sent, side_done = queued
+                                if not side_done:
+                                    _v68_apply_signal_side_effects(
+                                        signal_key,
+                                        stored_message,
+                                        payload if isinstance(payload, dict) else best,
+                                        trades,
+                                        alert_state,
+                                    )
+
+                                if not already_sent:
+                                    sent = send_telegram(stored_message)
+                                    _v68_mark_signal_delivery(
+                                        signal_key,
+                                        sent,
+                                        "" if sent else "initial Telegram delivery failed",
+                                    )
+                                    if sent:
+                                        print("✅ Durable ENTRY persisted + Telegram broadcast.")
+                                    else:
+                                        print("⚠️ ENTRY persisted; Telegram failed and will be retried.")
+                                else:
+                                    print("Durable signal already delivered; duplicate Telegram suppressed.")
+                            else:
+                                # Database had a transient issue. Preserve old V6.7 behavior
+                                # rather than dropping a valid setup.
+                                sent = send_telegram(message)
+                                if sent:
+                                    save_latest_signal(message, best)
+                                    log_signal(best)
+                                    create_paper_trade(best, trades)
+                                    record_alert_state(best, alert_state)
+                                print("⚠️ DB degraded during signal; local fallback path used.")
+                        else:
+                            # Graceful fallback if DATABASE_URL isn't configured yet.
+                            sent = send_telegram(message)
+                            if sent:
+                                save_latest_signal(message, best)
+                                log_signal(best)
+                                create_paper_trade(best, trades)
+                                record_alert_state(best, alert_state)
+                                print("✅ Telegram ENTRY broadcast (local fallback mode).")
+                            else:
+                                print("⚠️ Telegram alert failed in local fallback mode.")
+                    else:
+                        print(
+                            "ENTRY setup found, but duplicate/open-trade "
+                            "alert suppressed."
+                        )
+
+                print_stats(trades)
+
+        except Exception as error:
+            print()
+            print(f"MAIN LOOP ERROR: {error}")
+
+        elapsed = time.time() - cycle_start
+        sleep_for = max(5, OI_UPDATE_INTERVAL - elapsed)
+        await asyncio.sleep(sleep_for)
+
+
+
+# ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
 
@@ -6004,8 +7266,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "6.7",
+                "version": "6.8",
                 "macro_regime": get_macro_snapshot().get("regime"),
+                "database_ready": bool(V68_DB_READY),
+                "research_lab": "active" if V68_DB_READY else "local_fallback",
                 "event_risk": get_macro_snapshot().get("event_risk"),
                 "uptime_seconds": int(max(0, time.time() - STARTED_AT)),
                 "time": local_time(),
