@@ -8151,17 +8151,1148 @@ def handle_telegram_command(chat_id, text):
     return _V69_V681_HANDLE_TELEGRAM_COMMAND(chat_id, text)
 
 
+
+# ============================================================
+# FUTURESHUNTER V6.9.1 — LIVE TRADE SUPERVISOR (SHADOW ONLY)
+# ============================================================
+# The scanner, Risk Lab and Strategy Lab no longer stop thinking after ENTRY.
+# Every OPEN control paper trade is re-evaluated throughout its lifetime using:
+#   1) Core scanner trajectory (latest full-scan directional score/state)
+#   2) Portfolio/regime risk (macro, BTC, correlated book, stop clusters)
+#   3) Strategy ensemble (5m/15m/1h/4h closed-candle playbooks)
+#   4) Fast tape telemetry (price/OI + current R)
+#
+# IMPORTANT: this is advisory/research SHADOW logic. It NEVER closes, resizes,
+# moves the stop of, or otherwise modifies the control paper trade. The first
+# confirmed EXIT_WARNING is stored as a counterfactual shadow exit so we can
+# later compare supervisor management with the original STOP/TP3/expiry logic.
+
+V691_SUPERVISOR_VERSION = "6.9.1-shadow-live-supervisor"
+V691_SUPERVISOR_INTERVAL_SECONDS = int(os.getenv("V691_SUPERVISOR_INTERVAL_SECONDS", "60"))
+V691_STRATEGY_REFRESH_SECONDS = int(os.getenv("V691_STRATEGY_REFRESH_SECONDS", "300"))
+V691_SNAPSHOT_SECONDS = int(os.getenv("V691_SNAPSHOT_SECONDS", "180"))
+V691_SUPERVISOR_LOOKBACK_HOURS = int(os.getenv("V691_SUPERVISOR_LOOKBACK_HOURS", "72"))
+V691_STATE_CONFIRMATIONS = max(1, int(os.getenv("V691_STATE_CONFIRMATIONS", "2")))
+V691_EXIT_CONFIRMATIONS = max(1, int(os.getenv("V691_EXIT_CONFIRMATIONS", "2")))
+V691_STRATEGY_RUNTIME_CACHE = {}
+V691_SEVERITY = {
+    "STRONG_HOLD": 0,
+    "HOLD": 1,
+    "CAUTION": 2,
+    "DEFENSIVE": 3,
+    "EXIT_WARNING": 4,
+}
+
+
+def _v691_clamp(value, low=0.0, high=100.0):
+    return max(low, min(high, num(value)))
+
+
+def _v691_latest_scan(symbol):
+    symbol = str(symbol or "").upper()
+    for result in V681_LAST_SCAN_RESULTS or []:
+        if str(result.get("symbol") or "").upper() == symbol:
+            return result
+
+    if not V68_DB_READY:
+        return None
+
+    row = _v68_db_execute(
+        """
+        SELECT selected_direction, signal_state, selected_regime,
+               best_score, long_score, short_score, oi_score, price,
+               entry_threshold, metrics, scan_ts
+        FROM fh_research_scans
+        WHERE symbol = %s
+        ORDER BY scan_time DESC
+        LIMIT 1
+        """,
+        (symbol,),
+        fetch="one",
+    )
+    if not row:
+        return None
+
+    direction, state, regime, best, long_score, short_score, oi_score, price, entry_threshold, metrics, scan_ts = row
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "signal_state": state,
+        "regime": regime,
+        "best_score": num(best),
+        "long_score": num(long_score),
+        "short_score": num(short_score),
+        "oi_score": int(num(oi_score)),
+        "price": num(price),
+        "entry_threshold": num(entry_threshold),
+        "metrics": metrics or {},
+        "scan_ts": num(scan_ts),
+    }
+
+
+def _v691_core_view(trade):
+    direction = str(trade.get("direction") or "")
+    scan = _v691_latest_scan(trade.get("symbol"))
+    if not scan:
+        return {
+            "health": 55.0,
+            "directional_score": 0.0,
+            "selected_direction": None,
+            "state": "NO_DATA",
+            "regime": None,
+            "score_delta": 0.0,
+            "reasons": ["no recent core full-scan snapshot"],
+            "hard_flags": [],
+        }
+
+    directional_score = num(
+        scan.get("long_score") if direction == "LONG" else scan.get("short_score")
+    )
+    if directional_score <= 0 and scan.get("direction") == direction:
+        directional_score = num(scan.get("best_score"))
+
+    selected_direction = scan.get("direction")
+    state = str(scan.get("signal_state") or "IGNORE")
+    same_direction = selected_direction == direction
+    health = directional_score if directional_score > 0 else 50.0
+    reasons = []
+    hard_flags = []
+
+    if same_direction:
+        health += {
+            "ENTRY": 6.0,
+            "ARMED": 3.0,
+            "WATCH": -3.0,
+            "REJECT": -7.0,
+            "IGNORE": -9.0,
+        }.get(state, 0.0)
+    else:
+        health -= 8.0
+        reasons.append(f"core scanner currently prefers {selected_direction or 'no direction'}")
+        if state == "ENTRY":
+            health -= 10.0
+            hard_flags.append("core scanner flipped to opposite ENTRY")
+        elif state == "ARMED":
+            health -= 5.0
+
+    entry_score = num(trade.get("score"))
+    score_delta = directional_score - entry_score if directional_score > 0 else 0.0
+    if score_delta <= -25:
+        health -= 10.0
+        reasons.append(f"directional score deteriorated {score_delta:.1f} points from entry")
+    elif score_delta <= -15:
+        health -= 5.0
+        reasons.append(f"directional score is {abs(score_delta):.1f} points below entry")
+    elif score_delta >= 10:
+        health += 4.0
+
+    if directional_score and directional_score < 45:
+        reasons.append(f"directional core score is weak at {directional_score:.1f}")
+        if not same_direction:
+            hard_flags.append("trade-direction core score collapsed while scanner prefers opposite side")
+
+    return {
+        "health": _v691_clamp(health),
+        "directional_score": directional_score,
+        "selected_direction": selected_direction,
+        "state": state,
+        "regime": scan.get("regime"),
+        "score_delta": score_delta,
+        "oi_score": int(num(scan.get("oi_score"))),
+        "scan_price": num(scan.get("price")),
+        "reasons": reasons,
+        "hard_flags": hard_flags,
+    }
+
+
+def _v691_other_correlated_open(trades, trade):
+    bucket = _v681_asset_bucket(trade.get("symbol"))
+    direction = trade.get("direction")
+    signal_id = trade.get("signal_id")
+    symbols = []
+    for other in trades or []:
+        if other.get("status") != "OPEN":
+            continue
+        if signal_id and other.get("signal_id") == signal_id:
+            continue
+        if other.get("direction") != direction:
+            continue
+        if _v681_asset_bucket(other.get("symbol")) != bucket:
+            continue
+        symbols.append(str(other.get("symbol")))
+    return len(symbols), symbols
+
+
+def _v691_management_risk_view(trade, trades):
+    direction = trade.get("direction")
+    symbol = trade.get("symbol")
+    bucket = _v681_asset_bucket(symbol)
+    macro = get_macro_snapshot() or {}
+    combined = num(macro.get("combined_score"))
+    event_risk = str(macro.get("event_risk") or "LOW").upper()
+    btc = _v681_btc_scan_snapshot()
+    macro_conflict, strong_macro_conflict = _v681_directional_macro_conflict(
+        direction, bucket, combined
+    )
+    btc_weak = _v681_btc_is_weak_for(direction, bucket, btc)
+    open_count, open_symbols = _v691_other_correlated_open(trades, trade)
+    stop_count, recent_stops = _v681_recent_stop_cluster(
+        trades, symbol, direction, time.time()
+    )
+
+    health = 100.0
+    reasons = []
+    hard_flags = []
+
+    if event_risk == "EXTREME":
+        health -= 55.0
+        reasons.append("EXTREME event-risk window")
+        hard_flags.append("extreme scheduled-event risk")
+    elif event_risk == "HIGH":
+        health -= 28.0
+        reasons.append("HIGH event-risk window")
+
+    if macro_conflict:
+        health -= 24.0 if strong_macro_conflict else 14.0
+        reasons.append(f"{bucket} {direction} conflicts with macro/news {combined:+.1f}")
+
+    if btc_weak:
+        health -= 18.0
+        reasons.append(
+            "BTC not aligned at entry strength "
+            f"({btc.get('direction') or 'N/A'} {btc.get('state') or 'N/A'} {num(btc.get('score')):.1f})"
+        )
+
+    if open_count >= 6:
+        health -= 18.0
+        reasons.append(f"{open_count} other correlated {bucket} {direction} positions open")
+    elif open_count >= 3:
+        health -= 10.0
+        reasons.append(f"{open_count} other correlated {bucket} {direction} positions open")
+    elif open_count >= 1:
+        health -= 4.0
+
+    if stop_count >= 2:
+        health -= 18.0
+        reasons.append(f"{stop_count} same-bucket {direction} stops in the recent cluster window")
+    elif stop_count == 1:
+        health -= 7.0
+
+    # Portfolio stress is not, by itself, an exit thesis. It becomes a hard
+    # invalidation only when broad conditions and the core trade thesis both fail.
+    if strong_macro_conflict and btc_weak and bucket == "CRYPTO":
+        hard_flags.append("strong macro conflict + weak BTC")
+
+    health = _v691_clamp(health)
+    if health >= 78:
+        decision = "ALLOW"
+    elif health >= 58:
+        decision = "CAUTION"
+    else:
+        decision = "DEFENSIVE"
+
+    return {
+        "health": health,
+        "decision": decision,
+        "macro_score": combined,
+        "event_risk": event_risk,
+        "macro_regime": macro.get("regime"),
+        "macro_conflict": macro_conflict,
+        "strong_macro_conflict": strong_macro_conflict,
+        "btc": btc,
+        "btc_weak": btc_weak,
+        "open_correlated": open_count,
+        "open_correlated_symbols": open_symbols,
+        "recent_stop_count": stop_count,
+        "recent_stops": recent_stops,
+        "reasons": reasons,
+        "hard_flags": hard_flags,
+    }
+
+
+def _v691_strategy_view(trade, core):
+    symbol = str(trade.get("symbol") or "")
+    direction = str(trade.get("direction") or "")
+    cache_key = f"{symbol}|{direction}"
+    now_ts = time.time()
+    cached = V691_STRATEGY_RUNTIME_CACHE.get(cache_key)
+    ensemble = None
+
+    if cached and now_ts - num(cached.get("ts")) < V691_STRATEGY_REFRESH_SECONDS:
+        ensemble = cached.get("ensemble")
+
+    if not ensemble:
+        synthetic = {
+            "symbol": symbol,
+            "direction": direction,
+            "best_score": num(core.get("directional_score")) or num(trade.get("score")),
+            "regime": core.get("regime") or (trade.get("strategy_ensemble") or {}).get("signal_regime") or (trade.get("risk_challenger") or {}).get("signal_regime") or "UNKNOWN",
+        }
+        try:
+            ensemble = _v69_evaluate_strategy_ensemble(synthetic)
+            V691_STRATEGY_RUNTIME_CACHE[cache_key] = {
+                "ts": now_ts,
+                "ensemble": ensemble,
+            }
+        except Exception as error:
+            print(f"V6.9.1 strategy supervisor error {symbol}: {error}")
+            ensemble = cached.get("ensemble") if cached else None
+
+    if not ensemble:
+        return {
+            "health": 55.0,
+            "consensus": "NO_DATA",
+            "confirm_count": 0,
+            "wait_count": 0,
+            "reject_count": 0,
+            "applicable_count": 0,
+            "statuses": {},
+            "reasons": ["strategy ensemble unavailable"],
+            "hard_flags": [],
+        }
+
+    playbooks = ensemble.get("playbooks") or {}
+    statuses = {}
+    values = []
+    reasons = []
+    rejected_names = []
+    weights = {"CONFIRM": 100.0, "WAIT": 60.0, "REJECT": 20.0}
+    for name, payload in playbooks.items():
+        status = str((payload or {}).get("status") or "N/A")
+        statuses[name] = status
+        if status in weights:
+            values.append(weights[status])
+        if status == "REJECT":
+            rejected_names.append(name)
+            reason = str((payload or {}).get("reason") or "rejected")
+            reasons.append(f"{name}: {reason}")
+
+    health = sum(values) / len(values) if values else 55.0
+    consensus = str(ensemble.get("consensus") or "NO_DATA")
+    health += {
+        "STRONG_CONFIRM": 6.0,
+        "CONFIRM": 3.0,
+        "WAIT": 0.0,
+        "MIXED": -4.0,
+        "AVOID": -12.0,
+    }.get(consensus, 0.0)
+
+    reject_count = int(num(ensemble.get("reject_count")))
+    hard_flags = []
+    if reject_count >= 3:
+        hard_flags.append(f"{reject_count} strategy playbooks reject the open thesis")
+    if consensus == "AVOID":
+        hard_flags.append("strategy ensemble consensus is AVOID")
+
+    return {
+        "health": _v691_clamp(health),
+        "consensus": consensus,
+        "confirm_count": int(num(ensemble.get("confirm_count"))),
+        "wait_count": int(num(ensemble.get("wait_count"))),
+        "reject_count": reject_count,
+        "applicable_count": int(num(ensemble.get("applicable_count"))),
+        "statuses": statuses,
+        "reasons": reasons,
+        "hard_flags": hard_flags,
+    }
+
+
+def _v691_tape_view(trade, details, oi_metrics):
+    symbol = trade.get("symbol")
+    ticker = (details or {}).get(symbol, {}) or {}
+    price = num(ticker.get("lastPrice")) or num(ticker.get("fairPrice")) or num(trade.get("entry"))
+    metrics = (oi_metrics or {}).get(symbol, {}) or {}
+    oi5 = metrics.get("oi5")
+    oi15 = metrics.get("oi15")
+    price5 = metrics.get("price5")
+    price15 = metrics.get("price15")
+    direction = trade.get("direction")
+    current_r = current_r_for_price(trade, price) if price > 0 else 0.0
+
+    health = 60.0
+    reasons = []
+
+    def apply_window(pchg, ochg, weight, label):
+        nonlocal health
+        if pchg is None or ochg is None:
+            return
+        p = num(pchg)
+        o = num(ochg)
+        directional_p = p if direction == "LONG" else -p
+        if directional_p > 0 and o > 0:
+            health += 10.0 * weight
+        elif directional_p < 0 and o > 0:
+            health -= 14.0 * weight
+            reasons.append(f"{label} price moving against trade while OI expands")
+        elif directional_p > 0 and o < 0:
+            health -= 3.0 * weight
+            reasons.append(f"{label} favorable price move is occurring with contracting OI")
+        elif directional_p < 0 and o < 0:
+            health -= 5.0 * weight
+
+    apply_window(price5, oi5, 0.7, "5m")
+    apply_window(price15, oi15, 1.0, "15m")
+
+    if current_r >= 2.0:
+        health += 8.0
+    elif current_r >= 1.0:
+        health += 5.0
+    elif current_r <= -0.85:
+        health -= 24.0
+        reasons.append(f"trade is close to original stop at {current_r:+.2f}R")
+    elif current_r <= -0.50:
+        health -= 10.0
+        reasons.append(f"trade is under pressure at {current_r:+.2f}R")
+
+    if trade.get("tp2_hit"):
+        health += 6.0
+    elif trade.get("tp1_hit"):
+        health += 3.0
+
+    return {
+        "health": _v691_clamp(health),
+        "price": price,
+        "current_r": current_r,
+        "oi5": oi5,
+        "oi15": oi15,
+        "price5": price5,
+        "price15": price15,
+        "funding": num(ticker.get("fundingRate")),
+        "reasons": reasons,
+        "hard_flags": [],
+    }
+
+
+def _v691_evaluate_open_trade(trade, trades, details, oi_metrics):
+    core = _v691_core_view(trade)
+    risk = _v691_management_risk_view(trade, trades)
+    strategy = _v691_strategy_view(trade, core)
+    tape = _v691_tape_view(trade, details, oi_metrics)
+
+    health = _v691_clamp(
+        0.40 * num(core.get("health"))
+        + 0.30 * num(strategy.get("health"))
+        + 0.20 * num(risk.get("health"))
+        + 0.10 * num(tape.get("health"))
+    )
+
+    hard_flags = []
+    hard_flags.extend(core.get("hard_flags") or [])
+    hard_flags.extend(strategy.get("hard_flags") or [])
+
+    # A broad-risk warning becomes an exit-quality invalidation only when the
+    # trade's own core thesis is also weak. This prevents "BLOCK new entries"
+    # from being misread as "dump a technically healthy existing position".
+    if risk.get("hard_flags") and num(core.get("health")) < 50:
+        hard_flags.extend(risk.get("hard_flags") or [])
+
+    if (
+        strategy.get("consensus") == "AVOID"
+        and num(core.get("health")) < 52
+    ):
+        hard_flags.append("core + strategy thesis failure")
+
+    opposite_entry = (
+        core.get("selected_direction")
+        and core.get("selected_direction") != trade.get("direction")
+        and core.get("state") == "ENTRY"
+    )
+    immediate_exit = bool(opposite_entry and num(core.get("directional_score")) < 45)
+
+    if immediate_exit or len(set(hard_flags)) >= 2:
+        target_state = "EXIT_WARNING"
+    elif health >= 82:
+        target_state = "STRONG_HOLD"
+    elif health >= 68:
+        target_state = "HOLD"
+    elif health >= 54:
+        target_state = "CAUTION"
+    elif health >= 40:
+        target_state = "DEFENSIVE"
+    else:
+        target_state = "EXIT_WARNING"
+
+    reasons = []
+    for group in (core, risk, strategy, tape):
+        for reason in group.get("reasons") or []:
+            if reason not in reasons:
+                reasons.append(reason)
+    for flag in hard_flags:
+        if flag not in reasons:
+            reasons.append(flag)
+
+    entry_regime = (
+        (trade.get("strategy_ensemble") or {}).get("signal_regime")
+        or (trade.get("risk_challenger") or {}).get("signal_regime")
+        or trade.get("entry_regime")
+        or "UNKNOWN"
+    )
+
+    return {
+        "version": V691_SUPERVISOR_VERSION,
+        "evaluated_ts": time.time(),
+        "signal_id": trade.get("signal_id"),
+        "symbol": trade.get("symbol"),
+        "direction": trade.get("direction"),
+        "entry_regime": entry_regime,
+        "current_regime": core.get("regime"),
+        "health": round(health, 2),
+        "target_state": target_state,
+        "immediate_exit": immediate_exit,
+        "hard_flags": list(dict.fromkeys(hard_flags)),
+        "reasons": reasons[:8],
+        "core": core,
+        "risk": risk,
+        "strategy": strategy,
+        "tape": tape,
+    }
+
+
+def _v691_apply_state_machine(trade, snapshot):
+    now_ts = num(snapshot.get("evaluated_ts")) or time.time()
+    supervisor = trade.get("supervisor") or {}
+    previous_state = supervisor.get("state")
+    target = snapshot.get("target_state") or "HOLD"
+    health = num(snapshot.get("health"))
+    previous_health = num(supervisor.get("health")) if supervisor.get("health") is not None else health
+    initialized = bool(supervisor.get("initialized"))
+    transitioned = False
+    old_state = previous_state
+
+    if not initialized or previous_state not in V691_SEVERITY:
+        supervisor.update({
+            "initialized": True,
+            "state": target,
+            "pending_state": None,
+            "pending_count": 0,
+            "first_seen_ts": now_ts,
+        })
+        previous_state = target
+        old_state = None
+        # Avoid a restart flood. Initial severe conditions are still surfaced.
+        transitioned = target in {"DEFENSIVE", "EXIT_WARNING"}
+    elif target == previous_state:
+        supervisor["pending_state"] = None
+        supervisor["pending_count"] = 0
+    else:
+        if supervisor.get("pending_state") == target:
+            supervisor["pending_count"] = int(num(supervisor.get("pending_count"))) + 1
+        else:
+            supervisor["pending_state"] = target
+            supervisor["pending_count"] = 1
+
+        worsening = V691_SEVERITY.get(target, 1) > V691_SEVERITY.get(previous_state, 1)
+        required = V691_STATE_CONFIRMATIONS
+        if target == "EXIT_WARNING":
+            required = V691_EXIT_CONFIRMATIONS
+            if snapshot.get("immediate_exit") or len(snapshot.get("hard_flags") or []) >= 2:
+                required = 1
+        elif not worsening:
+            required = V691_STATE_CONFIRMATIONS
+
+        if int(num(supervisor.get("pending_count"))) >= required:
+            supervisor["state"] = target
+            supervisor["pending_state"] = None
+            supervisor["pending_count"] = 0
+            transitioned = True
+
+    current_state = supervisor.get("state") or target
+    tape = snapshot.get("tape") or {}
+    current_r = num(tape.get("current_r"))
+    mfe = supervisor.get("mfe_r")
+    mae = supervisor.get("mae_r")
+    supervisor["mfe_r"] = current_r if mfe is None else max(num(mfe), current_r)
+    supervisor["mae_r"] = current_r if mae is None else min(num(mae), current_r)
+    supervisor["previous_health"] = previous_health
+    supervisor["health"] = health
+    supervisor["last_eval_ts"] = now_ts
+    supervisor["target_state"] = target
+    supervisor["components"] = {
+        "core": round(num((snapshot.get("core") or {}).get("health")), 2),
+        "strategy": round(num((snapshot.get("strategy") or {}).get("health")), 2),
+        "risk": round(num((snapshot.get("risk") or {}).get("health")), 2),
+        "tape": round(num((snapshot.get("tape") or {}).get("health")), 2),
+    }
+    supervisor["current_price"] = num(tape.get("price"))
+    supervisor["current_r"] = current_r
+    supervisor["reasons"] = list(snapshot.get("reasons") or [])[:6]
+    supervisor["hard_flags"] = list(snapshot.get("hard_flags") or [])
+    supervisor["core"] = {
+        "directional_score": num((snapshot.get("core") or {}).get("directional_score")),
+        "selected_direction": (snapshot.get("core") or {}).get("selected_direction"),
+        "state": (snapshot.get("core") or {}).get("state"),
+        "regime": (snapshot.get("core") or {}).get("regime"),
+        "score_delta": num((snapshot.get("core") or {}).get("score_delta")),
+    }
+    supervisor["risk"] = {
+        "decision": (snapshot.get("risk") or {}).get("decision"),
+        "macro_score": num((snapshot.get("risk") or {}).get("macro_score")),
+        "event_risk": (snapshot.get("risk") or {}).get("event_risk"),
+        "btc_direction": ((snapshot.get("risk") or {}).get("btc") or {}).get("direction"),
+        "btc_state": ((snapshot.get("risk") or {}).get("btc") or {}).get("state"),
+        "btc_score": num(((snapshot.get("risk") or {}).get("btc") or {}).get("score")),
+        "open_correlated": int(num((snapshot.get("risk") or {}).get("open_correlated"))),
+        "recent_stop_count": int(num((snapshot.get("risk") or {}).get("recent_stop_count"))),
+    }
+    supervisor["strategy"] = {
+        "consensus": (snapshot.get("strategy") or {}).get("consensus"),
+        "confirm_count": int(num((snapshot.get("strategy") or {}).get("confirm_count"))),
+        "wait_count": int(num((snapshot.get("strategy") or {}).get("wait_count"))),
+        "reject_count": int(num((snapshot.get("strategy") or {}).get("reject_count"))),
+        "statuses": (snapshot.get("strategy") or {}).get("statuses") or {},
+    }
+    supervisor["tape"] = {
+        "oi5": (snapshot.get("tape") or {}).get("oi5"),
+        "oi15": (snapshot.get("tape") or {}).get("oi15"),
+        "price5": (snapshot.get("tape") or {}).get("price5"),
+        "price15": (snapshot.get("tape") or {}).get("price15"),
+    }
+
+    # Capture only the first confirmed EXIT_WARNING. It is the shadow strategy's
+    # counterfactual management exit; the control trade intentionally remains OPEN.
+    if current_state == "EXIT_WARNING" and supervisor.get("shadow_exit_r") is None:
+        supervisor["shadow_exit_ts"] = now_ts
+        supervisor["shadow_exit_price"] = num(tape.get("price"))
+        supervisor["shadow_exit_r"] = round(current_r, 4)
+        supervisor["shadow_exit_reason"] = "; ".join((snapshot.get("reasons") or [])[:3])
+
+    supervisor["state_changed"] = transitioned
+    supervisor["old_state"] = old_state
+    trade["supervisor"] = supervisor
+    return transitioned, old_state, current_state
+
+
+def v691_init_supervisor_lab():
+    if not V68_DB_READY:
+        return False
+
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS fh_trade_supervisor (
+            signal_id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_time TIMESTAMPTZ,
+            entry_price DOUBLE PRECISION,
+            entry_regime TEXT,
+            current_state TEXT,
+            current_health DOUBLE PRECISION,
+            last_eval_time TIMESTAMPTZ,
+            first_exit_warning_time TIMESTAMPTZ,
+            shadow_exit_price DOUBLE PRECISION,
+            shadow_exit_r DOUBLE PRECISION,
+            actual_status TEXT,
+            actual_final_r DOUBLE PRECISION,
+            supervisor_final_r DOUBLE PRECISION,
+            edge_r DOUBLE PRECISION,
+            settled_at TIMESTAMPTZ,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_trade_supervisor_state
+        ON fh_trade_supervisor (current_state, updated_at DESC)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fh_trade_supervisor_snapshots (
+            id BIGSERIAL PRIMARY KEY,
+            snapshot_key TEXT UNIQUE NOT NULL,
+            snapshot_ts BIGINT NOT NULL,
+            snapshot_time TIMESTAMPTZ NOT NULL,
+            signal_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            supervisor_state TEXT,
+            target_state TEXT,
+            health_score DOUBLE PRECISION,
+            core_health DOUBLE PRECISION,
+            strategy_health DOUBLE PRECISION,
+            risk_health DOUBLE PRECISION,
+            tape_health DOUBLE PRECISION,
+            current_price DOUBLE PRECISION,
+            current_r DOUBLE PRECISION,
+            mfe_r DOUBLE PRECISION,
+            mae_r DOUBLE PRECISION,
+            entry_regime TEXT,
+            current_regime TEXT,
+            core_direction TEXT,
+            core_signal_state TEXT,
+            core_directional_score DOUBLE PRECISION,
+            strategy_consensus TEXT,
+            confirm_count INTEGER,
+            wait_count INTEGER,
+            reject_count INTEGER,
+            macro_score DOUBLE PRECISION,
+            event_risk TEXT,
+            btc_direction TEXT,
+            btc_state TEXT,
+            btc_score DOUBLE PRECISION,
+            oi5 DOUBLE PRECISION,
+            oi15 DOUBLE PRECISION,
+            price5 DOUBLE PRECISION,
+            price15 DOUBLE PRECISION,
+            state_changed BOOLEAN NOT NULL DEFAULT FALSE,
+            reasons TEXT[],
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_trade_supervisor_snapshots_trade_time
+        ON fh_trade_supervisor_snapshots (signal_id, snapshot_time DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_trade_supervisor_snapshots_state_time
+        ON fh_trade_supervisor_snapshots (supervisor_state, snapshot_time DESC)
+        """,
+    ]
+    for statement in statements:
+        if not _v68_db_execute(statement):
+            return False
+
+    _v68_state_set("trade_supervisor_version", {
+        "version": V691_SUPERVISOR_VERSION,
+        "mode": "SHADOW_ONLY",
+        "interval_seconds": V691_SUPERVISOR_INTERVAL_SECONDS,
+        "strategy_refresh_seconds": V691_STRATEGY_REFRESH_SECONDS,
+        "snapshot_seconds": V691_SNAPSHOT_SECONDS,
+    })
+    return True
+
+
+def _v691_compact_payload(snapshot, supervisor):
+    strategy = snapshot.get("strategy") or {}
+    core = snapshot.get("core") or {}
+    risk = snapshot.get("risk") or {}
+    tape = snapshot.get("tape") or {}
+    return {
+        "version": V691_SUPERVISOR_VERSION,
+        "target_state": snapshot.get("target_state"),
+        "hard_flags": snapshot.get("hard_flags") or [],
+        "core": {
+            "score": core.get("directional_score"),
+            "direction": core.get("selected_direction"),
+            "state": core.get("state"),
+            "regime": core.get("regime"),
+            "score_delta": core.get("score_delta"),
+        },
+        "risk": {
+            "decision": risk.get("decision"),
+            "macro_score": risk.get("macro_score"),
+            "event_risk": risk.get("event_risk"),
+            "btc": risk.get("btc"),
+            "open_correlated": risk.get("open_correlated"),
+            "recent_stop_count": risk.get("recent_stop_count"),
+        },
+        "strategy": {
+            "consensus": strategy.get("consensus"),
+            "confirm": strategy.get("confirm_count"),
+            "wait": strategy.get("wait_count"),
+            "reject": strategy.get("reject_count"),
+            "statuses": strategy.get("statuses") or {},
+        },
+        "tape": {
+            "current_r": tape.get("current_r"),
+            "oi5": tape.get("oi5"),
+            "oi15": tape.get("oi15"),
+            "price5": tape.get("price5"),
+            "price15": tape.get("price15"),
+        },
+        "reasons": (snapshot.get("reasons") or [])[:6],
+        "shadow_exit_r": supervisor.get("shadow_exit_r"),
+    }
+
+
+def _v691_store_supervisor(trade, snapshot, force_snapshot=False):
+    if not V68_DB_READY:
+        return False
+
+    supervisor = trade.get("supervisor") or {}
+    ts = int(num(snapshot.get("evaluated_ts")) or time.time())
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    entry_ts = num(trade.get("signal_time"))
+    entry_dt = datetime.fromtimestamp(entry_ts, tz=timezone.utc) if entry_ts else None
+    shadow_exit_ts = num(supervisor.get("shadow_exit_ts"))
+    shadow_exit_dt = datetime.fromtimestamp(shadow_exit_ts, tz=timezone.utc) if shadow_exit_ts else None
+    payload = _v691_compact_payload(snapshot, supervisor)
+
+    _v68_db_execute(
+        """
+        INSERT INTO fh_trade_supervisor (
+            signal_id, symbol, direction, entry_time, entry_price, entry_regime,
+            current_state, current_health, last_eval_time,
+            first_exit_warning_time, shadow_exit_price, shadow_exit_r, payload, updated_at
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s, NOW()
+        )
+        ON CONFLICT (signal_id) DO UPDATE SET
+            current_state = EXCLUDED.current_state,
+            current_health = EXCLUDED.current_health,
+            last_eval_time = EXCLUDED.last_eval_time,
+            first_exit_warning_time = COALESCE(fh_trade_supervisor.first_exit_warning_time, EXCLUDED.first_exit_warning_time),
+            shadow_exit_price = COALESCE(fh_trade_supervisor.shadow_exit_price, EXCLUDED.shadow_exit_price),
+            shadow_exit_r = COALESCE(fh_trade_supervisor.shadow_exit_r, EXCLUDED.shadow_exit_r),
+            payload = EXCLUDED.payload,
+            updated_at = NOW()
+        """,
+        (
+            trade.get("signal_id"), trade.get("symbol"), trade.get("direction"),
+            entry_dt, num(trade.get("entry")), snapshot.get("entry_regime"),
+            supervisor.get("state"), num(supervisor.get("health")), dt,
+            shadow_exit_dt, supervisor.get("shadow_exit_price"), supervisor.get("shadow_exit_r"),
+            _v68_json(payload),
+        ),
+    )
+
+    last_snapshot_ts = num(supervisor.get("last_snapshot_ts"))
+    due = (ts - last_snapshot_ts) >= V691_SNAPSHOT_SECONDS
+    state_changed = bool(supervisor.get("state_changed"))
+    if not (force_snapshot or due or state_changed):
+        return True
+
+    bucket_ts = int(ts // max(60, V691_SNAPSHOT_SECONDS)) * max(60, V691_SNAPSHOT_SECONDS)
+    key_material = f"{trade.get('signal_id')}|{bucket_ts}|{supervisor.get('state')}"
+    snapshot_key = hashlib.sha1(key_material.encode("utf-8")).hexdigest()
+    core = snapshot.get("core") or {}
+    risk = snapshot.get("risk") or {}
+    strategy = snapshot.get("strategy") or {}
+    tape = snapshot.get("tape") or {}
+    btc = risk.get("btc") or {}
+
+    stored = _v68_db_execute(
+        """
+        INSERT INTO fh_trade_supervisor_snapshots (
+            snapshot_key, snapshot_ts, snapshot_time, signal_id, symbol, direction,
+            supervisor_state, target_state, health_score,
+            core_health, strategy_health, risk_health, tape_health,
+            current_price, current_r, mfe_r, mae_r,
+            entry_regime, current_regime,
+            core_direction, core_signal_state, core_directional_score,
+            strategy_consensus, confirm_count, wait_count, reject_count,
+            macro_score, event_risk, btc_direction, btc_state, btc_score,
+            oi5, oi15, price5, price15,
+            state_changed, reasons, payload
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s
+        )
+        ON CONFLICT (snapshot_key) DO NOTHING
+        """,
+        (
+            snapshot_key, ts, dt, trade.get("signal_id"), trade.get("symbol"), trade.get("direction"),
+            supervisor.get("state"), snapshot.get("target_state"), num(snapshot.get("health")),
+            num(core.get("health")), num(strategy.get("health")), num(risk.get("health")), num(tape.get("health")),
+            num(tape.get("price")), num(tape.get("current_r")), num(supervisor.get("mfe_r")), num(supervisor.get("mae_r")),
+            snapshot.get("entry_regime"), snapshot.get("current_regime"),
+            core.get("selected_direction"), core.get("state"), num(core.get("directional_score")),
+            strategy.get("consensus"), int(num(strategy.get("confirm_count"))), int(num(strategy.get("wait_count"))), int(num(strategy.get("reject_count"))),
+            num(risk.get("macro_score")), risk.get("event_risk"), btc.get("direction"), btc.get("state"), num(btc.get("score")),
+            tape.get("oi5"), tape.get("oi15"), tape.get("price5"), tape.get("price15"),
+            state_changed, [str(x) for x in (snapshot.get("reasons") or [])[:8]], _v68_json(payload),
+        ),
+    )
+    if stored:
+        supervisor["last_snapshot_ts"] = ts
+    return bool(stored)
+
+
+def _v691_supervisor_alert_message(trade, old_state, new_state):
+    sup = trade.get("supervisor") or {}
+    comp = sup.get("components") or {}
+    risk = sup.get("risk") or {}
+    strategy = sup.get("strategy") or {}
+    reasons = sup.get("reasons") or []
+    icon = {
+        "STRONG_HOLD": "🟢",
+        "HOLD": "✅",
+        "CAUTION": "⚠️",
+        "DEFENSIVE": "🟠",
+        "EXIT_WARNING": "🚨",
+    }.get(new_state, "🤖")
+
+    if old_state:
+        transition = f"{old_state} → {new_state}"
+    else:
+        transition = f"Initial state: {new_state}"
+
+    if new_state == "EXIT_WARNING":
+        view = "Shadow exit thesis triggered. Control paper trade remains unchanged."
+    elif new_state == "DEFENSIVE":
+        view = "Material deterioration. Supervisor would manage defensively in shadow."
+    elif new_state == "CAUTION":
+        view = "Trade thesis is weakening; monitor confirmation closely."
+    elif new_state == "HOLD":
+        view = "Trade thesis has recovered / remains intact."
+    else:
+        view = "Trade thesis is strongly supported."
+
+    reason_text = "\n".join(f"• {x}" for x in reasons[:3]) or "• no major negative flag"
+    shadow_line = ""
+    if sup.get("shadow_exit_r") is not None:
+        shadow_line = f"\nShadow exit captured: {num(sup.get('shadow_exit_r')):+.2f}R"
+
+    return (
+        f"{icon} FUTURESHUNTER V6.9.1 LIVE SUPERVISOR — SHADOW\n\n"
+        f"{trade.get('symbol')} {trade.get('direction')}\n"
+        f"{transition}\n"
+        f"Health: {num(sup.get('health')):.0f}/100 | Current: {num(sup.get('current_r')):+.2f}R\n"
+        f"Core {num(comp.get('core')):.0f} | Strategy {num(comp.get('strategy')):.0f} | Risk {num(comp.get('risk')):.0f} | Tape {num(comp.get('tape')):.0f}\n"
+        f"Strategy: {strategy.get('consensus') or 'N/A'} "
+        f"C/W/R {int(num(strategy.get('confirm_count')))}/{int(num(strategy.get('wait_count')))}/{int(num(strategy.get('reject_count')))}\n"
+        f"Macro {num(risk.get('macro_score')):+.1f} | BTC {risk.get('btc_direction') or 'N/A'} {risk.get('btc_state') or 'N/A'} {num(risk.get('btc_score')):.1f}\n\n"
+        f"{view}\n{reason_text}{shadow_line}\n\n"
+        "Research advisory only — original paper stop/TP/expiry logic is untouched."
+    )
+
+
+def _v691_should_notify(old_state, new_state):
+    important = {"CAUTION", "DEFENSIVE", "EXIT_WARNING"}
+    if new_state in important or old_state in important:
+        return True
+    return False
+
+
+def _v691_monitor_open_trades(trades, details, oi_metrics):
+    now_ts = time.time()
+    open_trades = [t for t in (trades or []) if t.get("status") == "OPEN"]
+    if not open_trades:
+        return 0
+
+    evaluated = 0
+    persist_needed = False
+    for trade in open_trades:
+        sup = trade.get("supervisor") or {}
+        if now_ts - num(sup.get("last_eval_ts")) < V691_SUPERVISOR_INTERVAL_SECONDS:
+            continue
+        try:
+            snapshot = _v691_evaluate_open_trade(trade, trades, details, oi_metrics)
+            transitioned, old_state, new_state = _v691_apply_state_machine(trade, snapshot)
+            sup = trade.get("supervisor") or {}
+            force_snapshot = not bool(sup.get("last_snapshot_ts"))
+            _v691_store_supervisor(trade, snapshot, force_snapshot=force_snapshot)
+            evaluated += 1
+
+            if transitioned and _v691_should_notify(old_state, new_state):
+                send_telegram(_v691_supervisor_alert_message(trade, old_state, new_state))
+                print(
+                    f"V6.9.1 SUPERVISOR: {trade.get('symbol')} {trade.get('direction')} "
+                    f"{old_state or 'INIT'} → {new_state} | health {num(sup.get('health')):.1f}"
+                )
+            persist_needed = True
+        except Exception as error:
+            print(f"V6.9.1 supervisor error {trade.get('symbol')}: {error}")
+
+    if persist_needed:
+        save_json(TRADES_FILE, trades)
+    return evaluated
+
+
+def _v691_settle_supervisor(trades):
+    if not V68_DB_READY:
+        return 0
+    settled = 0
+    changed = False
+    for trade in trades or []:
+        if trade.get("status") == "OPEN" or trade.get("v691_supervisor_settled"):
+            continue
+        supervisor = trade.get("supervisor") or {}
+        if not supervisor.get("initialized"):
+            continue
+
+        actual_r = trade.get("final_r")
+        if actual_r is None:
+            supervisor_r = None
+            edge_r = None
+        else:
+            shadow_exit_r = supervisor.get("shadow_exit_r")
+            supervisor_r = num(shadow_exit_r) if shadow_exit_r is not None else num(actual_r)
+            edge_r = supervisor_r - num(actual_r)
+
+        ok = _v68_db_execute(
+            """
+            UPDATE fh_trade_supervisor
+            SET actual_status = %s,
+                actual_final_r = %s,
+                supervisor_final_r = %s,
+                edge_r = %s,
+                settled_at = NOW(),
+                updated_at = NOW()
+            WHERE signal_id = %s
+            """,
+            (
+                trade.get("status"),
+                None if actual_r is None else num(actual_r),
+                supervisor_r,
+                edge_r,
+                trade.get("signal_id"),
+            ),
+        )
+        if ok:
+            supervisor["actual_status"] = trade.get("status")
+            supervisor["actual_final_r"] = actual_r
+            supervisor["supervisor_final_r"] = supervisor_r
+            supervisor["edge_r"] = edge_r
+            trade["supervisor"] = supervisor
+            trade["v691_supervisor_settled"] = True
+            changed = True
+            settled += 1
+
+    if changed:
+        save_json(TRADES_FILE, trades)
+    return settled
+
+
+def _v691_trade_summary_line(trade):
+    sup = trade.get("supervisor") or {}
+    state = sup.get("state") or "WARMING_UP"
+    return (
+        f"{trade.get('symbol')} {trade.get('direction')} | {state} "
+        f"{num(sup.get('health')):.0f}/100 | {num(sup.get('current_r')):+.2f}R"
+    )
+
+
+def _v691_supervisor_summary_message():
+    trades = load_json(TRADES_FILE, [])
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+    open_trades.sort(
+        key=lambda t: (
+            -V691_SEVERITY.get((t.get("supervisor") or {}).get("state"), 1),
+            num((t.get("supervisor") or {}).get("health")),
+        )
+    )
+
+    lines = [_v691_trade_summary_line(t) for t in open_trades[:15]]
+    stats_text = ""
+    if V68_DB_READY:
+        row = _v68_db_execute(
+            """
+            SELECT COUNT(*),
+                   COUNT(*) FILTER (WHERE actual_status IS NOT NULL),
+                   COUNT(*) FILTER (WHERE shadow_exit_r IS NOT NULL),
+                   COALESCE(SUM(actual_final_r) FILTER (WHERE actual_status IS NOT NULL), 0),
+                   COALESCE(SUM(supervisor_final_r) FILTER (WHERE actual_status IS NOT NULL), 0),
+                   COALESCE(SUM(edge_r) FILTER (WHERE actual_status IS NOT NULL), 0)
+            FROM fh_trade_supervisor
+            """,
+            fetch="one",
+        )
+        if row:
+            tracked, settled, exit_warnings, control_r, supervisor_r, edge_r = row
+            stats_text = (
+                f"\nTracked: {int(tracked or 0)} | settled: {int(settled or 0)} | "
+                f"shadow exits: {int(exit_warnings or 0)}\n"
+                f"Settled control {num(control_r):+.2f}R vs supervisor {num(supervisor_r):+.2f}R "
+                f"(Δ {num(edge_r):+.2f}R)\n"
+            )
+
+    return (
+        "🤖 FUTURESHUNTER V6.9.1 LIVE TRADE SUPERVISOR\n\n"
+        "Mode: SHADOW / ADVISORY — control trades are NEVER altered\n"
+        f"Open trades: {len(open_trades)}\n"
+        + stats_text
+        + ("\n" + "\n".join(lines) if lines else "\nNo open control paper trades.")
+        + "\n\nUse /trade HYPE for the detailed live thesis on one market."
+    )
+
+
+def _v691_trade_detail_message(query):
+    query = str(query or "").strip().upper()
+    if query and not query.endswith("_USDT"):
+        query += "_USDT"
+    trades = load_json(TRADES_FILE, [])
+    candidates = trades
+    if query:
+        candidates = [t for t in trades if str(t.get("symbol") or "").upper() == query]
+    if not candidates:
+        return f"🤖 No tracked paper trade found for {query or 'that symbol'}."
+
+    candidates.sort(
+        key=lambda t: (t.get("status") == "OPEN", num(t.get("signal_time"))),
+        reverse=True,
+    )
+    trade = candidates[0]
+    sup = trade.get("supervisor") or {}
+    if not sup.get("initialized"):
+        return (
+            f"🤖 {trade.get('symbol')} {trade.get('direction')} is tracked, but V6.9.1 "
+            "has not produced its first supervisor evaluation yet."
+        )
+
+    comp = sup.get("components") or {}
+    core = sup.get("core") or {}
+    risk = sup.get("risk") or {}
+    strategy = sup.get("strategy") or {}
+    tape = sup.get("tape") or {}
+    reasons = sup.get("reasons") or []
+    reason_text = "\n".join(f"• {x}" for x in reasons[:5]) or "• no major negative flags"
+    shadow = "Not triggered"
+    if sup.get("shadow_exit_r") is not None:
+        shadow = f"{num(sup.get('shadow_exit_r')):+.2f}R @ {num(sup.get('shadow_exit_price')):.8g}"
+
+    return (
+        f"🤖 V6.9.1 TRADE SUPERVISOR — {trade.get('symbol')}\n\n"
+        f"Control: {trade.get('direction')} {trade.get('status')} | entry {num(trade.get('entry')):.8g}\n"
+        f"Supervisor: {sup.get('state')} | target {sup.get('target_state')} | health {num(sup.get('health')):.0f}/100\n"
+        f"Current: {num(sup.get('current_price')):.8g} | {num(sup.get('current_r')):+.2f}R | "
+        f"MFE {num(sup.get('mfe_r')):+.2f}R | MAE {num(sup.get('mae_r')):+.2f}R\n\n"
+        f"Core {num(comp.get('core')):.0f}: {core.get('selected_direction') or 'N/A'} {core.get('state') or 'N/A'} "
+        f"dir-score {num(core.get('directional_score')):.1f}\n"
+        f"Strategy {num(comp.get('strategy')):.0f}: {strategy.get('consensus') or 'N/A'} "
+        f"C/W/R {int(num(strategy.get('confirm_count')))}/{int(num(strategy.get('wait_count')))}/{int(num(strategy.get('reject_count')))}\n"
+        f"Risk {num(comp.get('risk')):.0f}: {risk.get('decision') or 'N/A'} | macro {num(risk.get('macro_score')):+.1f} | "
+        f"BTC {risk.get('btc_direction') or 'N/A'} {risk.get('btc_state') or 'N/A'} {num(risk.get('btc_score')):.1f}\n"
+        f"Tape {num(comp.get('tape')):.0f}: OI5 {format_optional(tape.get('oi5'))} | "
+        f"OI15 {format_optional(tape.get('oi15'))}\n\n"
+        f"Why:\n{reason_text}\n\n"
+        f"First shadow EXIT: {shadow}\n"
+        "Original paper STOP/TP/expiry remains untouched."
+    )
+
+
+# Add live-supervisor commands without disturbing V6.9 / Risk Lab / Research Lab.
+_V691_V69_HANDLE_TELEGRAM_COMMAND = handle_telegram_command
+
+
+def handle_telegram_command(chat_id, text):
+    parts = (text or "").strip().split()
+    command = parts[0].lower() if parts else ""
+    if command in {"/supervisor", "/livesupervisor", "/tradesupervisor"}:
+        send_to_chat(chat_id, _v691_supervisor_summary_message())
+        return
+    if command in {"/trade", "/tradehealth"}:
+        query = parts[1] if len(parts) > 1 else ""
+        if not query:
+            send_to_chat(chat_id, "Usage: /trade HYPE")
+        else:
+            send_to_chat(chat_id, _v691_trade_detail_message(query))
+        return
+    return _V691_V69_HANDLE_TELEGRAM_COMMAND(chat_id, text)
+
+
 # V6.8 main: same live decision engine as V6.7, with durable state / signal queue
 # and Research Lab farming around it.
 async def main():
     print()
     print("=" * 90)
-    print("MEXC FUTURES HUNTER V6.9 — RESEARCH LAB + RISK LAB + SHADOW STRATEGY ENSEMBLE")
+    print("MEXC FUTURES HUNTER V6.9.1 — RESEARCH + RISK + STRATEGY + LIVE TRADE SUPERVISOR")
     print("=" * 90)
 
     v68_init_database()
     v681_init_risk_lab()
     v69_init_strategy_lab()
+    v691_init_supervisor_lab()
     _v68_restore_subscribers()
     _v68_restore_latest_signal_file()
 
@@ -8204,16 +9335,18 @@ async def main():
     print("Research Lab: EVERY full-scan setup + LONG/SHORT factor vectors")
     print("Risk challenger: SHADOW ONLY — portfolio/regime throttling is being measured")
     print("Strategy ensemble: SHADOW ONLY — 8 explicit playbooks on closed candles")
+    print("Live trade supervisor: SHADOW ONLY — continuously re-evaluates every OPEN trade")
     print("Durable signal queue: persist BEFORE Telegram")
     print("Paper/shadow/alert state: mirrored to Postgres")
     print(f"Paper trade expiry: {TRADE_EXPIRY_HOURS} hours")
 
     send_telegram(
-        "✅ FuturesHunter V6.9 Research + Risk + Strategy Lab is online.\n\n"
+        "✅ FuturesHunter V6.9.1 Research + Risk + Strategy + Live Supervisor is online.\n\n"
         "V6.7 trading logic is unchanged. Durable signal queue + persistent "
         "paper/shadow state + research farming are active.\n"
-        "The V6.8.1 portfolio/regime challenger and V6.9 strategy ensemble are SHADOW-ONLY and do not block control paper signals.\n\n"
-        "Try /research, /risklab, /strategylab, /dbstatus, /macro, /watch or /why ZEC."
+        "The V6.8.1 risk challenger, V6.9 strategy ensemble and V6.9.1 live trade supervisor are SHADOW-ONLY.\n"
+        "The supervisor watches OPEN trades but never closes/resizes the control paper position.\n\n"
+        "Try /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
     )
 
     if gap_seconds > V68_DOWNTIME_THRESHOLD_SECONDS:
@@ -8235,8 +9368,16 @@ async def main():
             print()
             print(f"[{local_time()}] Updating market + OI data...")
 
-            symbols = await get_top_symbols()
-            details = await get_detailed_tickers(symbols)
+            scan_symbols = await get_top_symbols()
+            detail_symbols = list(scan_symbols)
+            for _open_trade in trades:
+                if _open_trade.get("status") != "OPEN":
+                    continue
+                _sym = str(_open_trade.get("symbol") or "")
+                if _sym and _sym not in detail_symbols:
+                    detail_symbols.append(_sym)
+            symbols = detail_symbols
+            details = await get_detailed_tickers(detail_symbols)
 
             if not gap_backfilled and last_seen_ts:
                 _v68_backfill_gap_market_samples(
@@ -8256,9 +9397,23 @@ async def main():
 
             # Track both actual paper signals and rejected/developing shadow trades.
             track_open_trades(trades)
+
+            settled_risk = _v681_settle_risk_challenger(trades)
+            if settled_risk:
+                print(f"V6.8.1 Risk Lab: settled {settled_risk} challenger outcome(s).")
+
             settled_strategy = _v69_settle_strategy_ensemble(trades)
             if settled_strategy:
                 print(f"V6.9 Strategy Lab: settled {settled_strategy} ensemble outcome(s).")
+
+            settled_supervisor = _v691_settle_supervisor(trades)
+            if settled_supervisor:
+                print(f"V6.9.1 Live Supervisor: settled {settled_supervisor} management outcome(s).")
+
+            supervised = _v691_monitor_open_trades(trades, details, oi_metrics)
+            if supervised:
+                print(f"V6.9.1 Live Supervisor: refreshed {supervised} open trade(s).")
+
             track_shadow_trades()
 
             if now >= next_unsent_retry:
@@ -8271,7 +9426,7 @@ async def main():
 
             if now >= next_full_scan:
                 best = run_full_scan(
-                    symbols,
+                    scan_symbols,
                     details,
                     oi_metrics,
                 )
@@ -8311,9 +9466,10 @@ async def main():
                             f"{strategy_shadow.get('reject_count', 0)}"
                         )
 
-                        message = build_alert_message(best).replace(
-                            "V6.7 MACROHUNTER",
-                            "V6.9 RESEARCH LAB",
+                        message = (
+                            build_alert_message(best)
+                            .replace("V6.7 MACROHUNTER", "V6.9.1 RESEARCH LAB")
+                            .replace("Validate V6.6", "Validate V6.9.1")
                         )
 
                         if V68_DB_READY:
@@ -8391,12 +9547,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "6.9",
+                "version": "6.9.1",
                 "macro_regime": get_macro_snapshot().get("regime"),
                 "database_ready": bool(V68_DB_READY),
                 "research_lab": "active" if V68_DB_READY else "local_fallback",
                 "risk_challenger": "shadow" if V68_DB_READY else "local_fallback",
                 "strategy_ensemble": "shadow" if V68_DB_READY else "local_fallback",
+                "trade_supervisor": "shadow_live" if V68_DB_READY else "local_fallback",
                 "event_risk": get_macro_snapshot().get("event_risk"),
                 "uptime_seconds": int(max(0, time.time() - STARTED_AT)),
                 "time": local_time(),
