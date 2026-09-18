@@ -4873,6 +4873,9 @@ async def main():
 
             # Track both actual paper signals and rejected/developing shadow trades.
             track_open_trades(trades)
+            settled_now = _v681_settle_risk_challenger(trades)
+            if settled_now:
+                print(f"V6.8.1 Risk Lab: settled {settled_now} challenger outcome(s).")
             track_shadow_trades()
 
             now = time.time()
@@ -6024,7 +6027,7 @@ V68_DB_LOCK = threading.RLock()
 V68_DB_CONN = None
 V68_DB_READY = False
 V68_DB_LAST_ERROR = ""
-V68_RESEARCH_VERSION = "6.8"
+V68_RESEARCH_VERSION = "6.8.1"
 V68_DOWNTIME_THRESHOLD_SECONDS = int(
     os.getenv("V68_DOWNTIME_THRESHOLD_SECONDS", "180")
 )
@@ -6759,6 +6762,11 @@ def _v68_store_research_results(results):
 
 
 def save_scan_snapshot(results):
+    # V6.8.1 keeps the full in-memory scan available to the shadow risk challenger
+    # so it can assess BTC market health without changing the core signal engine.
+    global V681_LAST_SCAN_RESULTS
+    V681_LAST_SCAN_RESULTS = list(results or [])
+
     _V68_ORIGINAL_SAVE_SCAN_SNAPSHOT(results)
     stored = _v68_store_research_results(results)
     if stored:
@@ -7063,15 +7071,1097 @@ def handle_telegram_command(chat_id, text):
     return _V68_V67_HANDLE_TELEGRAM_COMMAND(chat_id, text)
 
 
+
+# ============================================================
+# V6.8.1 SHADOW PORTFOLIO / REGIME RISK CHALLENGER
+# ============================================================
+#
+# This challenger is intentionally SHADOW-ONLY. It observes every new paper
+# ENTRY that the unchanged V6.7 decision engine would take, assigns an exposure
+# multiplier (1.0 / 0.5 / 0.0), and stores the hypothetical result beside the
+# actual control outcome. No live/paper ENTRY is suppressed by this layer yet.
+#
+# The first target is correlated regime failure: many same-direction crypto
+# positions can all be technically valid and still fail together when BTC and
+# the broader macro/news regime deteriorate. We want evidence before promotion.
+
+V681_LAST_SCAN_RESULTS = []
+V681_RISK_LOOKBACK_HOURS = int(os.getenv("V681_RISK_LOOKBACK_HOURS", "24"))
+V681_MACRO_CONFLICT = float(os.getenv("V681_MACRO_CONFLICT", "35"))
+V681_STRONG_MACRO_CONFLICT = float(os.getenv("V681_STRONG_MACRO_CONFLICT", "42"))
+V681_BTC_ENTRY_STRENGTH = float(os.getenv("V681_BTC_ENTRY_STRENGTH", "68"))
+V681_MAX_CORRELATED_OPEN = int(os.getenv("V681_MAX_CORRELATED_OPEN", "3"))
+V681_HARD_CORRELATED_OPEN = int(os.getenv("V681_HARD_CORRELATED_OPEN", "5"))
+V681_STOP_CLUSTER_COUNT = int(os.getenv("V681_STOP_CLUSTER_COUNT", "2"))
+V681_STOP_CLUSTER_MINUTES = int(os.getenv("V681_STOP_CLUSTER_MINUTES", "60"))
+
+
+def _v681_asset_bucket(symbol):
+    symbol = str(symbol or "").upper()
+    if any(token in symbol for token in ("STOCK", "SOXL", "SOXS", "TQQQ", "SQQQ")):
+        return "EQUITY"
+    if symbol.startswith(("XAU", "XAUT", "SILVER", "GOLD")):
+        return "METAL"
+    if symbol.startswith(("USOIL", "UKOIL", "WTI", "BRENT")):
+        return "ENERGY"
+    return "CRYPTO"
+
+
+def _v681_btc_scan_snapshot():
+    for result in V681_LAST_SCAN_RESULTS or []:
+        if str(result.get("symbol")) == "BTC_USDT":
+            return {
+                "direction": result.get("direction"),
+                "state": result.get("signal_state"),
+                "score": num(result.get("best_score")),
+                "long_score": num(result.get("long_score")),
+                "short_score": num(result.get("short_score")),
+                "oi_score": int(num(result.get("oi_score"))),
+                "regime": result.get("regime"),
+            }
+    return {
+        "direction": None,
+        "state": None,
+        "score": 0.0,
+        "long_score": 0.0,
+        "short_score": 0.0,
+        "oi_score": 0,
+        "regime": None,
+    }
+
+
+def _v681_same_bucket_open(trades, symbol, direction):
+    bucket = _v681_asset_bucket(symbol)
+    count = 0
+    symbols = []
+    for trade in trades or []:
+        if trade.get("status") != "OPEN":
+            continue
+        if trade.get("direction") != direction:
+            continue
+        if _v681_asset_bucket(trade.get("symbol")) != bucket:
+            continue
+        count += 1
+        symbols.append(str(trade.get("symbol")))
+    return count, symbols
+
+
+def _v681_recent_stop_cluster(trades, symbol, direction, now_ts=None):
+    bucket = _v681_asset_bucket(symbol)
+    now_ts = float(now_ts or time.time())
+    cutoff = now_ts - max(1, V681_STOP_CLUSTER_MINUTES) * 60
+    stops = []
+    for trade in trades or []:
+        if trade.get("status") != "STOP":
+            continue
+        if trade.get("direction") != direction:
+            continue
+        if _v681_asset_bucket(trade.get("symbol")) != bucket:
+            continue
+        closed = num(trade.get("closed_time"))
+        if closed >= cutoff:
+            stops.append({
+                "symbol": trade.get("symbol"),
+                "closed_time": closed,
+            })
+    return len(stops), stops
+
+
+def _v681_directional_macro_conflict(direction, bucket, combined_score):
+    # Risk-off/risk-on is meaningful for crypto and equity proxies. Metals and
+    # energy have different macro transmission, so only event risk applies to
+    # them in this first challenger version.
+    if bucket not in {"CRYPTO", "EQUITY"}:
+        return False, False
+
+    if direction == "LONG":
+        return (
+            combined_score <= -V681_MACRO_CONFLICT,
+            combined_score <= -V681_STRONG_MACRO_CONFLICT,
+        )
+    if direction == "SHORT":
+        return (
+            combined_score >= V681_MACRO_CONFLICT,
+            combined_score >= V681_STRONG_MACRO_CONFLICT,
+        )
+    return False, False
+
+
+def _v681_btc_is_weak_for(direction, bucket, btc):
+    if bucket != "CRYPTO":
+        return False
+    if not btc or not btc.get("direction"):
+        return True
+
+    state = str(btc.get("state") or "")
+    score = num(btc.get("score"))
+    aligned = btc.get("direction") == direction
+    strong_state = state in {"ENTRY", "ARMED"}
+    return not (aligned and strong_state and score >= V681_BTC_ENTRY_STRENGTH)
+
+
+def _v681_evaluate_risk_challenger(result, trades):
+    now_ts = time.time()
+    direction = result.get("direction")
+    symbol = result.get("symbol")
+    bucket = _v681_asset_bucket(symbol)
+    macro = get_macro_snapshot() or {}
+    combined = num(macro.get("combined_score"))
+    event_risk = str(macro.get("event_risk") or "LOW").upper()
+    btc = _v681_btc_scan_snapshot()
+
+    open_count, open_symbols = _v681_same_bucket_open(
+        trades, symbol, direction
+    )
+    stop_count, recent_stops = _v681_recent_stop_cluster(
+        trades, symbol, direction, now_ts
+    )
+
+    macro_conflict, strong_macro_conflict = _v681_directional_macro_conflict(
+        direction, bucket, combined
+    )
+    btc_weak = _v681_btc_is_weak_for(direction, bucket, btc)
+
+    multiplier = 1.0
+    reasons = []
+
+    if event_risk == "EXTREME":
+        multiplier = 0.0
+        reasons.append("EXTREME scheduled-event danger window")
+    elif event_risk == "HIGH":
+        multiplier = min(multiplier, 0.5)
+        reasons.append("HIGH scheduled-event risk")
+
+    if macro_conflict:
+        reasons.append(
+            f"{bucket} {direction} conflicts with macro/news regime {combined:+.1f}"
+        )
+        if strong_macro_conflict:
+            multiplier = min(multiplier, 0.5)
+
+    if btc_weak:
+        reasons.append(
+            "BTC is not aligned at ENTRY-strength "
+            f"({btc.get('direction') or 'N/A'} {btc.get('state') or 'N/A'} {num(btc.get('score')):.1f})"
+        )
+
+    if open_count >= V681_MAX_CORRELATED_OPEN:
+        multiplier = min(multiplier, 0.5)
+        reasons.append(
+            f"{open_count} correlated {bucket} {direction} positions already open"
+        )
+
+    if open_count >= V681_HARD_CORRELATED_OPEN:
+        multiplier = 0.0
+        reasons.append(
+            f"hard correlated-exposure cap reached ({open_count})"
+        )
+
+    # Combined failure pattern that hurt the control sample: macro conflict +
+    # weakening BTC while several same-direction crypto positions were already
+    # open. Shadow-block it so we can measure whether that improves expectancy.
+    if bucket == "CRYPTO" and macro_conflict and btc_weak and open_count >= V681_MAX_CORRELATED_OPEN:
+        multiplier = 0.0
+        reasons.append("macro conflict + weak BTC + crowded same-direction crypto book")
+    elif bucket == "CRYPTO" and macro_conflict and btc_weak:
+        multiplier = min(multiplier, 0.5)
+        reasons.append("macro conflict confirmed by weak BTC structure")
+
+    if stop_count >= V681_STOP_CLUSTER_COUNT:
+        multiplier = 0.0
+        reasons.append(
+            f"cooldown: {stop_count} same-bucket {direction} stops in last {V681_STOP_CLUSTER_MINUTES}m"
+        )
+    elif stop_count == 1 and macro_conflict:
+        multiplier = min(multiplier, 0.5)
+        reasons.append("recent stop + macro conflict")
+
+    if multiplier <= 0:
+        decision = "BLOCK"
+        multiplier = 0.0
+    elif multiplier < 1.0:
+        decision = "REDUCE"
+    elif reasons:
+        decision = "CAUTION"
+    else:
+        decision = "ALLOW"
+
+    return {
+        "version": "6.8.1-shadow",
+        "evaluated_ts": now_ts,
+        "decision": decision,
+        "size_multiplier": multiplier,
+        "reasons": reasons,
+        "symbol": symbol,
+        "direction": direction,
+        "asset_bucket": bucket,
+        "signal_score": num(result.get("best_score")),
+        "signal_regime": result.get("regime"),
+        "macro_score": combined,
+        "event_risk": event_risk,
+        "btc": btc,
+        "btc_weak": btc_weak,
+        "macro_conflict": macro_conflict,
+        "strong_macro_conflict": strong_macro_conflict,
+        "open_correlated": open_count,
+        "open_correlated_symbols": open_symbols,
+        "recent_stop_count": stop_count,
+        "recent_stops": recent_stops,
+    }
+
+
+def v681_init_risk_lab():
+    if not V68_DB_READY:
+        return False
+
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS fh_risk_challenger (
+            id BIGSERIAL PRIMARY KEY,
+            evaluated_ts DOUBLE PRECISION NOT NULL,
+            evaluated_time TIMESTAMPTZ NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            asset_bucket TEXT,
+            signal_score DOUBLE PRECISION,
+            signal_regime TEXT,
+            macro_score DOUBLE PRECISION,
+            event_risk TEXT,
+            btc_direction TEXT,
+            btc_state TEXT,
+            btc_score DOUBLE PRECISION,
+            btc_weak BOOLEAN,
+            macro_conflict BOOLEAN,
+            open_correlated INTEGER,
+            recent_stop_count INTEGER,
+            decision TEXT NOT NULL,
+            size_multiplier DOUBLE PRECISION NOT NULL,
+            reasons TEXT[],
+            payload JSONB NOT NULL,
+            actual_status TEXT,
+            actual_final_r DOUBLE PRECISION,
+            challenger_final_r DOUBLE PRECISION,
+            settled_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_risk_challenger_time
+        ON fh_risk_challenger (evaluated_time DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_risk_challenger_decision
+        ON fh_risk_challenger (decision, evaluated_time DESC)
+        """,
+    ]
+    for statement in statements:
+        if not _v68_db_execute(statement):
+            return False
+    _v68_state_set("risk_challenger_version", {
+        "version": "6.8.1-shadow",
+        "mode": "SHADOW_ONLY",
+    })
+    return True
+
+
+def _v681_store_risk_decision(risk):
+    if not V68_DB_READY or not risk:
+        return None
+    ts = float(risk.get("evaluated_ts") or time.time())
+    row = _v68_db_execute(
+        """
+        INSERT INTO fh_risk_challenger (
+            evaluated_ts, evaluated_time, symbol, direction,
+            asset_bucket, signal_score, signal_regime,
+            macro_score, event_risk, btc_direction, btc_state,
+            btc_score, btc_weak, macro_conflict, open_correlated,
+            recent_stop_count, decision, size_multiplier, reasons, payload
+        )
+        VALUES (
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s, %s
+        )
+        RETURNING id
+        """,
+        (
+            ts,
+            datetime.fromtimestamp(ts, tz=timezone.utc),
+            risk.get("symbol"),
+            risk.get("direction"),
+            risk.get("asset_bucket"),
+            num(risk.get("signal_score")),
+            risk.get("signal_regime"),
+            num(risk.get("macro_score")),
+            risk.get("event_risk"),
+            risk.get("btc", {}).get("direction"),
+            risk.get("btc", {}).get("state"),
+            num(risk.get("btc", {}).get("score")),
+            bool(risk.get("btc_weak")),
+            bool(risk.get("macro_conflict")),
+            int(num(risk.get("open_correlated"))),
+            int(num(risk.get("recent_stop_count"))),
+            risk.get("decision"),
+            num(risk.get("size_multiplier")),
+            [str(x) for x in risk.get("reasons", [])],
+            _v68_json(risk),
+        ),
+        fetch="one",
+    )
+    if not row:
+        return None
+    return int(row[0])
+
+
+# Preserve risk-challenger metadata inside each control paper trade so the
+# outcome can be settled later without fuzzy symbol/time matching.
+_V681_ORIGINAL_CREATE_PAPER_TRADE = create_paper_trade
+
+
+def create_paper_trade(result, trades):
+    trade = _V681_ORIGINAL_CREATE_PAPER_TRADE(result, trades)
+    risk = result.get("risk_challenger") if isinstance(result, dict) else None
+    if risk:
+        trade["risk_challenger"] = _clean_json_value(risk)
+        save_json(TRADES_FILE, trades)
+    return trade
+
+
+def _v681_settle_risk_challenger(trades):
+    if not V68_DB_READY:
+        return 0
+    changed = False
+    settled = 0
+
+    for trade in trades or []:
+        if trade.get("status") == "OPEN":
+            continue
+        if trade.get("v681_risk_settled"):
+            continue
+
+        risk = trade.get("risk_challenger") or {}
+        row_id = int(num(risk.get("row_id")))
+        if row_id <= 0:
+            continue
+
+        actual_r = trade.get("final_r")
+        if actual_r is None:
+            # Ambiguous OHLC outcomes stay unscored rather than being guessed.
+            challenger_r = None
+        else:
+            challenger_r = num(actual_r) * num(risk.get("size_multiplier", 1.0))
+
+        ok = _v68_db_execute(
+            """
+            UPDATE fh_risk_challenger
+            SET actual_status = %s,
+                actual_final_r = %s,
+                challenger_final_r = %s,
+                settled_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                trade.get("status"),
+                None if actual_r is None else num(actual_r),
+                challenger_r,
+                row_id,
+            ),
+        )
+        if ok:
+            trade["v681_risk_settled"] = True
+            changed = True
+            settled += 1
+
+    if changed:
+        save_json(TRADES_FILE, trades)
+    return settled
+
+
+def _v681_risklab_summary_message():
+    if not V68_DB_READY:
+        return "🧯 V6.8.1 Risk Lab is waiting for Postgres."
+
+    hours = max(1, V681_RISK_LOOKBACK_HOURS)
+    row = _v68_db_execute(
+        f"""
+        SELECT
+            COUNT(*),
+            COUNT(*) FILTER (WHERE decision = 'ALLOW'),
+            COUNT(*) FILTER (WHERE decision = 'CAUTION'),
+            COUNT(*) FILTER (WHERE decision = 'REDUCE'),
+            COUNT(*) FILTER (WHERE decision = 'BLOCK'),
+            COUNT(*) FILTER (WHERE actual_status IS NOT NULL),
+            COALESCE(SUM(actual_final_r) FILTER (WHERE actual_status IS NOT NULL), 0),
+            COALESCE(SUM(challenger_final_r) FILTER (WHERE actual_status IS NOT NULL), 0)
+        FROM fh_risk_challenger
+        WHERE evaluated_time >= NOW() - INTERVAL '{hours} hours'
+        """,
+        fetch="one",
+    )
+
+    latest = _v68_db_execute(
+        """
+        SELECT symbol, direction, decision, size_multiplier,
+               macro_score, btc_direction, btc_state, btc_score,
+               open_correlated, recent_stop_count, reasons
+        FROM fh_risk_challenger
+        ORDER BY evaluated_time DESC
+        LIMIT 1
+        """,
+        fetch="one",
+    )
+
+    if not row or int(row[0] or 0) == 0:
+        return (
+            "🧯 FUTURESHUNTER V6.8.1 RISK LAB\n\n"
+            "Mode: SHADOW ONLY\n"
+            "No new ENTRY has been evaluated since deployment yet."
+        )
+
+    total, allow, caution, reduce, block, settled, actual_r, shadow_r = row
+    edge = num(shadow_r) - num(actual_r)
+    latest_text = ""
+    if latest:
+        symbol, direction, decision, mult, macro_score, btc_dir, btc_state, btc_score, open_corr, stops, reasons = latest
+        reason_text = "; ".join((reasons or [])[:2]) or "no risk flags"
+        latest_text = (
+            "\n\nLatest challenger decision:\n"
+            f"{symbol} {direction} → {decision} ({num(mult):.1f}x)\n"
+            f"Macro {num(macro_score):+.1f} | BTC {btc_dir or 'N/A'} {btc_state or 'N/A'} {num(btc_score):.1f}\n"
+            f"Correlated open {int(open_corr or 0)} | recent stops {int(stops or 0)}\n"
+            f"Why: {reason_text}"
+        )
+
+    return (
+        "🧯 FUTURESHUNTER V6.8.1 RISK LAB\n\n"
+        "Mode: SHADOW ONLY — control signals remain unchanged\n"
+        f"Window: last {hours}h\n"
+        f"Decisions A/C/R/B: {int(allow or 0)}/{int(caution or 0)}/{int(reduce or 0)}/{int(block or 0)}\n"
+        f"Settled comparisons: {int(settled or 0)}\n"
+        f"Control R: {num(actual_r):+.2f}R\n"
+        f"Shadow risk R: {num(shadow_r):+.2f}R\n"
+        f"Shadow delta: {edge:+.2f}R\n\n"
+        "Do not promote this layer from shadow mode until the sample is materially larger."
+        + latest_text
+    )
+
+
+# Add /risklab without disturbing the V6.8/V6.7 command stack.
+_V681_V68_HANDLE_TELEGRAM_COMMAND = handle_telegram_command
+
+
+def handle_telegram_command(chat_id, text):
+    parts = (text or "").strip().split()
+    command = parts[0].lower() if parts else ""
+    if command in {"/risklab", "/challenger", "/portfolio"}:
+        send_to_chat(chat_id, _v681_risklab_summary_message())
+        return
+    return _V681_V68_HANDLE_TELEGRAM_COMMAND(chat_id, text)
+
+
+# ============================================================
+# FUTURESHUNTER V6.9 — SHADOW STRATEGY ENSEMBLE / PLAYBOOK LAB
+# ============================================================
+# This layer does NOT alter the V6.8.1 control entries. It evaluates a set of
+# explicit, falsifiable trading playbooks using CLOSED candles only, stores the
+# decisions in Postgres, and later settles each playbook against the control
+# trade outcome. Instagram/social-media ideas are treated as hypotheses, not
+# truth. Promotion requires out-of-sample evidence.
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+V69_STRATEGY_VERSION = "6.9-shadow-ensemble"
+V69_STRATEGY_LOOKBACK_HOURS = int(os.getenv("V69_STRATEGY_LOOKBACK_HOURS", "72"))
+V69_CONTEXT_CACHE_SECONDS = int(os.getenv("V69_CONTEXT_CACHE_SECONDS", "180"))
+V69_PLAYBOOK_NAMES = (
+    "MTF_15M_CLOSE",
+    "MTF_1H_CLOSE",
+    "MTF_4H_CLOSE",
+    "BOX_15M_BREAKOUT",
+    "BREAKOUT_RETEST_15M",
+    "EMA20_RECLAIM_15M",
+    "VOL_COMPRESSION_EXPANSION_15M",
+    "ORB_5M_SESSION",
+)
+V69_CONTEXT_CACHE = {}
+
+
+def _v69_status(status, reason, **extra):
+    payload = {"status": status, "reason": reason}
+    payload.update(_clean_json_value(extra))
+    return payload
+
+
+def _v69_closed_frame(symbol, interval):
+    df = get_candles(symbol, interval)
+    if df is None or len(df) < 40:
+        return None
+    try:
+        return add_indicators(df.copy())
+    except Exception as error:
+        print(f"V6.9 strategy context error {symbol} {interval}: {error}")
+        return None
+
+
+def _v69_market_context(symbol):
+    now = time.time()
+    cached = V69_CONTEXT_CACHE.get(symbol)
+    if cached and now - num(cached.get("ts")) < V69_CONTEXT_CACHE_SECONDS:
+        return cached.get("context")
+
+    context = {}
+    for key, interval in (("5m", "Min5"), ("15m", "Min15"), ("1h", "Min60"), ("4h", "Hour4")):
+        df = _v69_closed_frame(symbol, interval)
+        if df is None:
+            return None
+        context[key] = df
+        time.sleep(0.08)
+
+    V69_CONTEXT_CACHE[symbol] = {"ts": now, "context": context}
+    return context
+
+
+def _v69_rows(df):
+    # MEXC includes the still-forming candle at the end. All playbooks use
+    # closed candles only to prevent accidental look-ahead.
+    if df is None or len(df) < 5:
+        return None, None, None
+    closed = df.iloc[:-1]
+    return closed, closed.iloc[-1], closed.iloc[-2]
+
+
+def _v69_directional_close(direction, latest, previous, label):
+    close = num(latest.get("close"))
+    prev_high = num(previous.get("high"))
+    prev_low = num(previous.get("low"))
+    body_pct = num(latest.get("body_pct"))
+    close_location = num(latest.get("close_location"))
+
+    if direction == "LONG":
+        confirmed = close > prev_high and close_location >= 0.60
+        wrong_way = close < prev_low and close_location <= 0.40
+        trigger = prev_high
+    else:
+        confirmed = close < prev_low and close_location <= 0.40
+        wrong_way = close > prev_high and close_location >= 0.60
+        trigger = prev_low
+
+    if confirmed:
+        return _v69_status(
+            "CONFIRM",
+            f"{label} closed beyond the previous candle in signal direction",
+            trigger=trigger,
+            close=close,
+            body_pct=body_pct,
+            close_location=close_location,
+        )
+    if wrong_way:
+        return _v69_status(
+            "REJECT",
+            f"{label} closed beyond the previous candle in the opposite direction",
+            trigger=trigger,
+            close=close,
+        )
+    return _v69_status(
+        "WAIT",
+        f"{label} has not produced a directional close confirmation yet",
+        trigger=trigger,
+        close=close,
+    )
+
+
+def _v69_box_breakout(direction, df15):
+    closed, latest, _ = _v69_rows(df15)
+    if closed is None or len(closed) < 14:
+        return _v69_status("N/A", "insufficient 15m history")
+
+    prior = closed.iloc[-13:-1]
+    box_high = num(prior["high"].max())
+    box_low = num(prior["low"].min())
+    close = num(latest["close"])
+    rv = num(latest.get("relative_volume"))
+    body = num(latest.get("body_pct"))
+    loc = num(latest.get("close_location"))
+
+    if direction == "LONG":
+        if close > box_high and body >= 0.45 and loc >= 0.60:
+            return _v69_status("CONFIRM", "15m closed above the 12-candle box", box_high=box_high, box_low=box_low, rv=rv)
+        if close < box_low:
+            return _v69_status("REJECT", "15m closed below the box while signal is LONG", box_high=box_high, box_low=box_low)
+    else:
+        if close < box_low and body >= 0.45 and loc <= 0.40:
+            return _v69_status("CONFIRM", "15m closed below the 12-candle box", box_high=box_high, box_low=box_low, rv=rv)
+        if close > box_high:
+            return _v69_status("REJECT", "15m closed above the box while signal is SHORT", box_high=box_high, box_low=box_low)
+
+    return _v69_status("WAIT", "price is still inside/around the 15m box", box_high=box_high, box_low=box_low, rv=rv)
+
+
+def _v69_breakout_retest(direction, df15):
+    closed, latest, previous = _v69_rows(df15)
+    if closed is None or len(closed) < 16:
+        return _v69_status("N/A", "insufficient 15m history")
+
+    # Box is defined using candles before the previous candle. The previous
+    # candle is the candidate breakout; latest is the candidate retest/hold.
+    base = closed.iloc[-14:-2]
+    box_high = num(base["high"].max())
+    box_low = num(base["low"].min())
+    atr = max(num(latest.get("atr14")), num(latest.get("atr")), 1e-12)
+    tolerance = 0.20 * atr
+
+    pclose = num(previous["close"])
+    close = num(latest["close"])
+    high = num(latest["high"])
+    low = num(latest["low"])
+
+    if direction == "LONG":
+        breakout = pclose > box_high
+        retest = low <= box_high + tolerance and close > box_high
+        if breakout and retest:
+            return _v69_status("CONFIRM", "prior 15m breakout retested the box top and held", level=box_high, tolerance=tolerance)
+        if close < box_low:
+            return _v69_status("REJECT", "retest failed back through the opposite side of the box", level=box_high)
+    else:
+        breakout = pclose < box_low
+        retest = high >= box_low - tolerance and close < box_low
+        if breakout and retest:
+            return _v69_status("CONFIRM", "prior 15m breakdown retested the box bottom and held", level=box_low, tolerance=tolerance)
+        if close > box_high:
+            return _v69_status("REJECT", "retest failed back through the opposite side of the box", level=box_low)
+
+    return _v69_status("WAIT", "breakout + retest sequence is not complete", box_high=box_high, box_low=box_low)
+
+
+def _v69_ema20_reclaim(direction, df15, df1h):
+    _, latest, _ = _v69_rows(df15)
+    _, h1, _ = _v69_rows(df1h)
+    if latest is None or h1 is None:
+        return _v69_status("N/A", "missing 15m/1h data")
+
+    close = num(latest["close"])
+    open_ = num(latest["open"])
+    high = num(latest["high"])
+    low = num(latest["low"])
+    ema20 = num(latest.get("ema20"))
+    atr = max(num(latest.get("atr14")), num(latest.get("atr")), 1e-12)
+    trend1h = describe_trend(h1)
+    touch = 0.22 * atr
+
+    if direction == "LONG":
+        if trend1h == "BEARISH":
+            return _v69_status("REJECT", "1h trend is bearish for a LONG pullback play")
+        if low <= ema20 + touch and close > ema20 and close > open_:
+            return _v69_status("CONFIRM", "15m pulled into EMA20 and reclaimed it with 1h non-bearish", ema20=ema20, trend1h=trend1h)
+        if close < ema20 - 0.50 * atr:
+            return _v69_status("REJECT", "15m lost EMA20 by more than 0.5 ATR", ema20=ema20)
+    else:
+        if trend1h == "BULLISH":
+            return _v69_status("REJECT", "1h trend is bullish for a SHORT pullback play")
+        if high >= ema20 - touch and close < ema20 and close < open_:
+            return _v69_status("CONFIRM", "15m pulled into EMA20 and rejected it with 1h non-bullish", ema20=ema20, trend1h=trend1h)
+        if close > ema20 + 0.50 * atr:
+            return _v69_status("REJECT", "15m reclaimed EMA20 by more than 0.5 ATR against SHORT", ema20=ema20)
+
+    return _v69_status("WAIT", "waiting for an EMA20 pullback/reclaim sequence", ema20=ema20, trend1h=trend1h)
+
+
+def _v69_vol_compression_expansion(direction, df15):
+    closed, latest, previous = _v69_rows(df15)
+    if closed is None or len(closed) < 55:
+        return _v69_status("N/A", "insufficient history for compression percentile")
+
+    widths = closed["bb_width"].dropna().iloc[-50:]
+    if len(widths) < 30:
+        return _v69_status("N/A", "insufficient Bollinger width history")
+
+    threshold = float(widths.quantile(0.35))
+    pre_width = num(previous.get("bb_width"))
+    latest_width = num(latest.get("bb_width"))
+    rv = num(latest.get("relative_volume"))
+    atr = max(num(latest.get("atr14")), 1e-12)
+    candle_range = num(latest["high"]) - num(latest["low"])
+    loc = num(latest.get("close_location"))
+    expansion = latest_width > pre_width and candle_range >= 1.05 * atr and rv >= 1.10
+    compressed = pre_width <= threshold
+
+    if not compressed:
+        return _v69_status("N/A", "no preceding volatility compression", pre_width=pre_width, threshold=threshold)
+
+    if direction == "LONG" and expansion and loc >= 0.65:
+        return _v69_status("CONFIRM", "15m volatility compression expanded upward with volume", rv=rv, pre_width=pre_width, latest_width=latest_width)
+    if direction == "SHORT" and expansion and loc <= 0.35:
+        return _v69_status("CONFIRM", "15m volatility compression expanded downward with volume", rv=rv, pre_width=pre_width, latest_width=latest_width)
+
+    return _v69_status("WAIT", "compression exists but directional expansion is not confirmed", rv=rv, pre_width=pre_width, latest_width=latest_width)
+
+
+def _v69_session_open_utc_ts(bucket, reference_ts):
+    dt_utc = datetime.fromtimestamp(reference_ts, tz=timezone.utc)
+
+    if bucket == "CRYPTO":
+        # Deliberately named/treated as a hypothesis: crypto has no exchange
+        # open. We test the first 5m candle of the UTC trading day because this
+        # is a common social-media rule, not because it is assumed valid.
+        return datetime(dt_utc.year, dt_utc.month, dt_utc.day, tzinfo=timezone.utc).timestamp(), "UTC_DAY_00:00"
+
+    if ZoneInfo is None:
+        return None, None
+
+    ny = ZoneInfo("America/New_York")
+    dt_ny = dt_utc.astimezone(ny)
+    if bucket == "EQUITY":
+        local = datetime(dt_ny.year, dt_ny.month, dt_ny.day, 9, 30, tzinfo=ny)
+        return local.astimezone(timezone.utc).timestamp(), "NY_09:30"
+    if bucket == "METAL":
+        # 08:20 New York is tested as a gold/metals session hypothesis.
+        local = datetime(dt_ny.year, dt_ny.month, dt_ny.day, 8, 20, tzinfo=ny)
+        return local.astimezone(timezone.utc).timestamp(), "NY_METALS_08:20"
+
+    return None, None
+
+
+def _v69_orb_5m(direction, symbol, df5):
+    closed, latest, _ = _v69_rows(df5)
+    if closed is None or len(closed) < 10:
+        return _v69_status("N/A", "insufficient 5m history")
+
+    bucket = _v681_asset_bucket(symbol)
+    session_ts, session_name = _v69_session_open_utc_ts(bucket, num(latest["time"]))
+    if session_ts is None:
+        return _v69_status("N/A", f"5m ORB not defined for {bucket}")
+
+    candidates = closed[(closed["time"] >= session_ts) & (closed["time"] < session_ts + 300)]
+    if candidates.empty:
+        return _v69_status("N/A", f"session opening 5m candle unavailable ({session_name})")
+
+    opening = candidates.iloc[0]
+    orb_high = num(opening["high"])
+    orb_low = num(opening["low"])
+    close = num(latest["close"])
+    loc = num(latest.get("close_location"))
+
+    if num(latest["time"]) <= num(opening["time"]):
+        return _v69_status("WAIT", "opening 5m range has only just formed", session=session_name, orb_high=orb_high, orb_low=orb_low)
+
+    if direction == "LONG":
+        if close > orb_high and loc >= 0.55:
+            return _v69_status("CONFIRM", "price closed above the session first-5m range", session=session_name, orb_high=orb_high, orb_low=orb_low)
+        if close < orb_low and loc <= 0.40:
+            return _v69_status("REJECT", "price closed below the session first-5m range against LONG", session=session_name, orb_high=orb_high, orb_low=orb_low)
+    else:
+        if close < orb_low and loc <= 0.45:
+            return _v69_status("CONFIRM", "price closed below the session first-5m range", session=session_name, orb_high=orb_high, orb_low=orb_low)
+        if close > orb_high and loc >= 0.60:
+            return _v69_status("REJECT", "price closed above the session first-5m range against SHORT", session=session_name, orb_high=orb_high, orb_low=orb_low)
+
+    return _v69_status("WAIT", "price has not closed outside the first-5m range in signal direction", session=session_name, orb_high=orb_high, orb_low=orb_low)
+
+
+def _v69_evaluate_strategy_ensemble(result):
+    symbol = result.get("symbol")
+    direction = result.get("direction")
+    context = _v69_market_context(symbol)
+    if context is None:
+        return {
+            "version": V69_STRATEGY_VERSION,
+            "evaluated_ts": time.time(),
+            "symbol": symbol,
+            "direction": direction,
+            "consensus": "NO_DATA",
+            "confirm_count": 0,
+            "wait_count": 0,
+            "reject_count": 0,
+            "applicable_count": 0,
+            "playbooks": {},
+        }
+
+    _, m15, p15 = _v69_rows(context["15m"])
+    _, h1, p1h = _v69_rows(context["1h"])
+    _, h4, p4h = _v69_rows(context["4h"])
+
+    playbooks = {
+        "MTF_15M_CLOSE": _v69_directional_close(direction, m15, p15, "15m"),
+        "MTF_1H_CLOSE": _v69_directional_close(direction, h1, p1h, "1h"),
+        "MTF_4H_CLOSE": _v69_directional_close(direction, h4, p4h, "4h"),
+        "BOX_15M_BREAKOUT": _v69_box_breakout(direction, context["15m"]),
+        "BREAKOUT_RETEST_15M": _v69_breakout_retest(direction, context["15m"]),
+        "EMA20_RECLAIM_15M": _v69_ema20_reclaim(direction, context["15m"], context["1h"]),
+        "VOL_COMPRESSION_EXPANSION_15M": _v69_vol_compression_expansion(direction, context["15m"]),
+        "ORB_5M_SESSION": _v69_orb_5m(direction, symbol, context["5m"]),
+    }
+
+    statuses = [p.get("status") for p in playbooks.values() if p.get("status") != "N/A"]
+    confirm = statuses.count("CONFIRM")
+    wait = statuses.count("WAIT")
+    reject = statuses.count("REJECT")
+    applicable = len(statuses)
+
+    if applicable == 0:
+        consensus = "NO_DATA"
+    elif reject >= 2 and reject > confirm:
+        consensus = "AVOID"
+    elif confirm >= 3 and reject == 0:
+        consensus = "STRONG_CONFIRM"
+    elif confirm >= 2 and confirm > reject:
+        consensus = "CONFIRM"
+    elif wait >= max(confirm, reject):
+        consensus = "WAIT"
+    else:
+        consensus = "MIXED"
+
+    return {
+        "version": V69_STRATEGY_VERSION,
+        "evaluated_ts": time.time(),
+        "symbol": symbol,
+        "direction": direction,
+        "asset_bucket": _v681_asset_bucket(symbol),
+        "signal_score": num(result.get("best_score")),
+        "signal_regime": result.get("regime"),
+        "consensus": consensus,
+        "confirm_count": confirm,
+        "wait_count": wait,
+        "reject_count": reject,
+        "applicable_count": applicable,
+        "playbooks": playbooks,
+    }
+
+
+def v69_init_strategy_lab():
+    if not V68_DB_READY:
+        return False
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS fh_strategy_ensemble (
+            id BIGSERIAL PRIMARY KEY,
+            ensemble_key TEXT UNIQUE NOT NULL,
+            evaluated_ts DOUBLE PRECISION NOT NULL,
+            evaluated_time TIMESTAMPTZ NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            asset_bucket TEXT,
+            signal_score DOUBLE PRECISION,
+            signal_regime TEXT,
+            consensus TEXT,
+            confirm_count INTEGER,
+            wait_count INTEGER,
+            reject_count INTEGER,
+            applicable_count INTEGER,
+            playbooks JSONB NOT NULL,
+            payload JSONB NOT NULL,
+            actual_status TEXT,
+            actual_final_r DOUBLE PRECISION,
+            settled_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_strategy_ensemble_time
+        ON fh_strategy_ensemble (evaluated_time DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_fh_strategy_ensemble_consensus
+        ON fh_strategy_ensemble (consensus, evaluated_time DESC)
+        """,
+    ]
+    for statement in statements:
+        if not _v68_db_execute(statement):
+            return False
+    _v68_state_set("strategy_ensemble_version", {
+        "version": V69_STRATEGY_VERSION,
+        "mode": "SHADOW_ONLY",
+        "playbooks": list(V69_PLAYBOOK_NAMES),
+    })
+    return True
+
+
+def _v69_ensemble_key(result, ensemble):
+    ts_minute = int(num(ensemble.get("evaluated_ts")) // 60)
+    raw = f"{ts_minute}|{result.get('symbol')}|{result.get('direction')}|{num(result.get('price')):.12g}|{num(result.get('best_score')):.3f}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _v69_store_ensemble(result, ensemble):
+    if not V68_DB_READY or not ensemble:
+        return None
+    ts = float(ensemble.get("evaluated_ts") or time.time())
+    key = _v69_ensemble_key(result, ensemble)
+    row = _v68_db_execute(
+        """
+        INSERT INTO fh_strategy_ensemble (
+            ensemble_key, evaluated_ts, evaluated_time, symbol, direction,
+            asset_bucket, signal_score, signal_regime, consensus,
+            confirm_count, wait_count, reject_count, applicable_count,
+            playbooks, payload
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s
+        )
+        ON CONFLICT (ensemble_key) DO NOTHING
+        RETURNING id
+        """,
+        (
+            key, ts, datetime.fromtimestamp(ts, tz=timezone.utc),
+            result.get("symbol"), result.get("direction"),
+            ensemble.get("asset_bucket"), num(ensemble.get("signal_score")),
+            ensemble.get("signal_regime"), ensemble.get("consensus"),
+            int(num(ensemble.get("confirm_count"))), int(num(ensemble.get("wait_count"))),
+            int(num(ensemble.get("reject_count"))), int(num(ensemble.get("applicable_count"))),
+            _v68_json(ensemble.get("playbooks", {})), _v68_json(ensemble),
+        ),
+        fetch="one",
+    )
+    if row:
+        return int(row[0])
+    existing = _v68_db_execute(
+        "SELECT id FROM fh_strategy_ensemble WHERE ensemble_key = %s",
+        (key,), fetch="one"
+    )
+    return int(existing[0]) if existing else None
+
+
+_V69_V681_CREATE_PAPER_TRADE = create_paper_trade
+
+
+def create_paper_trade(result, trades):
+    trade = _V69_V681_CREATE_PAPER_TRADE(result, trades)
+    ensemble = result.get("strategy_ensemble") if isinstance(result, dict) else None
+    if ensemble:
+        trade["strategy_ensemble"] = _clean_json_value(ensemble)
+        save_json(TRADES_FILE, trades)
+    return trade
+
+
+def _v69_settle_strategy_ensemble(trades):
+    if not V68_DB_READY:
+        return 0
+    settled = 0
+    changed = False
+    for trade in trades or []:
+        if trade.get("status") == "OPEN" or trade.get("v69_strategy_settled"):
+            continue
+        ensemble = trade.get("strategy_ensemble") or {}
+        row_id = int(num(ensemble.get("row_id")))
+        if row_id <= 0:
+            continue
+        actual_r = trade.get("final_r")
+        ok = _v68_db_execute(
+            """
+            UPDATE fh_strategy_ensemble
+            SET actual_status = %s,
+                actual_final_r = %s,
+                settled_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                trade.get("status"),
+                None if actual_r is None else num(actual_r),
+                row_id,
+            ),
+        )
+        if ok:
+            trade["v69_strategy_settled"] = True
+            changed = True
+            settled += 1
+    if changed:
+        save_json(TRADES_FILE, trades)
+    return settled
+
+
+def _v69_strategy_lab_summary_message():
+    if not V68_DB_READY:
+        return "🧠 V6.9 Strategy Lab is waiting for Postgres."
+
+    hours = max(1, V69_STRATEGY_LOOKBACK_HOURS)
+    rows = _v68_db_execute(
+        f"""
+        SELECT consensus, playbooks, actual_final_r
+        FROM fh_strategy_ensemble
+        WHERE evaluated_time >= NOW() - INTERVAL '{hours} hours'
+        ORDER BY evaluated_time DESC
+        """,
+        fetch="all",
+    ) or []
+
+    if not rows:
+        return (
+            "🧠 FUTURESHUNTER V6.9 STRATEGY LAB\n\n"
+            "Mode: SHADOW ONLY\n"
+            "No control ENTRY has been evaluated by the playbook ensemble yet."
+        )
+
+    settled_rows = [r for r in rows if r[2] is not None]
+    control_r = sum(num(r[2]) for r in settled_rows)
+    consensus_counts = {}
+    for consensus, _, _ in rows:
+        consensus_counts[str(consensus)] = consensus_counts.get(str(consensus), 0) + 1
+
+    perf = {name: {"confirm": 0, "settled": 0, "r": 0.0} for name in V69_PLAYBOOK_NAMES}
+    for _, playbooks, actual_r in rows:
+        playbooks = playbooks or {}
+        for name in V69_PLAYBOOK_NAMES:
+            pb = playbooks.get(name) or {}
+            if pb.get("status") == "CONFIRM":
+                perf[name]["confirm"] += 1
+                if actual_r is not None:
+                    perf[name]["settled"] += 1
+                    perf[name]["r"] += num(actual_r)
+
+    ranked = sorted(
+        perf.items(),
+        key=lambda item: (item[1]["settled"], item[1]["r"]),
+        reverse=True,
+    )
+    lines = []
+    for name, p in ranked:
+        lines.append(
+            f"{name}: confirms {p['confirm']} | settled {p['settled']} | filter R {p['r']:+.1f}"
+        )
+
+    ctext = ", ".join(f"{k} {v}" for k, v in sorted(consensus_counts.items()))
+    return (
+        "🧠 FUTURESHUNTER V6.9 STRATEGY LAB\n\n"
+        "Mode: SHADOW ONLY — ZERO control-entry changes\n"
+        f"Window: last {hours}h\n"
+        f"Signals evaluated: {len(rows)} | settled: {len(settled_rows)}\n"
+        f"Control R on settled: {control_r:+.2f}R\n"
+        f"Consensus: {ctext}\n\n"
+        + "\n".join(lines)
+        + "\n\nFilter R means: take the original control trade only when that playbook already CONFIRMED. WAIT is not yet simulated as a delayed re-entry."
+    )
+
+
+# Add Strategy Lab commands without disturbing Risk Lab / Research Lab commands.
+_V69_V681_HANDLE_TELEGRAM_COMMAND = handle_telegram_command
+
+
+def handle_telegram_command(chat_id, text):
+    parts = (text or "").strip().split()
+    command = parts[0].lower() if parts else ""
+    if command in {"/strategylab", "/playbooks", "/ensemble"}:
+        send_to_chat(chat_id, _v69_strategy_lab_summary_message())
+        return
+    return _V69_V681_HANDLE_TELEGRAM_COMMAND(chat_id, text)
+
+
 # V6.8 main: same live decision engine as V6.7, with durable state / signal queue
 # and Research Lab farming around it.
 async def main():
     print()
     print("=" * 90)
-    print("MEXC FUTURES HUNTER V6.8 — DURABLE RESEARCH LAB + MACROHUNTER")
+    print("MEXC FUTURES HUNTER V6.9 — RESEARCH LAB + RISK LAB + SHADOW STRATEGY ENSEMBLE")
     print("=" * 90)
 
     v68_init_database()
+    v681_init_risk_lab()
+    v69_init_strategy_lab()
     _v68_restore_subscribers()
     _v68_restore_latest_signal_file()
 
@@ -7112,15 +8202,18 @@ async def main():
     print("States: WATCH → ARMED → ENTRY")
     print(f"Focus symbols: {', '.join(sorted(FOCUS_SYMBOLS)) or 'none'}")
     print("Research Lab: EVERY full-scan setup + LONG/SHORT factor vectors")
+    print("Risk challenger: SHADOW ONLY — portfolio/regime throttling is being measured")
+    print("Strategy ensemble: SHADOW ONLY — 8 explicit playbooks on closed candles")
     print("Durable signal queue: persist BEFORE Telegram")
     print("Paper/shadow/alert state: mirrored to Postgres")
     print(f"Paper trade expiry: {TRADE_EXPIRY_HOURS} hours")
 
     send_telegram(
-        "✅ FuturesHunter V6.8 Research Lab is online.\n\n"
+        "✅ FuturesHunter V6.9 Research + Risk + Strategy Lab is online.\n\n"
         "V6.7 trading logic is unchanged. Durable signal queue + persistent "
-        "paper/shadow state + research farming are active.\n\n"
-        "Try /research, /dbstatus, /macro, /watch or /why ZEC."
+        "paper/shadow state + research farming are active.\n"
+        "The V6.8.1 portfolio/regime challenger and V6.9 strategy ensemble are SHADOW-ONLY and do not block control paper signals.\n\n"
+        "Try /research, /risklab, /strategylab, /dbstatus, /macro, /watch or /why ZEC."
     )
 
     if gap_seconds > V68_DOWNTIME_THRESHOLD_SECONDS:
@@ -7163,6 +8256,9 @@ async def main():
 
             # Track both actual paper signals and rejected/developing shadow trades.
             track_open_trades(trades)
+            settled_strategy = _v69_settle_strategy_ensemble(trades)
+            if settled_strategy:
+                print(f"V6.9 Strategy Lab: settled {settled_strategy} ensemble outcome(s).")
             track_shadow_trades()
 
             if now >= next_unsent_retry:
@@ -7186,9 +8282,38 @@ async def main():
 
                 if best is not None:
                     if should_send_alert(best, alert_state, trades):
+                        # Shadow-only portfolio/regime challenger. The control trade
+                        # is still taken exactly as V6.8 would take it.
+                        risk_shadow = _v681_evaluate_risk_challenger(best, trades)
+                        risk_row_id = _v681_store_risk_decision(risk_shadow)
+                        if risk_row_id:
+                            risk_shadow["row_id"] = risk_row_id
+                        best["risk_challenger"] = risk_shadow
+                        print(
+                            f"V6.8.1 RISK SHADOW: {best['symbol']} {best['direction']} "
+                            f"→ {risk_shadow['decision']} ({risk_shadow['size_multiplier']:.1f}x)"
+                            + (
+                                " — " + "; ".join(risk_shadow.get("reasons", [])[:2])
+                                if risk_shadow.get("reasons") else ""
+                            )
+                        )
+
+                        strategy_shadow = _v69_evaluate_strategy_ensemble(best)
+                        strategy_row_id = _v69_store_ensemble(best, strategy_shadow)
+                        if strategy_row_id:
+                            strategy_shadow["row_id"] = strategy_row_id
+                        best["strategy_ensemble"] = strategy_shadow
+                        print(
+                            f"V6.9 STRATEGY SHADOW: {best['symbol']} {best['direction']} "
+                            f"→ {strategy_shadow.get('consensus')} "
+                            f"C/W/R {strategy_shadow.get('confirm_count', 0)}/"
+                            f"{strategy_shadow.get('wait_count', 0)}/"
+                            f"{strategy_shadow.get('reject_count', 0)}"
+                        )
+
                         message = build_alert_message(best).replace(
                             "V6.7 MACROHUNTER",
-                            "V6.8 RESEARCH LAB",
+                            "V6.9 RESEARCH LAB",
                         )
 
                         if V68_DB_READY:
@@ -7266,10 +8391,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "6.8",
+                "version": "6.9",
                 "macro_regime": get_macro_snapshot().get("regime"),
                 "database_ready": bool(V68_DB_READY),
                 "research_lab": "active" if V68_DB_READY else "local_fallback",
+                "risk_challenger": "shadow" if V68_DB_READY else "local_fallback",
+                "strategy_ensemble": "shadow" if V68_DB_READY else "local_fallback",
                 "event_risk": get_macro_snapshot().get("event_risk"),
                 "uptime_seconds": int(max(0, time.time() - STARTED_AT)),
                 "time": local_time(),
