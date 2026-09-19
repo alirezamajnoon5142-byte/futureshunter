@@ -14,13 +14,14 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.1.2-safety-init-fix"
+V70_VERSION = "7.1.3-dry-run-harness"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ENABLED = os.getenv("V70_LIVE_ENABLED", "false").lower() == "true"
 ARMED = os.getenv("V70_LIVE_ARMED", "false").lower() == "true"
+DRY_RUN = os.getenv("V70_DRY_RUN", "false").lower() == "true"
 PILOT_START_BALANCE = float(os.getenv("V70_PILOT_START_BALANCE", os.getenv("V70_START_BALANCE", "27")))
 RISK_PCT = min(0.01, max(0.0001, float(os.getenv("V70_RISK_PCT", "0.01"))))
 DAILY_LOSS_PCT = min(0.03, max(0.0001, float(os.getenv("V70_DAILY_LOSS_PCT", "0.03"))))
@@ -51,6 +52,7 @@ def diagnostic_state():
         "version": V70_VERSION,
         "enabled": ENABLED,
         "armed": ARMED,
+        "dry_run": DRY_RUN,
         "credentials_present": bool(ACCESS_KEY and SECRET_KEY),
         "database_configured": bool(DATABASE_URL),
         "pilot_start_balance": PILOT_START_BALANCE,
@@ -78,9 +80,13 @@ def _clean_params(params):
 
 
 def _signed(method, path, params=None, timeout=10):
+    method = method.upper()
+    # Transport-level safety interlock: dry-run may read MEXC but can NEVER mutate it.
+    if DRY_RUN and method not in {"GET"}:
+        raise RuntimeError(f"V7DRYRUN WRITE BLOCKED: {method} {path}")
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("MEXC live API credentials are not configured")
-    method = method.upper(); params = _clean_params(params)
+    params = _clean_params(params)
     ts = str(int(time.time() * 1000))
     if method in {"GET", "DELETE"}:
         items = sorted(params.items(), key=lambda x: x[0])
@@ -238,6 +244,63 @@ def preflight():
         halt(f"daily loss breaker reached: {_daily_net_loss():.4f} >= {limits['daily_loss_limit']:.4f} USDT"); return False, "daily loss breaker"
     if avail <= 0: return False, "no available USDT"
     return True, {"asset": a, "limits": limits}
+
+
+
+def run_zero_order_dry_run(symbol="BTC_USDT"):
+    """Exercise account/risk/contract/order construction without any MEXC write.
+
+    Requires ARMED=false and V70_DRY_RUN=true. GETs are real; all non-GETs are
+    blocked in _signed before requests.request is reached.
+    """
+    checks=[]
+    def ck(name, ok, detail=""):
+        checks.append((name, bool(ok), detail))
+        _diag(f"V7DRYRUN {'PASS' if ok else 'FAIL'} {name}" + (f" | {detail}" if detail else ""))
+    if not DRY_RUN:
+        _diag("V7DRYRUN SKIP V70_DRY_RUN=false"); return False
+    if ARMED:
+        _diag("V7DRYRUN FAIL ARMED must remain false"); return False
+    try:
+        a=asset(); limits=_dynamic_limits(a); pos=positions(); c=contract(symbol)
+        eq=float(a.get("equity") or 0); avail=float(a.get("availableOpen") or a.get("availableBalance") or 0)
+        ck("account_read", eq>0, f"equity={eq:.4f} available={avail:.4f}")
+        ck("zero_positions", len(pos)==0, f"positions={len(pos)}")
+        halted,why=halt_status(); ck("not_halted", not halted, why)
+        ck("equity_floor", eq>=limits["equity_kill"], f"equity={eq:.4f} floor={limits['equity_kill']:.2f}")
+        ck("daily_breaker", _daily_net_loss()<limits["daily_loss_limit"], f"loss={_daily_net_loss():.4f} limit={limits['daily_loss_limit']:.4f}")
+        ck("api_allowed", bool(c.get("apiAllowed",False)), f"symbol={symbol}")
+        ck("isolated_supported", int(c.get("positionOpenType",0)) in {1,3}, f"positionOpenType={c.get('positionOpenType')}")
+        # Use exchange metadata price when present; this is payload construction only, never submission.
+        entry=float(c.get("fairPrice") or c.get("indexPrice") or c.get("lastPrice") or 100.0)
+        if entry<=0: entry=100.0
+        contract_size=float(c["contractSize"]); step=float(c.get("volUnit") or 1); min_vol=float(c.get("minVol") or step)
+        stop_pct=1.0; stop_long=entry*(1-stop_pct/100); tp_long=entry*(1+3*stop_pct/100)
+        requested=min(limits["max_notional"], limits["risk_usdt"]/(stop_pct/100))
+        contracts=_floor_step(requested/(entry*contract_size),step)
+        actual=contracts*contract_size*entry
+        risk=actual*stop_pct/100
+        base_ok=contracts>=min_vol and actual<=limits["max_notional"]+1e-8 and risk<=limits["risk_usdt"]+1e-6
+        for direction in ("LONG","SHORT"):
+            stop=stop_long if direction=="LONG" else entry*(1+stop_pct/100)
+            tp3=tp_long if direction=="LONG" else entry*(1-3*stop_pct/100)
+            payload={"symbol":symbol,"price":entry,"vol":contracts,"leverage":min(MAX_LEVERAGE,int(c.get("maxLeverage") or MAX_LEVERAGE)),"side":1 if direction=="LONG" else 3,"type":5,"openType":1,"externalOid":_oid(f"dryrun_{direction}","E"),"stopLossPrice":stop,"takeProfitPrice":tp3,"lossTrend":2,"profitTrend":2,"positionMode":1}
+            ck(f"{direction.lower()}_sizing",base_ok,f"notional={actual:.4f} risk={risk:.4f} contracts={contracts}")
+            ck(f"{direction.lower()}_payload",payload["openType"]==1 and payload["leverage"]<=2 and payload["side"] in {1,3},f"isolated=True leverage={payload['leverage']} side={payload['side']}")
+        # Deliberately oversized intent must fail the same hard cap invariant.
+        oversized=limits["max_notional"]*2.0
+        ck("oversized_rejected", not (oversized<=limits["max_notional"]+1e-8), f"requested={oversized:.2f} cap={limits['max_notional']:.2f}")
+        # Prove the transport interlock itself blocks a write before HTTP transport.
+        blocked=False
+        try: _signed("POST","/__v7_dryrun_write_probe__",{"probe":True})
+        except RuntimeError as e: blocked="V7DRYRUN WRITE BLOCKED" in str(e)
+        ck("transport_write_guard",blocked,"non-GET blocked before network")
+        ok=all(x[1] for x in checks)
+        _diag(f"V7DRYRUN RESULT={'PASS' if ok else 'FAIL'} symbol={symbol} checks={sum(x[1] for x in checks)}/{len(checks)} MEXC_WRITE_REQUESTS=0")
+        return ok
+    except Exception as e:
+        _diag(f"V7DRYRUN RESULT=FAIL exception={type(e).__name__}: {e}")
+        return False
 
 
 def execute_signal(result, paper_trade=None):

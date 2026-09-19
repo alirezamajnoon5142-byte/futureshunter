@@ -9811,6 +9811,9 @@ if __name__ == "__main__":
             V70_LIVE.configure(notify=send_telegram)
             startup_ok = V70_LIVE.startup_reconcile()
             print(f"[V7DIAG] startup_reconcile returned={startup_ok}", flush=True)
+            if getattr(V70_LIVE, "DRY_RUN", False):
+                dry_ok = V70_LIVE.run_zero_order_dry_run()
+                print(f"[V7DIAG] zero_order_dry_run returned={dry_ok}", flush=True)
             V70_LIVE.start_reconciler()
         asyncio.run(
             main()
