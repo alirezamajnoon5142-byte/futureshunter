@@ -8167,13 +8167,16 @@ def handle_telegram_command(chat_id, text):
 # confirmed EXIT_WARNING is stored as a counterfactual shadow exit so we can
 # later compare supervisor management with the original STOP/TP3/expiry logic.
 
-V691_SUPERVISOR_VERSION = "6.9.1-shadow-live-supervisor"
+V691_SUPERVISOR_VERSION = "6.9.1-shadow-live-supervisor+profit-protect-7.1.5"
 V691_SUPERVISOR_INTERVAL_SECONDS = int(os.getenv("V691_SUPERVISOR_INTERVAL_SECONDS", "60"))
 V691_STRATEGY_REFRESH_SECONDS = int(os.getenv("V691_STRATEGY_REFRESH_SECONDS", "300"))
 V691_SNAPSHOT_SECONDS = int(os.getenv("V691_SNAPSHOT_SECONDS", "180"))
 V691_SUPERVISOR_LOOKBACK_HOURS = int(os.getenv("V691_SUPERVISOR_LOOKBACK_HOURS", "72"))
 V691_STATE_CONFIRMATIONS = max(1, int(os.getenv("V691_STATE_CONFIRMATIONS", "2")))
 V691_EXIT_CONFIRMATIONS = max(1, int(os.getenv("V691_EXIT_CONFIRMATIONS", "2")))
+# V7.1.5 research-only profit-protection challenger. It NEVER touches live or paper exits.
+V691_PROFIT_PROTECT_MIN_R = float(os.getenv("V691_PROFIT_PROTECT_MIN_R", "1.5"))
+V691_PROFIT_PROTECT_CORE_HEALTH_MAX = float(os.getenv("V691_PROFIT_PROTECT_CORE_HEALTH_MAX", "55"))
 V691_STRATEGY_RUNTIME_CACHE = {}
 V691_SEVERITY = {
     "STRONG_HOLD": 0,
@@ -8756,6 +8759,42 @@ def _v691_apply_state_machine(trade, snapshot):
         supervisor["shadow_exit_r"] = round(current_r, 4)
         supervisor["shadow_exit_reason"] = "; ".join((snapshot.get("reasons") or [])[:3])
 
+    # V7.1.5 PROFIT-PROTECTION CHALLENGER (research-only):
+    # Once >= +1.5R has actually been reached, capture a counterfactual profitable
+    # exit only when the *confirmed/persistent* supervisor state is DEFENSIVE or
+    # EXIT_WARNING AND Core itself has weakened. A transient downgrade cannot fire
+    # this because current_state only changes after the existing confirmation state
+    # machine. The control paper trade and any real MEXC position remain untouched.
+    core_now = snapshot.get("core") or {}
+    core_direction = core_now.get("selected_direction")
+    core_state = str(core_now.get("state") or "").upper()
+    core_health = num(core_now.get("health"))
+    opposite_core = bool(core_direction and core_direction != trade.get("direction"))
+    core_weakened = bool(
+        opposite_core
+        or core_state == "REJECT"
+        or core_health <= V691_PROFIT_PROTECT_CORE_HEALTH_MAX
+    )
+    profit_protect_eligible = bool(
+        current_r >= V691_PROFIT_PROTECT_MIN_R
+        and current_state in {"DEFENSIVE", "EXIT_WARNING"}
+        and core_weakened
+    )
+    supervisor["profit_protect_eligible"] = profit_protect_eligible
+    if profit_protect_eligible and supervisor.get("profit_protect_exit_r") is None:
+        supervisor["profit_protect_exit_ts"] = now_ts
+        supervisor["profit_protect_exit_price"] = num(tape.get("price"))
+        supervisor["profit_protect_exit_r"] = round(current_r, 4)
+        supervisor["profit_protect_exit_state"] = current_state
+        supervisor["profit_protect_exit_reason"] = (
+            f">={V691_PROFIT_PROTECT_MIN_R:.2f}R + persistent {current_state} + Core weakened "
+            f"(health={core_health:.1f}, state={core_state or 'N/A'}, direction={core_direction or 'N/A'})"
+        )
+        print(
+            f"V7.1.5 PROFIT-PROTECT SHADOW: {trade.get('symbol')} {trade.get('direction')} "
+            f"would exit {current_r:+.2f}R | {supervisor['profit_protect_exit_reason']}"
+        )
+
     supervisor["state_changed"] = transitioned
     supervisor["old_state"] = old_state
     trade["supervisor"] = supervisor
@@ -8795,6 +8834,13 @@ def v691_init_supervisor_lab():
         CREATE INDEX IF NOT EXISTS idx_fh_trade_supervisor_state
         ON fh_trade_supervisor (current_state, updated_at DESC)
         """,
+        "ALTER TABLE fh_trade_supervisor ADD COLUMN IF NOT EXISTS profit_protect_exit_time TIMESTAMPTZ",
+        "ALTER TABLE fh_trade_supervisor ADD COLUMN IF NOT EXISTS profit_protect_exit_price DOUBLE PRECISION",
+        "ALTER TABLE fh_trade_supervisor ADD COLUMN IF NOT EXISTS profit_protect_exit_r DOUBLE PRECISION",
+        "ALTER TABLE fh_trade_supervisor ADD COLUMN IF NOT EXISTS profit_protect_exit_state TEXT",
+        "ALTER TABLE fh_trade_supervisor ADD COLUMN IF NOT EXISTS profit_protect_exit_reason TEXT",
+        "ALTER TABLE fh_trade_supervisor ADD COLUMN IF NOT EXISTS profit_protect_final_r DOUBLE PRECISION",
+        "ALTER TABLE fh_trade_supervisor ADD COLUMN IF NOT EXISTS profit_protect_edge_r DOUBLE PRECISION",
         """
         CREATE TABLE IF NOT EXISTS fh_trade_supervisor_snapshots (
             id BIGSERIAL PRIMARY KEY,
@@ -8902,6 +8948,9 @@ def _v691_compact_payload(snapshot, supervisor):
         },
         "reasons": (snapshot.get("reasons") or [])[:6],
         "shadow_exit_r": supervisor.get("shadow_exit_r"),
+        "profit_protect_exit_r": supervisor.get("profit_protect_exit_r"),
+        "profit_protect_exit_state": supervisor.get("profit_protect_exit_state"),
+        "profit_protect_exit_reason": supervisor.get("profit_protect_exit_reason"),
     }
 
 
@@ -8947,6 +8996,22 @@ def _v691_store_supervisor(trade, snapshot, force_snapshot=False):
             _v68_json(payload),
         ),
     )
+
+    pp_ts = num(supervisor.get("profit_protect_exit_ts"))
+    pp_dt = datetime.fromtimestamp(pp_ts, tz=timezone.utc) if pp_ts else None
+    if supervisor.get("profit_protect_exit_r") is not None:
+        _v68_db_execute(
+            """UPDATE fh_trade_supervisor
+               SET profit_protect_exit_time=COALESCE(profit_protect_exit_time,%s),
+                   profit_protect_exit_price=COALESCE(profit_protect_exit_price,%s),
+                   profit_protect_exit_r=COALESCE(profit_protect_exit_r,%s),
+                   profit_protect_exit_state=COALESCE(profit_protect_exit_state,%s),
+                   profit_protect_exit_reason=COALESCE(profit_protect_exit_reason,%s),
+                   updated_at=NOW()
+               WHERE signal_id=%s""",
+            (pp_dt, supervisor.get("profit_protect_exit_price"), supervisor.get("profit_protect_exit_r"),
+             supervisor.get("profit_protect_exit_state"), supervisor.get("profit_protect_exit_reason"), trade.get("signal_id")),
+        )
 
     last_snapshot_ts = num(supervisor.get("last_snapshot_ts"))
     due = (ts - last_snapshot_ts) >= V691_SNAPSHOT_SECONDS
@@ -9140,6 +9205,17 @@ def _v691_settle_supervisor(trades):
             ),
         )
         if ok:
+            pp_exit_r = supervisor.get("profit_protect_exit_r")
+            pp_final_r = num(pp_exit_r) if pp_exit_r is not None else (None if actual_r is None else num(actual_r))
+            pp_edge_r = None if (pp_final_r is None or actual_r is None) else pp_final_r - num(actual_r)
+            _v68_db_execute(
+                """UPDATE fh_trade_supervisor
+                   SET profit_protect_final_r=%s, profit_protect_edge_r=%s, updated_at=NOW()
+                   WHERE signal_id=%s""",
+                (pp_final_r, pp_edge_r, trade.get("signal_id")),
+            )
+            supervisor["profit_protect_final_r"] = pp_final_r
+            supervisor["profit_protect_edge_r"] = pp_edge_r
             supervisor["actual_status"] = trade.get("status")
             supervisor["actual_final_r"] = actual_r
             supervisor["supervisor_final_r"] = supervisor_r
