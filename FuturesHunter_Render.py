@@ -9794,10 +9794,18 @@ if __name__ == "__main__":
     try:
         start_health_server()
         start_macro_news_thread()
-        _v71_init_challenger()
+        print(f"[V7DIAG] integration hook reached; live_module_loaded={V70_LIVE is not None}", flush=True)
+        challenger_ok = _v71_init_challenger()
+        print(f"[V7DIAG] V7.1 challenger init ready={challenger_ok} v68_db_ready={V68_DB_READY}", flush=True)
         if V70_LIVE is not None:
+            try:
+                ds = V70_LIVE.diagnostic_state()
+                print("[V7DIAG] executor config " + " ".join(f"{k}={v}" for k,v in ds.items()), flush=True)
+            except Exception as e:
+                print(f"[V7DIAG] executor diagnostic_state unavailable: {type(e).__name__}: {e}", flush=True)
             V70_LIVE.configure(notify=send_telegram)
-            V70_LIVE.startup_reconcile()
+            startup_ok = V70_LIVE.startup_reconcile()
+            print(f"[V7DIAG] startup_reconcile returned={startup_ok}", flush=True)
             V70_LIVE.start_reconciler()
         asyncio.run(
             main()

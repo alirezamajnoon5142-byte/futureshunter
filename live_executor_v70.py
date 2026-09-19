@@ -45,6 +45,29 @@ def configure(notify=None):
         _notify = notify
 
 
+def diagnostic_state():
+    """Secret-safe runtime state for deployment diagnostics."""
+    return {
+        "version": V70_VERSION,
+        "enabled": ENABLED,
+        "armed": ARMED,
+        "credentials_present": bool(ACCESS_KEY and SECRET_KEY),
+        "database_configured": bool(DATABASE_URL),
+        "pilot_start_balance": PILOT_START_BALANCE,
+        "risk_pct": RISK_PCT,
+        "daily_loss_pct": DAILY_LOSS_PCT,
+        "equity_kill_pct": EQUITY_KILL_PCT,
+        "max_notional_cap": MAX_NOTIONAL_CAP,
+        "max_leverage": MAX_LEVERAGE,
+        "max_positions": MAX_POSITIONS,
+    }
+
+
+def _diag(text):
+    # Render-only diagnostic path. Never include credentials or signed requests.
+    print(f"[V7DIAG] {text}", flush=True)
+
+
 def _msg(text):
     try: _notify(text)
     except Exception: print(text)
@@ -362,24 +385,42 @@ def reconcile_once():
 
 
 def startup_reconcile():
-    if not ENABLED: return True
-    if not init_db(): return False
+    _diag(f"startup entered version={V70_VERSION} enabled={ENABLED} armed={ARMED} db={bool(DATABASE_URL)} creds={bool(ACCESS_KEY and SECRET_KEY)}")
+    if not ENABLED:
+        _diag("startup skipped: V70_LIVE_ENABLED=false")
+        return True
+    if not init_db():
+        _diag("startup failed: live ledger DB initialization failed")
+        return False
+    _diag("live ledger DB initialized/preserved")
     if not ACCESS_KEY or not SECRET_KEY:
+        _diag("startup failed: MEXC credentials missing")
         halt("live enabled but MEXC credentials missing"); return False
     try:
+        _diag("MEXC reconciliation beginning")
         reconcile_once(); a=asset(); p=positions()
-        _limits=_dynamic_limits(a); _msg(f"🧪 V7.1.1 BALANCE-AWARE PILOT STARTUP\nArmed: {ARMED}\nEquity: {_limits['equity']:.4f} USDT\nExchange positions: {len(p)}\nRisk now: {_limits['risk_usdt']:.3f} | Max notional now: {_limits['max_notional']:.2f} | Daily breaker: {_limits['daily_loss_limit']:.3f} | Equity kill: {_limits['equity_kill']:.2f} | Max leverage: {MAX_LEVERAGE}x")
-        return not halt_status()[0]
+        _limits=_dynamic_limits(a)
+        halted, reason = halt_status()
+        _diag(f"MEXC reconciliation complete equity={_limits['equity']:.4f} positions={len(p)} risk={_limits['risk_usdt']:.3f} max_notional={_limits['max_notional']:.2f} daily_breaker={_limits['daily_loss_limit']:.3f} equity_kill={_limits['equity_kill']:.2f} leverage_cap={MAX_LEVERAGE}x halted={halted} armed={ARMED}")
+        if halted:
+            _diag(f"durable HALT active: {reason}")
+        _msg(f"🧪 V7.1.1 BALANCE-AWARE PILOT STARTUP\nArmed: {ARMED}\nEquity: {_limits['equity']:.4f} USDT\nExchange positions: {len(p)}\nRisk now: {_limits['risk_usdt']:.3f} | Max notional now: {_limits['max_notional']:.2f} | Daily breaker: {_limits['daily_loss_limit']:.3f} | Equity kill: {_limits['equity_kill']:.2f} | Max leverage: {MAX_LEVERAGE}x")
+        return not halted
     except Exception as e:
+        _diag(f"startup reconciliation exception: {type(e).__name__}: {e}")
         halt(f"startup reconciliation failed: {type(e).__name__}: {e}"); return False
 
 
 def start_reconciler():
-    if not ENABLED: return None
+    if not ENABLED:
+        _diag("background reconciler not started: live disabled")
+        return None
     def loop():
         while True:
             reconcile_once(); time.sleep(RECONCILE_SECONDS)
-    t=threading.Thread(target=loop,name="FH-V70-Reconciler",daemon=True); t.start(); return t
+    t=threading.Thread(target=loop,name="FH-V70-Reconciler",daemon=True); t.start()
+    _diag(f"background reconciler started interval={RECONCILE_SECONDS}s")
+    return t
 
 
 def live_pnl_text():
