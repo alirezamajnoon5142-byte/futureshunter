@@ -14,7 +14,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.1.3-dry-run-harness"
+V70_VERSION = "7.1.4-liveposition"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -484,6 +484,64 @@ def start_reconciler():
     t=threading.Thread(target=loop,name="FH-V70-Reconciler",daemon=True); t.start()
     _diag(f"background reconciler started interval={RECONCILE_SECONDS}s")
     return t
+
+
+def live_position_text():
+    """Read-only MEXC + ledger snapshot for Telegram /liveposition.
+
+    This function performs GETs only. It never submits, cancels, amends, closes,
+    or changes leverage/margin. Exchange data is treated as source of truth for
+    whether a position currently exists; the PostgreSQL ledger is shown beside it.
+    """
+    if not ENABLED:
+        return "V7 Live Position: DISABLED"
+    try:
+        ex = positions() or []
+        if isinstance(ex, dict):
+            ex = ex.get("data") or ex.get("positions") or [ex]
+        ex = [x for x in ex if isinstance(x, dict) and float(x.get("holdVol") or x.get("vol") or x.get("positionVol") or 0) > 0]
+        halted, why = halt_status()
+        gate = "HALTED — " + why if halted else ("ARMED" if ARMED else "SAFE/DISARMED")
+
+        dbrows = _db("""SELECT signal_id,symbol,direction,status,actual_entry,contracts,leverage,
+                               stop_price,tp3_price,protection_confirmed,opened_at
+                        FROM fh_live_trades WHERE status IN ('SUBMITTING','ENTRY_SENT','PROTECTING','OPEN')
+                        ORDER BY updated_at DESC LIMIT 5""", fetch="all") or []
+
+        lines = ["V7 LIVE POSITION", f"Exchange open positions: {len(ex)}", f"Live gate: {gate}"]
+        if not ex:
+            lines.append("MEXC: FLAT — no open futures position reported.")
+        for i, pos in enumerate(ex, 1):
+            symbol = str(pos.get("symbol") or pos.get("contractCode") or "?")
+            ptype = pos.get("positionType")
+            direction = "LONG" if str(ptype) == "1" else ("SHORT" if str(ptype) == "2" else str(pos.get("direction") or "UNKNOWN").upper())
+            vol = pos.get("holdVol", pos.get("vol", pos.get("positionVol", "?")))
+            entry = pos.get("openAvgPrice", pos.get("avgPrice", pos.get("entryPrice", "?")))
+            mark = pos.get("markPrice", pos.get("fairPrice", pos.get("lastPrice", "?")))
+            lev = pos.get("leverage", "?")
+            upl = pos.get("unrealisedPnl", pos.get("unrealizedPnl", pos.get("unrealizedProfit", "?")))
+            pid = pos.get("positionId", pos.get("id", "?"))
+            lines += [f"#{i} {symbol} {direction}", f"Entry: {entry} | Mark: {mark}", f"Contracts: {vol} | Leverage: {lev}x", f"Unrealized P&L: {upl} USDT | Position ID: {pid}"]
+
+        if dbrows:
+            lines.append("Ledger active rows:")
+            for r in dbrows:
+                # psycopg rows are tuples in this module
+                sig,sym,direction,status,entry,contracts,lev,stop,tp3,protected,opened = r
+                lines.append(f"• {sym} {direction} | {status} | entry={entry or '?'} | contracts={contracts or '?'} | {lev or '?'}x | STOP={stop or '?'} | TP3={tp3 or '?'} | protected={'YES' if protected else 'NO'}")
+        else:
+            lines.append("Ledger active rows: 0")
+
+        # A mismatch is important enough to surface loudly, but this read-only
+        # command deliberately does not mutate state or halt trading by itself.
+        if len(ex) != len([r for r in dbrows if str(r[3]).upper() == 'OPEN']):
+            lines.append("⚠️ Exchange/ledger count mismatch — reconciler should be checked.")
+        else:
+            lines.append("Exchange/ledger position count: MATCH")
+        lines.append("Read-only check: no order/write request sent.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"V7 Live Position unavailable: {type(e).__name__}: {e}"
 
 
 def live_pnl_text():

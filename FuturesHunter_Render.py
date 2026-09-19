@@ -9558,6 +9558,12 @@ def handle_telegram_command(chat_id, text):
         else:
             send_to_chat(chat_id, V70_LIVE.live_pnl_text())
         return
+    if command in {"/liveposition", "/livepos", "/positionlive"}:
+        if V70_LIVE is None:
+            send_to_chat(chat_id, "V7 Live Pilot module unavailable.")
+        else:
+            send_to_chat(chat_id, V70_LIVE.live_position_text())
+        return
     return _V70_PREV_COMMAND(chat_id, text)
 
 _V70_PAPER_CREATE = create_paper_trade
