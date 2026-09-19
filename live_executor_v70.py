@@ -14,7 +14,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.1.1-balance-aware"
+V70_VERSION = "7.1.2-safety-init-fix"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -24,7 +24,7 @@ ARMED = os.getenv("V70_LIVE_ARMED", "false").lower() == "true"
 PILOT_START_BALANCE = float(os.getenv("V70_PILOT_START_BALANCE", os.getenv("V70_START_BALANCE", "27")))
 RISK_PCT = min(0.01, max(0.0001, float(os.getenv("V70_RISK_PCT", "0.01"))))
 DAILY_LOSS_PCT = min(0.03, max(0.0001, float(os.getenv("V70_DAILY_LOSS_PCT", "0.03"))))
-EQUITY_KILL_PCT = min(0.90, max(0.01, float(os.getenv("V70_EQUITY_KILL_PCT", "0.90"))))
+EQUITY_KILL_DRAWDOWN_PCT = min(0.90, max(0.01, float(os.getenv("V70_EQUITY_KILL_PCT", "0.10"))))
 MAX_NOTIONAL_CAP = float(os.getenv("V70_MAX_NOTIONAL_CAP", str(PILOT_START_BALANCE)))
 MAX_LEVERAGE = min(2, int(os.getenv("V70_MAX_LEVERAGE", "2")))
 MAX_POSITIONS = 1
@@ -56,7 +56,7 @@ def diagnostic_state():
         "pilot_start_balance": PILOT_START_BALANCE,
         "risk_pct": RISK_PCT,
         "daily_loss_pct": DAILY_LOSS_PCT,
-        "equity_kill_pct": EQUITY_KILL_PCT,
+        "equity_kill_drawdown_pct": EQUITY_KILL_DRAWDOWN_PCT,
         "max_notional_cap": MAX_NOTIONAL_CAP,
         "max_leverage": MAX_LEVERAGE,
         "max_positions": MAX_POSITIONS,
@@ -201,7 +201,7 @@ def _risk_limits(equity):
     equity = max(0.0, float(equity or 0))
     risk_usdt = equity * RISK_PCT
     max_notional = min(equity, MAX_NOTIONAL_CAP)
-    equity_kill = PILOT_START_BALANCE * EQUITY_KILL_PCT
+    equity_kill = PILOT_START_BALANCE * (1.0 - EQUITY_KILL_DRAWDOWN_PCT)
     return risk_usdt, max_notional, equity_kill
 
 def _day_start_equity(current_equity):

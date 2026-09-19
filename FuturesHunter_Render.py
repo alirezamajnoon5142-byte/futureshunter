@@ -9289,7 +9289,8 @@ async def main():
     print("MEXC FUTURES HUNTER V6.9.1 — RESEARCH + RISK + STRATEGY + LIVE TRADE SUPERVISOR")
     print("=" * 90)
 
-    v68_init_database()
+    if not V68_DB_READY:
+        v68_init_database()
     v681_init_risk_lab()
     v69_init_strategy_lab()
     v691_init_supervisor_lab()
@@ -9579,8 +9580,12 @@ V71_CHALLENGER_DB_READY = False
 
 def _v71_init_challenger():
     global V71_CHALLENGER_DB_READY
+    # V7 startup runs before async main(); ensure the shared V6.8 PostgreSQL
+    # layer is initialized here rather than falsely degrading to local-only.
     if not V68_DB_READY:
-        return False
+        if not v68_init_database():
+            print(f"[V7DIAG] challenger DB bootstrap failed: {V68_DB_LAST_ERROR or 'unknown database error'}", flush=True)
+            return False
     ok = _v68_db_execute("""CREATE TABLE IF NOT EXISTS fh_v71_challenger (
         source_key TEXT PRIMARY KEY, evaluated_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         symbol TEXT NOT NULL, direction TEXT NOT NULL, core_score DOUBLE PRECISION,
