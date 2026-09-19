@@ -9538,6 +9538,204 @@ async def main():
 
 
 # ============================================================
+# V7.0 LIVE PILOT — FAIL-CLOSED EXECUTION WRAPPER
+# ============================================================
+try:
+    import live_executor_v70 as V70_LIVE
+except Exception as _v70_import_error:
+    V70_LIVE = None
+    print(f"V7.0 live module import warning: {_v70_import_error}")
+
+_V70_PREV_COMMAND = handle_telegram_command
+
+def handle_telegram_command(chat_id, text):
+    parts = (text or "").strip().split()
+    command = parts[0].lower() if parts else ""
+    if command in {"/livepnl", "/live", "/livepilot"}:
+        if V70_LIVE is None:
+            send_to_chat(chat_id, "V7.0 Live Pilot module unavailable.")
+        else:
+            send_to_chat(chat_id, V70_LIVE.live_pnl_text())
+        return
+    return _V70_PREV_COMMAND(chat_id, text)
+
+_V70_PAPER_CREATE = create_paper_trade
+
+# V7.1 SELECTION + CHALLENGER LAYER
+# V6.9.1 remains the immutable paper control. This layer only decides whether
+# a Core ENTRY is eligible for the tiny live pilot and records counterfactuals.
+V70_SELECTIVE_GATE = os.getenv("V70_SELECTIVE_GATE", "true").lower() == "true"
+V70_SAME_SYMBOL_COOLDOWN_MINUTES = int(os.getenv("V70_SAME_SYMBOL_COOLDOWN_MINUTES", "120"))
+V71_REGIME_GATE = os.getenv("V71_REGIME_GATE", "true").lower() == "true"
+V71_LOSS_CLUSTER_GATE = os.getenv("V71_LOSS_CLUSTER_GATE", "true").lower() == "true"
+V71_LOSS_CLUSTER_MINUTES = int(os.getenv("V71_LOSS_CLUSTER_MINUTES", "180"))
+V71_LOSS_CLUSTER_COUNT = int(os.getenv("V71_LOSS_CLUSTER_COUNT", "3"))
+V71_COST_GATE = os.getenv("V71_COST_GATE", "true").lower() == "true"
+V71_MAX_COST_FRACTION_R = float(os.getenv("V71_MAX_COST_FRACTION_R", "0.35"))
+V71_EST_TAKER_FEE_BPS = float(os.getenv("V71_EST_TAKER_FEE_BPS", "5.0"))
+V71_EST_SLIPPAGE_BPS = float(os.getenv("V71_EST_SLIPPAGE_BPS", "4.0"))
+V71_STRUCTURAL_RESET_SCORE_DELTA = float(os.getenv("V71_STRUCTURAL_RESET_SCORE_DELTA", "8.0"))
+V71_CHALLENGER_DB_READY = False
+
+def _v71_init_challenger():
+    global V71_CHALLENGER_DB_READY
+    if not V68_DB_READY:
+        return False
+    ok = _v68_db_execute("""CREATE TABLE IF NOT EXISTS fh_v71_challenger (
+        source_key TEXT PRIMARY KEY, evaluated_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        symbol TEXT NOT NULL, direction TEXT NOT NULL, core_score DOUBLE PRECISION,
+        risk_decision TEXT, strategy_consensus TEXT, btc_weak BOOLEAN,
+        macro_conflict BOOLEAN, recent_stop_count INTEGER, estimated_cost_r DOUBLE PRECISION,
+        selector_score DOUBLE PRECISION, decision TEXT NOT NULL, reasons JSONB NOT NULL,
+        payload JSONB NOT NULL, actual_status TEXT, actual_final_r DOUBLE PRECISION,
+        settled_at TIMESTAMPTZ
+    )""")
+    V71_CHALLENGER_DB_READY = bool(ok)
+    return V71_CHALLENGER_DB_READY
+
+def _v71_recent_same_symbol_stop(trades, symbol, direction):
+    now_ts=time.time(); cutoff=now_ts-max(1,V70_SAME_SYMBOL_COOLDOWN_MINUTES)*60
+    candidates=[]
+    for t in trades or []:
+        if t.get("status") == "STOP" and t.get("symbol") == symbol and t.get("direction") == direction:
+            closed=num(t.get("closed_time"))
+            if closed >= cutoff:
+                candidates.append(t)
+    return max(candidates, key=lambda x:num(x.get("closed_time")), default=None)
+
+def _v71_bucket_stop_cluster(trades, result):
+    now=time.time(); cutoff=now-max(1,V71_LOSS_CLUSTER_MINUTES)*60
+    bucket=((result.get("risk_challenger") or {}).get("asset_bucket") or _v681_asset_bucket(result.get("symbol")))
+    direction=result.get("direction")
+    hits=[]
+    for t in trades or []:
+        if t.get("status") != "STOP" or t.get("direction") != direction: continue
+        if num(t.get("closed_time")) < cutoff: continue
+        if _v681_asset_bucket(t.get("symbol")) == bucket: hits.append(t.get("symbol"))
+    return len(hits), hits
+
+def _v71_estimated_cost_r(result):
+    plan=result.get("risk_plan") or {}; entry=max(num(result.get("price")),1e-12)
+    stop_pct=abs(entry-num(plan.get("stop")))/entry if plan.get("stop") is not None else 0
+    if stop_pct <= 0: return 999.0
+    notional=min(50.0, 0.50/stop_pct)
+    # conservative round trip: taker on entry + exit, plus slippage on both legs.
+    cost=notional*(2*V71_EST_TAKER_FEE_BPS+2*V71_EST_SLIPPAGE_BPS)/10000.0
+    actual_risk=min(0.50,notional*stop_pct)
+    return cost/max(actual_risk,1e-9)
+
+def _v71_structural_reset(result, prior_stop):
+    if not prior_stop: return False
+    score_delta=num(result.get("best_score"))-num(prior_stop.get("score"))
+    risk=result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
+    # A cooldown can be overridden only by a materially stronger context, not time alone.
+    regime_ok=(not bool(risk.get("btc_weak")) and not bool(risk.get("macro_conflict")))
+    strategy_ok=str(strategy.get("consensus") or "").upper() in {"CONFIRM","STRONG_CONFIRM"}
+    return score_delta >= V71_STRUCTURAL_RESET_SCORE_DELTA and regime_ok and strategy_ok
+
+def _v71_selector_score(result, cost_r, cluster_count):
+    risk=result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
+    score=num(result.get("best_score"))
+    rd=str(risk.get("decision") or "NO_DATA").upper(); sc=str(strategy.get("consensus") or "NO_DATA").upper()
+    score += {"ALLOW":8,"CAUTION":3,"REDUCE":-4,"BLOCK":-25}.get(rd,0)
+    score += {"STRONG_CONFIRM":8,"CONFIRM":5,"MIXED":0,"WAIT":-4,"AVOID":-10}.get(sc,0)
+    if risk.get("btc_weak"): score-=8
+    if risk.get("macro_conflict"): score-=6
+    score-=min(12,cluster_count*4)
+    score-=min(12,cost_r*10)
+    return round(score,2)
+
+def _v71_live_candidate_gate(result, trades):
+    if not V70_SELECTIVE_GATE:
+        return {"eligible":True,"decision":"ALLOW","reasons":["selector disabled"],"selector_score":num(result.get("best_score"))}
+    risk=result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
+    rd=str(risk.get("decision") or "NO_DATA").upper(); sc=str(strategy.get("consensus") or "NO_DATA").upper()
+    reasons=[]; notes=[]
+    if rd == "BLOCK": reasons.append("Risk Lab BLOCK")
+    if rd == "BLOCK" and sc in {"WAIT","AVOID"}: reasons.append(f"Risk BLOCK + Strategy {sc}")
+    if V71_REGIME_GATE and (risk.get("asset_bucket") == "CRYPTO") and bool(risk.get("btc_weak")) and bool(risk.get("macro_conflict")):
+        reasons.append("crypto regime conflict: weak BTC + macro conflict")
+    prior=_v71_recent_same_symbol_stop(trades,result.get("symbol"),result.get("direction"))
+    if prior:
+        if _v71_structural_reset(result,prior): notes.append("same-symbol cooldown overridden by structural reset")
+        else:
+            age=(time.time()-num(prior.get("closed_time")))/60
+            reasons.append(f"same-symbol stop cooldown ({age:.0f}m ago; no structural reset)")
+    cluster_count,cluster_symbols=_v71_bucket_stop_cluster(trades,result)
+    if V71_LOSS_CLUSTER_GATE and cluster_count >= V71_LOSS_CLUSTER_COUNT:
+        reasons.append(f"loss-cluster breaker: {cluster_count} same-bucket {result.get('direction')} stops/{V71_LOSS_CLUSTER_MINUTES}m")
+    cost_r=_v71_estimated_cost_r(result)
+    if V71_COST_GATE and cost_r > V71_MAX_COST_FRACTION_R:
+        reasons.append(f"estimated execution drag {cost_r:.2f}R > {V71_MAX_COST_FRACTION_R:.2f}R")
+    selector_score=_v71_selector_score(result,cost_r,cluster_count)
+    return {"eligible":not reasons,"decision":"ALLOW" if not reasons else "SKIP","reasons":reasons,
+            "notes":notes,"risk_decision":rd,"strategy_consensus":sc,"btc_weak":bool(risk.get("btc_weak")),
+            "macro_conflict":bool(risk.get("macro_conflict")),"recent_stop_count":cluster_count,
+            "recent_stop_symbols":cluster_symbols,"estimated_cost_r":round(cost_r,4),"selector_score":selector_score,
+            "evaluated_ts":time.time(),"version":"7.1-selection-challenger"}
+
+def _v71_store_challenger(trade, gate):
+    if not V71_CHALLENGER_DB_READY or not trade: return
+    try:
+        _v68_db_execute("""INSERT INTO fh_v71_challenger
+        (source_key,symbol,direction,core_score,risk_decision,strategy_consensus,btc_weak,macro_conflict,
+         recent_stop_count,estimated_cost_r,selector_score,decision,reasons,payload)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+        ON CONFLICT(source_key) DO NOTHING""",(
+            trade.get("source_key"),trade.get("symbol"),trade.get("direction"),num(trade.get("score")),
+            gate.get("risk_decision"),gate.get("strategy_consensus"),gate.get("btc_weak"),gate.get("macro_conflict"),
+            gate.get("recent_stop_count"),gate.get("estimated_cost_r"),gate.get("selector_score"),gate.get("decision"),
+            json.dumps(gate.get("reasons") or []),json.dumps(gate)))
+    except Exception as e: print(f"V7.1 challenger store warning: {e}")
+
+def _v71_settle_challenger(trades):
+    if not V71_CHALLENGER_DB_READY: return
+    for t in trades or []:
+        if t.get("status") == "OPEN" or t.get("final_r") is None: continue
+        _v68_db_execute("""UPDATE fh_v71_challenger SET actual_status=%s,actual_final_r=%s,settled_at=NOW()
+        WHERE source_key=%s AND settled_at IS NULL""",(t.get("status"),num(t.get("final_r")),t.get("source_key")))
+
+def _v71_challenger_text():
+    if not V71_CHALLENGER_DB_READY: return "V7.1 Challenger: database unavailable"
+    row=_v68_db_execute("""SELECT COUNT(*),COUNT(*) FILTER(WHERE decision='ALLOW'),
+      COUNT(*) FILTER(WHERE decision='SKIP'),COUNT(*) FILTER(WHERE settled_at IS NOT NULL),
+      COALESCE(AVG(actual_final_r) FILTER(WHERE decision='ALLOW' AND settled_at IS NOT NULL),0),
+      COALESCE(AVG(actual_final_r) FILTER(WHERE decision='SKIP' AND settled_at IS NOT NULL),0),
+      COALESCE(SUM(actual_final_r) FILTER(WHERE decision='ALLOW' AND settled_at IS NOT NULL),0)
+      FROM fh_v71_challenger""",fetch="one")
+    if not row: return "V7.1 Challenger: no data"
+    return (f"V7.1 SELECTION CHALLENGER\nObserved: {row[0]} | ALLOW {row[1]} | SKIP {row[2]} | settled {row[3]}\n"
+            f"ALLOW expectancy: {num(row[4]):+.2f}R\nSkipped-trade expectancy: {num(row[5]):+.2f}R\n"
+            f"Counterfactual ALLOW total: {num(row[6]):+.2f}R")
+
+# Add challenger command without disturbing existing Telegram command tree.
+_V71_PREV_COMMAND = handle_telegram_command
+def handle_telegram_command(chat_id, text):
+    command=((text or "").strip().split() or [""])[0].lower()
+    if command in {"/v7","/v71","/challenger","/selector"}:
+        send_to_chat(chat_id,_v71_challenger_text()); return
+    return _V71_PREV_COMMAND(chat_id,text)
+
+_V70_PAPER_CREATE = create_paper_trade
+
+def create_paper_trade(result, trades):
+    _v71_settle_challenger(trades)
+    gate=_v71_live_candidate_gate(result,trades)
+    result["v70_live_gate"]=gate
+    trade=_V70_PAPER_CREATE(result,trades)
+    _v71_store_challenger(trade,gate)
+    if V70_LIVE is not None:
+        try:
+            if gate.get("eligible"):
+                V70_LIVE.execute_signal(result,trade)
+            else:
+                print(f"V7.1 LIVE SELECTOR: {result.get('symbol')} {result.get('direction')} SKIP — "+"; ".join(gate.get("reasons") or []))
+        except Exception as error:
+            try: V70_LIVE.halt(f"live hook exception: {type(error).__name__}: {error}")
+            except Exception: pass
+    return trade
+
+# ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
 
@@ -9547,7 +9745,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "6.9.1",
+                "version": "7.1",
+                "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
+                "v70_selective_gate": bool(V70_SELECTIVE_GATE),
+                "v70_same_symbol_cooldown_minutes": V70_SAME_SYMBOL_COOLDOWN_MINUTES,
+                "v71_selection_challenger": "active" if V71_CHALLENGER_DB_READY else "local_only",
                 "macro_regime": get_macro_snapshot().get("regime"),
                 "database_ready": bool(V68_DB_READY),
                 "research_lab": "active" if V68_DB_READY else "local_fallback",
@@ -9592,6 +9794,11 @@ if __name__ == "__main__":
     try:
         start_health_server()
         start_macro_news_thread()
+        _v71_init_challenger()
+        if V70_LIVE is not None:
+            V70_LIVE.configure(notify=send_telegram)
+            V70_LIVE.startup_reconcile()
+            V70_LIVE.start_reconciler()
         asyncio.run(
             main()
         )
