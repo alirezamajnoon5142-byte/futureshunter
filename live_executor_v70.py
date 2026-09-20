@@ -14,7 +14,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.4.1-live-multitp-legacy-adopt"
+V70_VERSION = "7.4.2-live-multitp-racefix"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -232,6 +232,31 @@ def _clear_transient_reconcile_halt_after_success():
     _diag("auto-cleared stale transient reconciliation HALT after successful fresh reconciliation")
     _msg("✅ FUTURESHUNTER V7 LIVE RECOVERED\nFresh MEXC reconciliation succeeded; stale transient API-timeout HALT cleared. Hard safety halts remain durable.")
     return True
+
+
+def _is_closed_position_race_halt(reason):
+    r = str(reason or "").lower()
+    return "code=2009" in r and "position is nonexistent or closed" in r
+
+def _clear_closed_position_race_halt_after_success():
+    """Clear only the known harmless race halt after the vanished position has been audited closed."""
+    global _halted_memory, _halt_reason
+    halted, reason = halt_status()
+    if not halted or not _is_closed_position_race_halt(reason):
+        return False
+    try:
+        ex = positions() or []
+        row = _db("SELECT COUNT(*) FROM fh_live_trades WHERE status='OPEN'", fetch="one") or (0,)
+        if ex or int(row[0] or 0) != 0:
+            return False
+        _halted_memory = False
+        _halt_reason = ""
+        _state_set("v70_halt", {"halted": False, "reason": "", "recovered_from": str(reason)[:500], "ts": time.time()})
+        _diag("auto-cleared closed-position race HALT after exchange/ledger both confirmed flat")
+        _msg("✅ FUTURESHUNTER V7 LIVE RECOVERED\nClosed-position race was audited; exchange and live ledger are both flat. Live gate restored.")
+        return True
+    except Exception:
+        return False
 
 
 def asset(): return _signed("GET", "/api/v1/private/account/asset/USDT")
@@ -605,14 +630,20 @@ def _manage_open_trade(row, exchange_pos):
     if not tp1_done and _target_reached(direction,px,targets["tp1"]):
         ok,detail=_partial_market_close(symbol,direction,position_id,float(tp1_vol),signal_id,"P1")
         if not ok:
+            if "position no longer open" in str(detail).lower() or "code=2009" in str(detail).lower():
+                return
             halt(f"TP1 partial close failed/unconfirmed on {symbol}: {detail}")
             return
         _db("UPDATE fh_live_trades SET tp1_done=TRUE,tp1_time=NOW(),management_stage='TP1_FILLED',updated_at=NOW() WHERE signal_id=%s",(signal_id,))
+        pnow=_active_position(symbol,position_id)
+        if not pnow:
+            return
         ok2,detail2=_change_position_protection(symbol,position_id,targets["be"],targets["tp3"])
         if not ok2:
             pnow=_active_position(symbol,position_id)
-            if pnow:
-                _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
+            if not pnow:
+                return
+            _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
             halt(f"TP1 filled on {symbol} but breakeven stop ratchet was not confirmed: {detail2}; remaining position flattened")
             return
         _db("UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,management_stage='TP1_LOCKED',updated_at=NOW() WHERE signal_id=%s",(targets["be"],targets["be"],signal_id))
@@ -627,14 +658,20 @@ def _manage_open_trade(row, exchange_pos):
     if tp1_done and not tp2_done and _target_reached(direction,px,targets["tp2"]):
         ok,detail=_partial_market_close(symbol,direction,position_id,float(tp2_vol),signal_id,"P2")
         if not ok:
+            if "position no longer open" in str(detail).lower() or "code=2009" in str(detail).lower():
+                return
             halt(f"TP2 partial close failed/unconfirmed on {symbol}: {detail}")
             return
         _db("UPDATE fh_live_trades SET tp2_done=TRUE,tp2_time=NOW(),management_stage='TP2_FILLED',updated_at=NOW() WHERE signal_id=%s",(signal_id,))
+        pnow=_active_position(symbol,position_id)
+        if not pnow:
+            return
         ok2,detail2=_change_position_protection(symbol,position_id,targets["lock2"],targets["tp3"])
         if not ok2:
             pnow=_active_position(symbol,position_id)
-            if pnow:
-                _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
+            if not pnow:
+                return
+            _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
             halt(f"TP2 filled on {symbol} but +{TP2_LOCK_R:.2f}R stop ratchet was not confirmed: {detail2}; remaining position flattened")
             return
         _db("UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,management_stage='TP2_LOCKED',updated_at=NOW() WHERE signal_id=%s",(targets["lock2"],targets["lock2"],signal_id))
@@ -646,9 +683,78 @@ def _manage_open_trade(row, exchange_pos):
             _db("UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,management_stage='TP2_LOCKED',updated_at=NOW() WHERE signal_id=%s",(targets["lock2"],targets["lock2"],signal_id))
 
 def _history_for(symbol, position_id):
-    data=_signed("GET","/api/v1/private/position/list/history_positions",{"symbol":symbol,"page_num":1,"page_size":100}) or {}
+    """Best-effort closed-position lookup. MEXC can return code 2009 during close races."""
+    attempts = [
+        {"symbol":symbol,"page_num":1,"page_size":100},
+        {"page_num":1,"page_size":100},
+    ]
+    for params in attempts:
+        try:
+            data=_signed("GET","/api/v1/private/position/list/history_positions",params) or {}
+        except Exception as e:
+            msg=str(e).lower()
+            if "code=2009" in msg or "position is nonexistent or closed" in msg:
+                continue
+            raise
+        rows=data.get("resultList",[]) if isinstance(data,dict) else (data or [])
+        hit=next((x for x in rows if int(x.get("positionId") or 0)==int(position_id)),None)
+        if hit:
+            return hit
+    return None
+
+def _close_orders_for_position(symbol, position_id, direction):
+    """Fallback audit source when position-history lags or returns code 2009."""
+    try:
+        data=_signed("GET","/api/v1/private/order/list/history_orders",{
+            "symbol":symbol,"states":"3","page_num":1,"page_size":100
+        }) or {}
+    except Exception:
+        return []
     rows=data.get("resultList",[]) if isinstance(data,dict) else (data or [])
-    return next((x for x in rows if int(x.get("positionId") or 0)==int(position_id)),None)
+    close_side = 4 if direction=="LONG" else 2
+    out=[]
+    for x in rows:
+        try:
+            if int(x.get("positionId") or 0)==int(position_id) and int(x.get("side") or 0)==close_side and int(x.get("state") or 0)==3:
+                out.append(x)
+        except Exception:
+            pass
+    return out
+
+def _settle_missing_position(row):
+    """Audit and close a ledger row only when MEXC confirms the position itself is gone."""
+    signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct = row[:9]
+    hist=_history_for(symbol,position_id)
+    orders=_close_orders_for_position(symbol,position_id,direction)
+    if not hist and not orders:
+        return False
+    exitp=0.0; gross=0.0; fees=0.0; funding=0.0
+    if hist:
+        exitp=float(hist.get("closeAvgPrice") or hist.get("newCloseAvgPrice") or 0)
+        gross=float(hist.get("closeProfitLoss") or hist.get("realised") or 0)
+        fees=abs(float(hist.get("totalFee") or hist.get("fee") or 0))
+        funding=float(hist.get("holdFee") or 0)
+    if orders:
+        dealt=[]
+        order_profit=0.0; order_fees=0.0
+        for x in orders:
+            vol=float(x.get("dealVol") or 0); px=float(x.get("dealAvgPrice") or 0)
+            if vol>0 and px>0: dealt.append((vol,px))
+            order_profit += float(x.get("profit") or 0)
+            order_fees += abs(float(x.get("takerFee") or 0)) + abs(float(x.get("makerFee") or 0))
+        if exitp<=0 and dealt:
+            tv=sum(v for v,_ in dealt); exitp=sum(v*px for v,px in dealt)/tv if tv>0 else 0.0
+        if abs(gross) < 1e-12 and abs(order_profit) > 0:
+            gross=order_profit
+        if order_fees > fees:
+            fees=order_fees
+    net=gross-fees+funding
+    entry=float(actual_entry or paper_entry or 0)
+    risk_usdt=max(1e-9, float(contracts or 0) * float(contract_size or 0) * entry * (float(stop_pct or 0) / 100.0))
+    _db("""UPDATE fh_live_trades SET status='CLOSED',actual_exit=%s,exit_fee=GREATEST(0,%s-entry_fee),funding=%s,gross_pnl=%s,net_pnl=%s,gross_r=%s,net_r=%s,closed_at=COALESCE(closed_at,NOW()),updated_at=NOW() WHERE signal_id=%s""",
+        (exitp,fees,funding,gross,net,gross/risk_usdt,net/risk_usdt,signal_id))
+    _msg(f"⚪ V7.4 LIVE CLOSED\n{symbol} {direction}\nExit: {exitp or 'audited via close orders'}\nGross: {gross:+.4f} USDT | Fees: -{fees:.4f} | Funding: {funding:+.4f}\nNet: {net:+.4f} USDT ({net/risk_usdt:+.2f}R)")
+    return True
 
 
 def reconcile_once():
@@ -673,23 +779,25 @@ def reconcile_once():
                             continue
                     # Manage TP1/TP2 first. TP3 and stop remain exchange-side throughout.
                     _manage_open_trade(row, exids[pid])
+                    # A server-side TP3 or manual/exchange close can race this pass. If the
+                    # position vanished while we were managing it, do not touch stale TP/SL.
+                    p_after=_active_position(row[1],pid)
+                    if not p_after:
+                        continue
                     tr=_db("SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s",(row[0],),"one")
                     if tr and not _confirm_protection(row[1],pid,float(tr[0]),float(tr[1])):
-                        _emergency_close(row[1],row[2],pid,float((exids[pid] or {}).get("holdVol") or row[4]),row[0]); halt(f"protection disappeared on {row[1]}; flattened")
+                        _emergency_close(row[1],row[2],pid,float(p_after.get("holdVol") or row[4]),row[0]); halt(f"protection disappeared on {row[1]}; flattened")
                     continue
-                hist=_history_for(row[1],pid)
-                if hist:
-                    exitp=float(hist.get("closeAvgPrice") or hist.get("newCloseAvgPrice") or 0); gross=float(hist.get("closeProfitLoss") or 0); fees=abs(float(hist.get("totalFee") or hist.get("fee") or 0)); funding=float(hist.get("holdFee") or 0); net=gross-fees+funding
-                    r=max(1e-9, float(row[4]) * float(row[5]) * float(row[6]) * (float(row[8]) / 100.0))
-                    _db("""UPDATE fh_live_trades SET status='CLOSED',actual_exit=%s,exit_fee=GREATEST(0,%s-entry_fee),funding=%s,gross_pnl=%s,net_pnl=%s,gross_r=%s,net_r=%s,closed_at=NOW(),updated_at=NOW() WHERE signal_id=%s""",(exitp,fees,funding,gross,net,gross/r,net/r,row[0]))
-                    _msg(f"⚪ V7.0 LIVE CLOSED\n{row[1]} {row[2]}\nExit: {exitp}\nGross: {gross:+.4f} USDT | Fees: -{fees:.4f} | Funding: {funding:+.4f}\nNet: {net:+.4f} USDT ({net/r:+.2f}R)")
+                if not _settle_missing_position(row):
+                    halt(f"exchange position disappeared but closure history is not yet auditable for {row[1]} position {pid}")
+                    return
             a=asset(); limits=_dynamic_limits(a); eq=limits["equity"]
             if eq < limits["equity_kill"] and not halted: halt(f"equity kill-switch: {eq:.4f} < {limits['equity_kill']:.2f} USDT")
             if _daily_net_loss() >= limits["daily_loss_limit"] and not halted: halt(f"daily loss breaker reached: {_daily_net_loss():.4f} USDT")
-            # If the only durable halt was a previous transient API read/transport failure,
-            # a completely successful fresh reconciliation is sufficient to recover it.
-            # Hard halts (unknown position, protection, equity, daily breaker, etc.) are never auto-cleared.
+            # Recover only narrowly-audited stale halts. Unknown positions, missing
+            # protection, equity kill, daily breaker, etc. remain durable.
             _clear_transient_reconcile_halt_after_success()
+            _clear_closed_position_race_halt_after_success()
         except Exception as e:
             halt(f"reconciliation failure: {type(e).__name__}: {e}")
 
