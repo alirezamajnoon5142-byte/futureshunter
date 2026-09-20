@@ -14,7 +14,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.4.2-live-multitp-racefix"
+V70_VERSION = "7.4.4-live-riskfix-multitp"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -28,7 +28,7 @@ DAILY_LOSS_PCT = min(0.03, max(0.0001, float(os.getenv("V70_DAILY_LOSS_PCT", "0.
 EQUITY_KILL_DRAWDOWN_PCT = min(0.90, max(0.01, float(os.getenv("V70_EQUITY_KILL_PCT", "0.10"))))
 MAX_NOTIONAL_CAP = float(os.getenv("V70_MAX_NOTIONAL_CAP", str(PILOT_START_BALANCE)))
 MAX_LEVERAGE = min(2, int(os.getenv("V70_MAX_LEVERAGE", "2")))
-MAX_POSITIONS = 1
+MAX_POSITIONS = min(2, max(1, int(os.getenv("V70_MAX_POSITIONS", "2"))))
 RECONCILE_SECONDS = max(5, int(os.getenv("V70_RECONCILE_SECONDS", "10")))
 FILL_TIMEOUT = max(3, int(os.getenv("V70_FILL_TIMEOUT", "15")))
 EXPIRY_HOURS = float(os.getenv("V70_EXPIRY_HOURS", "24"))
@@ -364,7 +364,7 @@ def preflight():
     if _daily_net_loss() >= limits["daily_loss_limit"]:
         halt(f"daily loss breaker reached: {_daily_net_loss():.4f} >= {limits['daily_loss_limit']:.4f} USDT"); return False, "daily loss breaker"
     if avail <= 0: return False, "no available USDT"
-    return True, {"asset": a, "limits": limits}
+    return True, {"asset": a, "limits": limits, "positions": pos}
 
 
 
@@ -424,6 +424,68 @@ def run_zero_order_dry_run(symbol="BTC_USDT"):
         return False
 
 
+def _position_direction(position):
+    ptype = int(position.get("positionType") or 0)
+    if ptype == 1:
+        return "LONG"
+    if ptype == 2:
+        return "SHORT"
+    return str(position.get("direction") or "").upper()
+
+
+def live_risk_snapshot(lookback_minutes=180):
+    """Read-only live portfolio context for the V7 selector.
+
+    Exchange positions are authoritative for current exposure. Recent realized
+    outcomes come only from the durable live ledger, never the paper portfolio.
+    A live loss <= -0.75R is exposed as stop-like for cooldown/cluster logic;
+    this avoids treating fee-only/near-breakeven closes as full stop-outs.
+    """
+    minutes = max(1, min(24 * 60, int(lookback_minutes or 180)))
+    ex = positions() or []
+    open_rows = []
+    for row in ex:
+        if not isinstance(row, dict):
+            continue
+        hold = float(row.get("holdVol") or row.get("vol") or row.get("positionVol") or 0)
+        if hold <= 0:
+            continue
+        open_rows.append({
+            "symbol": str(row.get("symbol") or row.get("contractCode") or ""),
+            "direction": _position_direction(row),
+            "position_id": int(row.get("positionId") or row.get("id") or 0),
+            "hold_vol": hold,
+        })
+    closed = _db(
+        """SELECT symbol,direction,closed_at,net_r,signal_id FROM fh_live_trades
+           WHERE status='CLOSED' AND closed_at IS NOT NULL
+             AND closed_at >= NOW() - (%s * INTERVAL '1 minute')
+           ORDER BY closed_at DESC LIMIT 100""",
+        (minutes,), fetch="all"
+    ) or []
+    closed_rows = []
+    for symbol, direction, closed_at, net_r, signal_id in closed:
+        try:
+            closed_ts = closed_at.timestamp() if closed_at is not None else 0.0
+        except Exception:
+            closed_ts = 0.0
+        r = float(net_r or 0.0)
+        closed_rows.append({
+            "symbol": str(symbol or ""),
+            "direction": str(direction or "").upper(),
+            "closed_time": closed_ts,
+            "net_r": r,
+            "stop_like": r <= -0.75,
+            "signal_id": str(signal_id or ""),
+        })
+    return {
+        "source": "MEXC_OPEN_POSITIONS+FH_LIVE_LEDGER",
+        "lookback_minutes": minutes,
+        "open_positions": open_rows,
+        "recent_closed": closed_rows,
+    }
+
+
 def execute_signal(result, paper_trade=None):
     """Attempt one live mirror of a Core ENTRY. Any uncertainty fails closed."""
     if not ENABLED: return {"executed": False, "reason": "disabled"}
@@ -431,6 +493,9 @@ def execute_signal(result, paper_trade=None):
         ok, state = preflight()
         if not ok: return {"executed": False, "reason": state}
         plan = result["risk_plan"]; symbol = result["symbol"]; direction = result["direction"]
+        for p in state.get("positions") or []:
+            if str(p.get("symbol") or p.get("contractCode") or "") == str(symbol):
+                return {"executed": False, "reason": "live position already open for symbol"}
         signal_id = (paper_trade or {}).get("signal_id") or f"{int(time.time())}_{symbol}_{direction}"
         existing = _db("SELECT status,entry_order_id FROM fh_live_trades WHERE signal_id=%s", (signal_id,), "one")
         if existing: return {"executed": False, "reason": f"idempotent duplicate ({existing[0]})"}
