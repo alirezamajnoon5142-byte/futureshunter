@@ -14,7 +14,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.1.4-liveposition"
+V70_VERSION = "7.4.1-live-multitp-legacy-adopt"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -28,11 +28,18 @@ DAILY_LOSS_PCT = min(0.03, max(0.0001, float(os.getenv("V70_DAILY_LOSS_PCT", "0.
 EQUITY_KILL_DRAWDOWN_PCT = min(0.90, max(0.01, float(os.getenv("V70_EQUITY_KILL_PCT", "0.10"))))
 MAX_NOTIONAL_CAP = float(os.getenv("V70_MAX_NOTIONAL_CAP", str(PILOT_START_BALANCE)))
 MAX_LEVERAGE = min(2, int(os.getenv("V70_MAX_LEVERAGE", "2")))
-MAX_POSITIONS = min(2, max(1, int(os.getenv("V70_MAX_POSITIONS", "2"))))
+MAX_POSITIONS = 1
 RECONCILE_SECONDS = max(5, int(os.getenv("V70_RECONCILE_SECONDS", "10")))
 FILL_TIMEOUT = max(3, int(os.getenv("V70_FILL_TIMEOUT", "15")))
 EXPIRY_HOURS = float(os.getenv("V70_EXPIRY_HOURS", "24"))
 RECV_WINDOW = min(30, max(5, int(os.getenv("V70_RECV_WINDOW", "10"))))
+
+# Live position management. Core entry qualification/risk sizing is unchanged.
+MULTI_TP_ENABLED = os.getenv("V70_MULTI_TP_ENABLED", "true").lower() == "true"
+TP1_FRACTION = min(0.45, max(0.05, float(os.getenv("V70_TP1_FRACTION", "0.25"))))
+TP2_FRACTION = min(0.45, max(0.05, float(os.getenv("V70_TP2_FRACTION", "0.25"))))
+BE_BUFFER_BPS = min(50.0, max(0.0, float(os.getenv("V70_BE_BUFFER_BPS", "10"))))
+TP2_LOCK_R = min(1.5, max(0.0, float(os.getenv("V70_TP2_LOCK_R", "1.0"))))
 
 _lock = threading.RLock()
 _halted_memory = False
@@ -62,6 +69,11 @@ def diagnostic_state():
         "max_notional_cap": MAX_NOTIONAL_CAP,
         "max_leverage": MAX_LEVERAGE,
         "max_positions": MAX_POSITIONS,
+        "multi_tp_enabled": MULTI_TP_ENABLED,
+        "tp1_fraction": TP1_FRACTION,
+        "tp2_fraction": TP2_FRACTION,
+        "be_buffer_bps": BE_BUFFER_BPS,
+        "tp2_lock_r": TP2_LOCK_R,
     }
 
 
@@ -134,13 +146,40 @@ def init_db():
       external_oid TEXT UNIQUE NOT NULL, entry_order_id TEXT, position_id BIGINT,
       paper_entry DOUBLE PRECISION, requested_notional DOUBLE PRECISION, actual_notional DOUBLE PRECISION,
       contracts DOUBLE PRECISION, contract_size DOUBLE PRECISION, leverage INTEGER,
-      stop_price DOUBLE PRECISION, tp3_price DOUBLE PRECISION, stop_pct DOUBLE PRECISION,
+      stop_price DOUBLE PRECISION, tp1_price DOUBLE PRECISION, tp2_price DOUBLE PRECISION, tp3_price DOUBLE PRECISION, stop_pct DOUBLE PRECISION,
+      initial_stop_price DOUBLE PRECISION, managed_stop_price DOUBLE PRECISION,
+      tp1_vol DOUBLE PRECISION, tp2_vol DOUBLE PRECISION, tp1_done BOOLEAN NOT NULL DEFAULT FALSE, tp2_done BOOLEAN NOT NULL DEFAULT FALSE,
+      tp1_time TIMESTAMPTZ, tp2_time TIMESTAMPTZ, management_stage TEXT NOT NULL DEFAULT 'INITIAL',
       actual_entry DOUBLE PRECISION, actual_exit DOUBLE PRECISION, slippage_usdt DOUBLE PRECISION,
       slippage_bps DOUBLE PRECISION, entry_fee DOUBLE PRECISION DEFAULT 0, exit_fee DOUBLE PRECISION DEFAULT 0,
       funding DOUBLE PRECISION DEFAULT 0, gross_pnl DOUBLE PRECISION, net_pnl DOUBLE PRECISION,
       gross_r DOUBLE PRECISION, net_r DOUBLE PRECISION, paper_status TEXT, paper_r DOUBLE PRECISION,
       protection_confirmed BOOLEAN NOT NULL DEFAULT FALSE, opened_at TIMESTAMPTZ, closed_at TIMESTAMPTZ,
       halt_reason TEXT, payload JSONB, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    # Forward-compatible migration for deployments created before the live manager.
+    for ddl in (
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp1_price DOUBLE PRECISION",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp2_price DOUBLE PRECISION",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS initial_stop_price DOUBLE PRECISION",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS managed_stop_price DOUBLE PRECISION",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp1_vol DOUBLE PRECISION",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp2_vol DOUBLE PRECISION",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp1_done BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp2_done BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp1_time TIMESTAMPTZ",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp2_time TIMESTAMPTZ",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS management_stage TEXT NOT NULL DEFAULT 'INITIAL'",
+    ):
+        _db(ddl)
+    # Adopt positions opened by the pre-multi-TP executor. Those rows already own the
+    # MEXC position but do not have the manager's baseline-stop columns populated.
+    # The original stop_price is the authoritative initial risk reference.
+    _db("""UPDATE fh_live_trades
+           SET initial_stop_price=COALESCE(initial_stop_price, stop_price),
+               managed_stop_price=COALESCE(managed_stop_price, stop_price),
+               management_stage=COALESCE(NULLIF(management_stage,''), 'INITIAL'),
+               updated_at=NOW()
+           WHERE status='OPEN'""")
     _db("CREATE INDEX IF NOT EXISTS idx_fh_live_status ON fh_live_trades(status, opened_at DESC)")
     return True
 
@@ -209,11 +248,44 @@ def contract(symbol):
 def order_by_external(symbol, oid): return _signed("GET", f"/api/v1/private/order/external/{symbol}/{oid}")
 def open_stops(symbol): return _signed("GET", "/api/v1/private/stoporder/open_orders", {"symbol": symbol}) or []
 
+def _fair_price(symbol):
+    data = _public("/api/v1/contract/ticker", {"symbol": symbol})
+    if isinstance(data, list):
+        data = next((x for x in data if x.get("symbol") == symbol), None)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"ticker unavailable for {symbol}")
+    px = float(data.get("fairPrice") or data.get("lastPrice") or data.get("indexPrice") or 0)
+    if px <= 0:
+        raise RuntimeError(f"invalid ticker price for {symbol}")
+    return px
+
+def _active_position(symbol, position_id):
+    for p in positions(symbol):
+        if int(p.get("positionId") or 0) == int(position_id) and float(p.get("holdVol") or 0) > 0:
+            return p
+    return None
+
+def _active_protection(symbol, position_id):
+    rows=[]
+    for x in open_stops(symbol):
+        if int(x.get("positionId") or 0) == int(position_id) and int(x.get("state") or 0) == 1:
+            rows.append(x)
+    return rows
 
 def _floor_step(value, step):
     if step <= 0: return value
     return math.floor((value + 1e-12) / step) * step
 
+def _three_way_split(contracts, step, min_vol):
+    """Prefer 25%/25%/50%; fall back to thirds if exchange granularity requires it."""
+    c=float(contracts); step=max(float(step or 0), 1e-12); min_vol=max(float(min_vol or step), step)
+    v1=_floor_step(c*TP1_FRACTION, step); v2=_floor_step(c*TP2_FRACTION, step); v3=_floor_step(c-v1-v2, step)
+    if v1 >= min_vol and v2 >= min_vol and v3 >= min_vol:
+        return v1,v2,v3
+    v1=_floor_step(c/3.0, step); v2=_floor_step((c-v1)/2.0, step); v3=_floor_step(c-v1-v2, step)
+    if v1 >= min_vol and v2 >= min_vol and v3 >= min_vol:
+        return v1,v2,v3
+    return None
 
 def _oid(signal_id, suffix="E"):
     digest = hashlib.sha1(f"{signal_id}|{suffix}".encode()).hexdigest()[:24]
@@ -341,7 +413,9 @@ def execute_signal(result, paper_trade=None):
         if not c.get("apiAllowed", False): return {"executed": False, "reason": "contract API trading not allowed"}
         if int(c.get("state", 1)) != 0: return {"executed": False, "reason": "contract not enabled"}
         if int(c.get("positionOpenType", 0)) not in {1,3}: return {"executed": False, "reason": "isolated margin unsupported"}
-        entry = float(result["price"]); stop = float(plan["stop"]); tp3 = float(plan["tp3"])
+        entry = float(result["price"]); stop = float(plan["stop"]); tp1 = float(plan.get("tp1") or 0); tp2 = float(plan.get("tp2") or 0); tp3 = float(plan["tp3"])
+        if MULTI_TP_ENABLED and (tp1 <= 0 or tp2 <= 0):
+            return {"executed": False, "reason": "multi-TP requires valid TP1/TP2 from Core risk plan"}
         stop_pct = abs(entry-stop)/entry*100.0
         if stop_pct <= 0: return {"executed": False, "reason": "invalid stop distance"}
         limits = state["limits"]
@@ -352,6 +426,10 @@ def execute_signal(result, paper_trade=None):
         contract_size = float(c["contractSize"]); step = float(c.get("volUnit") or 1); min_vol = float(c.get("minVol") or step)
         contracts = _floor_step(requested_notional / (entry * contract_size), step)
         if contracts < min_vol: return {"executed": False, "reason": "pilot size below exchange minimum"}
+        split = _three_way_split(contracts, step, min_vol) if MULTI_TP_ENABLED else None
+        if MULTI_TP_ENABLED and not split:
+            return {"executed": False, "reason": "position too small for three exchange-valid TP slices"}
+        tp1_vol,tp2_vol,tp3_vol = split if split else (0.0,0.0,contracts)
         actual_notional = contracts * contract_size * entry
         if actual_notional > max_notional + 1e-8: return {"executed": False, "reason": "notional cap calculation failed"}
         actual_risk = actual_notional * stop_pct/100.0
@@ -361,8 +439,8 @@ def execute_signal(result, paper_trade=None):
         if actual_notional/leverage > available: return {"executed": False, "reason": "insufficient margin"}
         oid = _oid(signal_id, "E")
         payload = {"symbol":symbol,"price":entry,"vol":contracts,"leverage":leverage,"side":1 if direction=="LONG" else 3,"type":5,"openType":1,"externalOid":oid,"stopLossPrice":stop,"takeProfitPrice":tp3,"lossTrend":2,"profitTrend":2,"positionMode":1}
-        _db("""INSERT INTO fh_live_trades(signal_id,symbol,direction,status,external_oid,paper_entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop_price,tp3_price,stop_pct,payload) VALUES(%s,%s,%s,'SUBMITTING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (signal_id,symbol,direction,oid,entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop,tp3,stop_pct,Jsonb(payload) if Jsonb else json.dumps(payload)))
+        _db("""INSERT INTO fh_live_trades(signal_id,symbol,direction,status,external_oid,paper_entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop_price,tp1_price,tp2_price,tp3_price,initial_stop_price,managed_stop_price,tp1_vol,tp2_vol,stop_pct,management_stage,payload) VALUES(%s,%s,%s,'SUBMITTING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INITIAL',%s)""",
+            (signal_id,symbol,direction,oid,entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop,tp1,tp2,tp3,stop,stop,tp1_vol,tp2_vol,stop_pct,Jsonb(payload) if Jsonb else json.dumps(payload)))
         try:
             created = _signed("POST", "/api/v1/private/order/create", payload)
             order_id = str(created.get("orderId"))
@@ -395,7 +473,7 @@ def execute_signal(result, paper_trade=None):
                 halt(f"protective stop/TP3 could not be confirmed for {symbol}; position flattened")
                 return {"executed": False, "reason": "protection failed; flattened"}
             _db("UPDATE fh_live_trades SET status='OPEN',protection_confirmed=TRUE,updated_at=NOW() WHERE signal_id=%s", (signal_id,))
-            _msg(f"🔴 V7.0 LIVE PILOT OPEN\n{symbol} {direction}\nFill: {fill}\nNotional: {actual_notional:.2f} USDT | Risk: {actual_risk:.3f} USDT | {leverage}x isolated\nStop: {stop} | TP3: {tp3}\nProtection: CONFIRMED")
+            _msg(f"🔴 V7.0 LIVE PILOT OPEN\n{symbol} {direction}\nFill: {fill}\nNotional: {actual_notional:.2f} USDT | Risk: {actual_risk:.3f} USDT | {leverage}x isolated\nStop: {stop} | TP1: {tp1} ({tp1_vol:g}) | TP2: {tp2} ({tp2_vol:g}) | TP3: {tp3} ({tp3_vol:g})\nManager: {'25/25/50 preferred' if MULTI_TP_ENABLED else 'disabled'} | Protection: CONFIRMED")
             return {"executed": True, "signal_id": signal_id, "fill": fill, "position_id": position_id}
         except Exception as e:
             # If an exception occurs after submission, never assume no fill. Check the exchange and flatten a matching position.
@@ -427,6 +505,146 @@ def _emergency_close(symbol, direction, position_id, contracts, signal_id):
     return _signed("POST", "/api/v1/private/order/create", payload)
 
 
+def _wait_partial_close(symbol, direction, position_id, before_vol, close_vol, oid):
+    """Confirm a partial close from order state or authoritative remaining position size."""
+    deadline=time.time()+FILL_TIMEOUT
+    last=None
+    while time.time() < deadline:
+        try:
+            order=order_by_external(symbol, oid)
+            if order and int(order.get("state") or 0) == 3:
+                return True, order
+        except Exception:
+            pass
+        try:
+            p=_active_position(symbol, position_id)
+            remaining=float(p.get("holdVol") or 0) if p else 0.0
+            last=remaining
+            if remaining <= max(0.0, before_vol-close_vol) + 1e-9:
+                return True, None
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False, last
+
+def _partial_market_close(symbol, direction, position_id, close_vol, signal_id, stage):
+    p=_active_position(symbol, position_id)
+    if not p:
+        return False, "position no longer open"
+    before=float(p.get("holdVol") or 0)
+    vol=min(float(close_vol), before)
+    if vol <= 0:
+        return False, "no closable volume"
+    oid=_oid(signal_id, stage)
+    payload={"symbol":symbol,"price":0,"vol":vol,"side":4 if direction=="LONG" else 2,"type":5,"openType":1,"externalOid":oid,"positionId":position_id,"positionMode":1}
+    try:
+        _signed("POST", "/api/v1/private/order/create", payload)
+    except Exception as e:
+        # If submit response is uncertain, do not repeat blindly; confirm by OID/position.
+        ok,detail=_wait_partial_close(symbol,direction,position_id,before,vol,oid)
+        return (True,detail) if ok else (False,f"submit/confirm failed: {type(e).__name__}: {e}")
+    ok,detail=_wait_partial_close(symbol,direction,position_id,before,vol,oid)
+    return (True,detail) if ok else (False,f"partial close unconfirmed; remaining={detail}")
+
+def _change_position_protection(symbol, position_id, new_stop, tp3):
+    """Ratchet the existing exchange-side entire-position TP/SL without removing protection."""
+    rows=_active_protection(symbol, position_id)
+    if len(rows) != 1:
+        return False, f"expected exactly one active TP/SL, found {len(rows)}"
+    x=rows[0]
+    stop_id=int(x.get("id") or x.get("stopPlanOrderId") or 0)
+    if stop_id <= 0:
+        return False, "active TP/SL has no stopPlanOrderId"
+    # SAME is MEXC's combined/entire-position TP/SL mode used by this executor.
+    mode=str(x.get("profitLossVolType") or "").upper()
+    if mode and mode != "SAME":
+        return False, f"unexpected TP/SL volume mode {mode}"
+    _signed("POST", "/api/v1/private/stoporder/change_plan_price", {"stopPlanOrderId":stop_id,"stopLossPrice":new_stop,"takeProfitPrice":tp3})
+    if _confirm_protection(symbol, position_id, new_stop, tp3):
+        return True, stop_id
+    return False, "updated TP/SL not confirmed"
+
+def _management_targets(row):
+    # row layout is documented in reconcile_once below. Backfill older rows defensively.
+    direction=row[2]; actual_entry=float(row[7] or row[6] or 0); initial_stop=float(row[11] or row[10] or 0)
+    if actual_entry <= 0 or initial_stop <= 0:
+        return None
+    risk=abs(actual_entry-initial_stop)
+    sign=1.0 if direction=="LONG" else -1.0
+    tp1=float(row[12] or (actual_entry+sign*1.5*risk))
+    tp2=float(row[13] or (actual_entry+sign*2.0*risk))
+    tp3=float(row[14] or (actual_entry+sign*3.0*risk))
+    be=actual_entry*(1.0 + sign*BE_BUFFER_BPS/10000.0)
+    lock2=actual_entry+sign*TP2_LOCK_R*risk
+    return {"entry":actual_entry,"risk":risk,"tp1":tp1,"tp2":tp2,"tp3":tp3,"be":be,"lock2":lock2}
+
+def _target_reached(direction, price, target):
+    return price >= target if direction=="LONG" else price <= target
+
+def _manage_open_trade(row, exchange_pos):
+    """Scale out at TP1/TP2 and ratchet the exchange-side stop. TP3 remains server-side."""
+    if not MULTI_TP_ENABLED:
+        return
+    signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop,initial_stop,tp1,tp2,tp3,tp1_vol,tp2_vol,tp1_done,tp2_done,stage=row
+    targets=_management_targets(row)
+    if not targets:
+        halt(f"live manager cannot reconstruct targets for {symbol}")
+        return
+    # Backfill targets for old/new rows so restarts are deterministic.
+    if not tp1 or not tp2 or not initial_stop:
+        _db("""UPDATE fh_live_trades SET tp1_price=%s,tp2_price=%s,initial_stop_price=COALESCE(initial_stop_price,stop_price),managed_stop_price=COALESCE(managed_stop_price,stop_price),updated_at=NOW() WHERE signal_id=%s""",(targets["tp1"],targets["tp2"],signal_id))
+    c=contract(symbol); step=float(c.get("volUnit") or 1); min_vol=float(c.get("minVol") or step)
+    if not tp1_vol or not tp2_vol:
+        split=_three_way_split(float(contracts),step,min_vol)
+        if not split:
+            halt(f"live manager cannot split {symbol} into three valid TP slices")
+            return
+        tp1_vol,tp2_vol,_=split
+        _db("UPDATE fh_live_trades SET tp1_vol=%s,tp2_vol=%s,updated_at=NOW() WHERE signal_id=%s",(tp1_vol,tp2_vol,signal_id))
+    px=_fair_price(symbol)
+    if not tp1_done and _target_reached(direction,px,targets["tp1"]):
+        ok,detail=_partial_market_close(symbol,direction,position_id,float(tp1_vol),signal_id,"P1")
+        if not ok:
+            halt(f"TP1 partial close failed/unconfirmed on {symbol}: {detail}")
+            return
+        _db("UPDATE fh_live_trades SET tp1_done=TRUE,tp1_time=NOW(),management_stage='TP1_FILLED',updated_at=NOW() WHERE signal_id=%s",(signal_id,))
+        ok2,detail2=_change_position_protection(symbol,position_id,targets["be"],targets["tp3"])
+        if not ok2:
+            pnow=_active_position(symbol,position_id)
+            if pnow:
+                _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
+            halt(f"TP1 filled on {symbol} but breakeven stop ratchet was not confirmed: {detail2}; remaining position flattened")
+            return
+        _db("UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,management_stage='TP1_LOCKED',updated_at=NOW() WHERE signal_id=%s",(targets["be"],targets["be"],signal_id))
+        _msg(f"💰 V7 LIVE TP1 BANKED\n{symbol} {direction} | closed {float(tp1_vol):g} contracts near {px}\nRemaining stop → breakeven zone {targets['be']:.10g} | TP3 stays {targets['tp3']:.10g}")
+        return
+    # Retry a stop ratchet after restart/transient failure if TP1 was filled but lock not persisted.
+    if tp1_done and not tp2_done and str(stage or '').upper() == 'TP1_FILLED':
+        ok2,detail2=_change_position_protection(symbol,position_id,targets["be"],targets["tp3"])
+        if ok2:
+            _db("UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,management_stage='TP1_LOCKED',updated_at=NOW() WHERE signal_id=%s",(targets["be"],targets["be"],signal_id))
+        return
+    if tp1_done and not tp2_done and _target_reached(direction,px,targets["tp2"]):
+        ok,detail=_partial_market_close(symbol,direction,position_id,float(tp2_vol),signal_id,"P2")
+        if not ok:
+            halt(f"TP2 partial close failed/unconfirmed on {symbol}: {detail}")
+            return
+        _db("UPDATE fh_live_trades SET tp2_done=TRUE,tp2_time=NOW(),management_stage='TP2_FILLED',updated_at=NOW() WHERE signal_id=%s",(signal_id,))
+        ok2,detail2=_change_position_protection(symbol,position_id,targets["lock2"],targets["tp3"])
+        if not ok2:
+            pnow=_active_position(symbol,position_id)
+            if pnow:
+                _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
+            halt(f"TP2 filled on {symbol} but +{TP2_LOCK_R:.2f}R stop ratchet was not confirmed: {detail2}; remaining position flattened")
+            return
+        _db("UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,management_stage='TP2_LOCKED',updated_at=NOW() WHERE signal_id=%s",(targets["lock2"],targets["lock2"],signal_id))
+        _msg(f"💰💰 V7 LIVE TP2 BANKED\n{symbol} {direction} | closed {float(tp2_vol):g} contracts near {px}\nRemaining stop → +{TP2_LOCK_R:.2f}R ({targets['lock2']:.10g}) | TP3 stays {targets['tp3']:.10g}")
+        return
+    if tp2_done and str(stage or '').upper() == 'TP2_FILLED':
+        ok2,detail2=_change_position_protection(symbol,position_id,targets["lock2"],targets["tp3"])
+        if ok2:
+            _db("UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,management_stage='TP2_LOCKED',updated_at=NOW() WHERE signal_id=%s",(targets["lock2"],targets["lock2"],signal_id))
+
 def _history_for(symbol, position_id):
     data=_signed("GET","/api/v1/private/position/list/history_positions",{"symbol":symbol,"page_num":1,"page_size":100}) or {}
     rows=data.get("resultList",[]) if isinstance(data,dict) else (data or [])
@@ -437,7 +655,7 @@ def reconcile_once():
     if not ENABLED: return
     with _lock:
         try:
-            halted,_=halt_status(); ex=positions(); dbrows=_db("SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at FROM fh_live_trades WHERE status='OPEN'",fetch="all") or []
+            halted,_=halt_status(); ex=positions(); dbrows=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage FROM fh_live_trades WHERE status='OPEN'""",fetch="all") or []
             exids={int(x.get("positionId") or 0):x for x in ex}; dbids={int(r[3] or 0):r for r in dbrows}
             unknown=[p for pid,p in exids.items() if pid not in dbids]
             if unknown:
@@ -450,13 +668,14 @@ def reconcile_once():
                     if opened_at is not None:
                         age = (datetime.now(timezone.utc) - opened_at).total_seconds()
                         if age >= EXPIRY_HOURS * 3600:
-                            _emergency_close(row[1], row[2], pid, float(row[4]), row[0])
+                            _emergency_close(row[1], row[2], pid, float((exids[pid] or {}).get("holdVol") or row[4]), row[0])
                             _msg(f"⏰ V7.0 expiry close sent for {row[1]} after {EXPIRY_HOURS:g}h")
                             continue
-                    # Protection disappearing while position is open is a hard failure.
+                    # Manage TP1/TP2 first. TP3 and stop remain exchange-side throughout.
+                    _manage_open_trade(row, exids[pid])
                     tr=_db("SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s",(row[0],),"one")
                     if tr and not _confirm_protection(row[1],pid,float(tr[0]),float(tr[1])):
-                        _emergency_close(row[1],row[2],pid,float(row[4]),row[0]); halt(f"protection disappeared on {row[1]}; flattened")
+                        _emergency_close(row[1],row[2],pid,float((exids[pid] or {}).get("holdVol") or row[4]),row[0]); halt(f"protection disappeared on {row[1]}; flattened")
                     continue
                 hist=_history_for(row[1],pid)
                 if hist:
@@ -532,7 +751,8 @@ def live_position_text():
         gate = "HALTED — " + why if halted else ("ARMED" if ARMED else "SAFE/DISARMED")
 
         dbrows = _db("""SELECT signal_id,symbol,direction,status,actual_entry,contracts,leverage,
-                               stop_price,tp3_price,protection_confirmed,opened_at
+                               stop_price,tp1_price,tp2_price,tp3_price,protection_confirmed,opened_at,
+                               tp1_done,tp2_done,management_stage,tp1_vol,tp2_vol
                         FROM fh_live_trades WHERE status IN ('SUBMITTING','ENTRY_SENT','PROTECTING','OPEN')
                         ORDER BY updated_at DESC LIMIT 5""", fetch="all") or []
 
@@ -555,8 +775,8 @@ def live_position_text():
             lines.append("Ledger active rows:")
             for r in dbrows:
                 # psycopg rows are tuples in this module
-                sig,sym,direction,status,entry,contracts,lev,stop,tp3,protected,opened = r
-                lines.append(f"• {sym} {direction} | {status} | entry={entry or '?'} | contracts={contracts or '?'} | {lev or '?'}x | STOP={stop or '?'} | TP3={tp3 or '?'} | protected={'YES' if protected else 'NO'}")
+                sig,sym,direction,status,entry,contracts,lev,stop,tp1,tp2,tp3,protected,opened,p1,p2,stage,v1,v2 = r
+                lines.append(f"• {sym} {direction} | {status} | entry={entry or '?'} | contracts={contracts or '?'} | {lev or '?'}x | STOP={stop or '?'} | TP1={tp1 or '?'} ({'DONE' if p1 else v1 or '?'}) | TP2={tp2 or '?'} ({'DONE' if p2 else v2 or '?'}) | TP3={tp3 or '?'} | stage={stage or '?'} | protected={'YES' if protected else 'NO'}")
         else:
             lines.append("Ledger active rows: 0")
 
