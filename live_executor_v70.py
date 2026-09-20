@@ -22,7 +22,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ENABLED = os.getenv("V70_LIVE_ENABLED", "false").lower() == "true"
 ARMED = os.getenv("V70_LIVE_ARMED", "false").lower() == "true"
 DRY_RUN = os.getenv("V70_DRY_RUN", "false").lower() == "true"
-PILOT_START_BALANCE = float(os.getenv("V70_PILOT_START_BALANCE", os.getenv("V70_START_BALANCE", "27")))
+PILOT_START_BALANCE = float(os.getenv("V70_PILOT_START_BALANCE", os.getenv("V70_START_BALANCE", "222.14387438")))
 RISK_PCT = min(0.01, max(0.0001, float(os.getenv("V70_RISK_PCT", "0.01"))))
 DAILY_LOSS_PCT = min(0.03, max(0.0001, float(os.getenv("V70_DAILY_LOSS_PCT", "0.03"))))
 EQUITY_KILL_DRAWDOWN_PCT = min(0.90, max(0.01, float(os.getenv("V70_EQUITY_KILL_PCT", "0.10"))))
