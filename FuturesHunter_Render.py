@@ -10303,14 +10303,137 @@ def _v71_estimated_cost_r(result):
 def _v71_structural_reset(result, prior_stop):
     if not prior_stop: return False
     score_delta=num(result.get("best_score"))-num(prior_stop.get("score"))
-    risk=result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
+    risk=result.get("live_risk_challenger") or result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
     # A cooldown can be overridden only by a materially stronger context, not time alone.
     regime_ok=(not bool(risk.get("btc_weak")) and not bool(risk.get("macro_conflict")))
     strategy_ok=str(strategy.get("consensus") or "").upper() in {"CONFIRM","STRONG_CONFIRM"}
     return score_delta >= V71_STRUCTURAL_RESET_SCORE_DELTA and regime_ok and strategy_ok
 
+def _v71_live_risk_snapshot():
+    """Fetch fail-closed live exposure/loss context from the executor.
+
+    This deliberately does not use paper trades. If the live account/ledger
+    cannot be read, the live selector must skip rather than assume zero risk.
+    """
+    if V70_LIVE is None or not getattr(V70_LIVE, "ENABLED", False):
+        return {"ok": False, "reason": "live executor unavailable/disabled"}
+    fn = getattr(V70_LIVE, "live_risk_snapshot", None)
+    if not callable(fn):
+        return {"ok": False, "reason": "live executor lacks live_risk_snapshot"}
+    try:
+        snap = fn(max(V71_LOSS_CLUSTER_MINUTES, V70_SAME_SYMBOL_COOLDOWN_MINUTES))
+        if not isinstance(snap, dict):
+            return {"ok": False, "reason": "invalid live risk snapshot"}
+        snap["ok"] = True
+        return snap
+    except Exception as e:
+        return {"ok": False, "reason": f"live risk snapshot failed: {type(e).__name__}: {e}"}
+
+
+def _v71_live_same_bucket_open(snapshot, symbol, direction):
+    bucket = _v681_asset_bucket(symbol)
+    count = 0; symbols = []
+    for p in (snapshot or {}).get("open_positions") or []:
+        if str(p.get("direction") or "").upper() != str(direction or "").upper():
+            continue
+        psym = str(p.get("symbol") or "")
+        if _v681_asset_bucket(psym) != bucket:
+            continue
+        count += 1; symbols.append(psym)
+    return count, symbols
+
+
+def _v71_live_recent_losses(snapshot, result, minutes=None, same_symbol=False):
+    direction = str(result.get("direction") or "").upper()
+    symbol = str(result.get("symbol") or "")
+    bucket = _v681_asset_bucket(symbol)
+    cutoff = time.time() - max(1, int(minutes or V71_LOSS_CLUSTER_MINUTES)) * 60
+    hits = []
+    for row in (snapshot or {}).get("recent_closed") or []:
+        if not bool(row.get("stop_like")):
+            continue
+        if str(row.get("direction") or "").upper() != direction:
+            continue
+        if num(row.get("closed_time")) < cutoff:
+            continue
+        rsym = str(row.get("symbol") or "")
+        if same_symbol:
+            if rsym != symbol:
+                continue
+        elif _v681_asset_bucket(rsym) != bucket:
+            continue
+        hits.append(row)
+    return hits
+
+
+def _v71_build_live_risk(result, snapshot):
+    """Recompute the Risk Lab view from actual live exposure and live losses.
+
+    Macro/BTC regime logic is preserved. Only portfolio exposure and recent
+    stop/loss history are sourced from the real MEXC account + live ledger.
+    """
+    now_ts = time.time()
+    direction = result.get("direction")
+    symbol = result.get("symbol")
+    bucket = _v681_asset_bucket(symbol)
+    macro = get_macro_snapshot() or {}
+    combined = num(macro.get("combined_score"))
+    event_risk = str(macro.get("event_risk") or "LOW").upper()
+    btc = _v681_btc_scan_snapshot()
+    open_count, open_symbols = _v71_live_same_bucket_open(snapshot, symbol, direction)
+    live_losses = _v71_live_recent_losses(snapshot, result, V681_STOP_CLUSTER_MINUTES)
+    stop_count = len(live_losses)
+    macro_conflict, strong_macro_conflict = _v681_directional_macro_conflict(direction, bucket, combined)
+    btc_weak = _v681_btc_is_weak_for(direction, bucket, btc)
+    multiplier = 1.0; reasons = []
+    if event_risk == "EXTREME":
+        multiplier = 0.0; reasons.append("EXTREME scheduled-event danger window")
+    elif event_risk == "HIGH":
+        multiplier = min(multiplier, 0.5); reasons.append("HIGH scheduled-event risk")
+    if macro_conflict:
+        reasons.append(f"{bucket} {direction} conflicts with macro/news regime {combined:+.1f}")
+        if strong_macro_conflict:
+            multiplier = min(multiplier, 0.5)
+    if btc_weak:
+        reasons.append(
+            "BTC is not aligned at ENTRY-strength "
+            f"({btc.get('direction') or 'N/A'} {btc.get('state') or 'N/A'} {num(btc.get('score')):.1f})"
+        )
+    if open_count >= V681_MAX_CORRELATED_OPEN:
+        multiplier = min(multiplier, 0.5)
+        reasons.append(f"{open_count} correlated LIVE {bucket} {direction} positions already open")
+    if open_count >= V681_HARD_CORRELATED_OPEN:
+        multiplier = 0.0; reasons.append(f"hard LIVE correlated-exposure cap reached ({open_count})")
+    if bucket == "CRYPTO" and macro_conflict and btc_weak and open_count >= V681_MAX_CORRELATED_OPEN:
+        multiplier = 0.0; reasons.append("macro conflict + weak BTC + crowded same-direction LIVE crypto book")
+    elif bucket == "CRYPTO" and macro_conflict and btc_weak:
+        multiplier = min(multiplier, 0.5); reasons.append("macro conflict confirmed by weak BTC structure")
+    if stop_count >= V681_STOP_CLUSTER_COUNT:
+        multiplier = 0.0
+        reasons.append(f"cooldown: {stop_count} LIVE same-bucket {direction} losses in last {V681_STOP_CLUSTER_MINUTES}m")
+    elif stop_count == 1 and macro_conflict:
+        multiplier = min(multiplier, 0.5); reasons.append("recent LIVE loss + macro conflict")
+    if multiplier <= 0:
+        decision = "BLOCK"; multiplier = 0.0
+    elif multiplier < 1.0:
+        decision = "REDUCE"
+    elif reasons:
+        decision = "CAUTION"
+    else:
+        decision = "ALLOW"
+    return {
+        "version": "7.4.4-live-risk", "evaluated_ts": now_ts, "decision": decision,
+        "size_multiplier": multiplier, "reasons": reasons, "symbol": symbol,
+        "direction": direction, "asset_bucket": bucket, "macro_score": combined,
+        "event_risk": event_risk, "btc_weak": btc_weak, "macro_conflict": macro_conflict,
+        "open_count": open_count, "open_symbols": open_symbols, "recent_stop_count": stop_count,
+        "recent_stop_symbols": [x.get("symbol") for x in live_losses],
+        "exposure_source": (snapshot or {}).get("source") or "LIVE",
+    }
+
+
 def _v71_selector_score(result, cost_r, cluster_count):
-    risk=result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
+    risk=result.get("live_risk_challenger") or result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
     score=num(result.get("best_score"))
     rd=str(risk.get("decision") or "NO_DATA").upper(); sc=str(strategy.get("consensus") or "NO_DATA").upper()
     score += {"ALLOW":8,"CAUTION":3,"REDUCE":-4,"BLOCK":-25}.get(rd,0)
@@ -10324,22 +10447,34 @@ def _v71_selector_score(result, cost_r, cluster_count):
 def _v71_live_candidate_gate(result, trades):
     if not V70_SELECTIVE_GATE:
         return {"eligible":True,"decision":"ALLOW","reasons":["selector disabled"],"selector_score":num(result.get("best_score"))}
-    risk=result.get("risk_challenger") or {}; strategy=result.get("strategy_ensemble") or {}
+    live_snapshot = _v71_live_risk_snapshot()
+    if not live_snapshot.get("ok"):
+        return {"eligible":False,"decision":"SKIP","reasons":[live_snapshot.get("reason") or "live risk context unavailable"],
+                "selector_score":0.0,"evaluated_ts":time.time(),"version":"7.4.4-live-risk"}
+    risk = _v71_build_live_risk(result, live_snapshot)
+    result["live_risk_challenger"] = risk
+    strategy=result.get("strategy_ensemble") or {}
     rd=str(risk.get("decision") or "NO_DATA").upper(); sc=str(strategy.get("consensus") or "NO_DATA").upper()
-    reasons=[]; notes=[]
+    reasons=[]; notes=[
+        f"live exposure source={risk.get('exposure_source')}",
+        f"live same-direction bucket positions={risk.get('open_count',0)}",
+    ]
     if rd == "BLOCK": reasons.append("Risk Lab BLOCK")
     if rd == "BLOCK" and sc in {"WAIT","AVOID"}: reasons.append(f"Risk BLOCK + Strategy {sc}")
     if V71_REGIME_GATE and (risk.get("asset_bucket") == "CRYPTO") and bool(risk.get("btc_weak")) and bool(risk.get("macro_conflict")):
         reasons.append("crypto regime conflict: weak BTC + macro conflict")
-    prior=_v71_recent_same_symbol_stop(trades,result.get("symbol"),result.get("direction"))
+    same_symbol_losses = _v71_live_recent_losses(live_snapshot, result, V70_SAME_SYMBOL_COOLDOWN_MINUTES, same_symbol=True)
+    prior = max(same_symbol_losses, key=lambda x:num(x.get("closed_time")), default=None)
     if prior:
-        if _v71_structural_reset(result,prior): notes.append("same-symbol cooldown overridden by structural reset")
-        else:
-            age=(time.time()-num(prior.get("closed_time")))/60
-            reasons.append(f"same-symbol stop cooldown ({age:.0f}m ago; no structural reset)")
-    cluster_count,cluster_symbols=_v71_bucket_stop_cluster(trades,result)
+        # Live ledger rows do not yet persist the original Core score, so do not
+        # invent a structural-reset comparison. A real same-symbol stop-like
+        # loss keeps its cooldown until the configured time window expires.
+        age=(time.time()-num(prior.get("closed_time")))/60
+        reasons.append(f"same-symbol LIVE loss cooldown ({age:.0f}m ago)")
+    cluster_rows = _v71_live_recent_losses(live_snapshot, result, V71_LOSS_CLUSTER_MINUTES)
+    cluster_count = len(cluster_rows); cluster_symbols = [x.get("symbol") for x in cluster_rows]
     if V71_LOSS_CLUSTER_GATE and cluster_count >= V71_LOSS_CLUSTER_COUNT:
-        reasons.append(f"loss-cluster breaker: {cluster_count} same-bucket {result.get('direction')} stops/{V71_LOSS_CLUSTER_MINUTES}m")
+        reasons.append(f"LIVE loss-cluster breaker: {cluster_count} same-bucket {result.get('direction')} losses/{V71_LOSS_CLUSTER_MINUTES}m")
     cost_r=_v71_estimated_cost_r(result)
     if V71_COST_GATE and cost_r > V71_MAX_COST_FRACTION_R:
         reasons.append(f"estimated execution drag {cost_r:.2f}R > {V71_MAX_COST_FRACTION_R:.2f}R")
@@ -10364,7 +10499,7 @@ def _v71_live_candidate_gate(result, trades):
             "notes":notes,"risk_decision":rd,"strategy_consensus":sc,"btc_weak":bool(risk.get("btc_weak")),
             "macro_conflict":bool(risk.get("macro_conflict")),"recent_stop_count":cluster_count,
             "recent_stop_symbols":cluster_symbols,"estimated_cost_r":round(cost_r,4),"selector_score":selector_score,
-            "evaluated_ts":time.time(),"version":"7.1-selection-challenger"}
+            "evaluated_ts":time.time(),"version":"7.4.4-live-risk","live_exposure_count":risk.get("open_count",0),"live_exposure_symbols":risk.get("open_symbols",[]),"exposure_source":risk.get("exposure_source")}
 
 def _v71_store_challenger(trade, gate):
     if not V71_CHALLENGER_DB_READY or not trade: return
@@ -10412,7 +10547,7 @@ _V70_PAPER_CREATE = create_paper_trade
 
 # Separate cadence for live-only bridge evaluations. This mirrors the normal
 # alert cooldown/score-improvement behavior without mutating paper alert state.
-V743_BRIDGE_VERSION = "7.4.3-live-bridgefix"
+V743_BRIDGE_VERSION = "7.4.4-live-riskfix"
 V71_LIVE_BRIDGE_STATE = {}
 
 def _v71_live_bridge_due(result):
@@ -10482,6 +10617,13 @@ def _v71_execute_live_gate(result, trade, gate, bridge_mode=False):
     if V70_LIVE is None:
         return {"executed": False, "reason": "live module unavailable"}
     try:
+        lr = result.get("live_risk_challenger") or {}
+        if lr:
+            print(
+                f"V7.4.4 LIVE RISK: {result.get('symbol')} {result.get('direction')} "
+                f"→ {lr.get('decision')} live_open={lr.get('open_count',0)} "
+                f"live_losses={lr.get('recent_stop_count',0)} btc_weak={bool(lr.get('btc_weak'))}"
+            )
         if gate.get("eligible"):
             outcome = V70_LIVE.execute_signal(result, trade)
             outcome = outcome if isinstance(outcome, dict) else {"executed": bool(outcome)}
@@ -10538,7 +10680,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.4.3-live-bridgefix",
+                "version": "7.4.4-live-riskfix",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
                 "v70_selective_gate": bool(V70_SELECTIVE_GATE),
