@@ -171,6 +171,30 @@ def halt_status():
         return (True, "cannot read durable halt state") if ENABLED else (False, "")
 
 
+def _is_transient_reconcile_halt(reason):
+    """Only stale transport/read failures are auto-recoverable after a full fresh reconcile."""
+    r = str(reason or "").lower()
+    return (
+        r.startswith("reconciliation failure:")
+        and any(x in r for x in ("readtimeout", "connecttimeout", "connectionerror", "timeout"))
+    )
+
+
+def _clear_transient_reconcile_halt_after_success():
+    global _halted_memory, _halt_reason
+    halted, reason = halt_status()
+    if not halted or not _is_transient_reconcile_halt(reason):
+        return False
+    # This is called only after positions, ledger ownership/protection, account equity,
+    # and breakers have all been read successfully in the same reconciliation pass.
+    _halted_memory = False
+    _halt_reason = ""
+    _state_set("v70_halt", {"halted": False, "reason": "", "recovered_from": str(reason)[:500], "ts": time.time()})
+    _diag("auto-cleared stale transient reconciliation HALT after successful fresh reconciliation")
+    _msg("✅ FUTURESHUNTER V7 LIVE RECOVERED\nFresh MEXC reconciliation succeeded; stale transient API-timeout HALT cleared. Hard safety halts remain durable.")
+    return True
+
+
 def asset(): return _signed("GET", "/api/v1/private/account/asset/USDT")
 def positions(symbol=None): return _signed("GET", "/api/v1/private/position/open_positions", {"symbol": symbol}) or []
 
@@ -443,6 +467,10 @@ def reconcile_once():
             a=asset(); limits=_dynamic_limits(a); eq=limits["equity"]
             if eq < limits["equity_kill"] and not halted: halt(f"equity kill-switch: {eq:.4f} < {limits['equity_kill']:.2f} USDT")
             if _daily_net_loss() >= limits["daily_loss_limit"] and not halted: halt(f"daily loss breaker reached: {_daily_net_loss():.4f} USDT")
+            # If the only durable halt was a previous transient API read/transport failure,
+            # a completely successful fresh reconciliation is sufficient to recover it.
+            # Hard halts (unknown position, protection, equity, daily breaker, etc.) are never auto-cleared.
+            _clear_transient_reconcile_halt_after_success()
         except Exception as e:
             halt(f"reconciliation failure: {type(e).__name__}: {e}")
 

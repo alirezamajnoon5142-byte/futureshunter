@@ -9337,6 +9337,32 @@ def _v691_trade_detail_message(query):
     )
 
 
+def _v715_profit_protect_summary_message():
+    if not V68_DB_READY:
+        return "V7.1.5 profit-protect: database unavailable"
+    row = _v68_db_execute(
+        """SELECT
+             COUNT(*) FILTER (WHERE profit_protect_exit_r IS NOT NULL),
+             COUNT(*) FILTER (WHERE profit_protect_exit_r IS NOT NULL AND profit_protect_edge_r IS NOT NULL),
+             COALESCE(AVG(profit_protect_exit_r) FILTER (WHERE profit_protect_exit_r IS NOT NULL),0),
+             COALESCE(SUM(profit_protect_edge_r) FILTER (WHERE profit_protect_edge_r IS NOT NULL),0),
+             COALESCE(AVG(profit_protect_edge_r) FILTER (WHERE profit_protect_edge_r IS NOT NULL),0),
+             COALESCE(SUM(actual_final_r) FILTER (WHERE profit_protect_exit_r IS NOT NULL AND profit_protect_edge_r IS NOT NULL),0),
+             COALESCE(SUM(profit_protect_final_r) FILTER (WHERE profit_protect_exit_r IS NOT NULL AND profit_protect_edge_r IS NOT NULL),0)
+           FROM fh_trade_supervisor""", fetch="one")
+    if not row:
+        return "V7.1.5 profit-protect: no data"
+    return (
+        "V7.1.5 PROFIT-PROTECT SHADOW\n"
+        f"Triggered: {int(row[0] or 0)} | Settled triggers: {int(row[1] or 0)}\n"
+        f"Average shadow exit: {num(row[2]):+.2f}R\n"
+        f"Control R on settled triggers: {num(row[5]):+.2f}R\n"
+        f"Shadow R on settled triggers: {num(row[6]):+.2f}R\n"
+        f"Net edge vs control: {num(row[3]):+.2f}R | Avg edge/trigger: {num(row[4]):+.2f}R\n"
+        "Research-only: original paper/live exits remain untouched."
+    )
+
+
 # Add live-supervisor commands without disturbing V6.9 / Risk Lab / Research Lab.
 _V691_V69_HANDLE_TELEGRAM_COMMAND = handle_telegram_command
 
@@ -9346,6 +9372,9 @@ def handle_telegram_command(chat_id, text):
     command = parts[0].lower() if parts else ""
     if command in {"/supervisor", "/livesupervisor", "/tradesupervisor"}:
         send_to_chat(chat_id, _v691_supervisor_summary_message())
+        return
+    if command in {"/profitprotect", "/ppshadow", "/shadow15"}:
+        send_to_chat(chat_id, _v715_profit_protect_summary_message())
         return
     if command in {"/trade", "/tradehealth"}:
         query = parts[1] if len(parts) > 1 else ""
@@ -9658,6 +9687,11 @@ V71_MAX_COST_FRACTION_R = float(os.getenv("V71_MAX_COST_FRACTION_R", "0.35"))
 V71_EST_TAKER_FEE_BPS = float(os.getenv("V71_EST_TAKER_FEE_BPS", "5.0"))
 V71_EST_SLIPPAGE_BPS = float(os.getenv("V71_EST_SLIPPAGE_BPS", "4.0"))
 V71_STRUCTURAL_RESET_SCORE_DELTA = float(os.getenv("V71_STRUCTURAL_RESET_SCORE_DELTA", "8.0"))
+# V7.2 adaptive quality gate: when the recent tape/regime is degraded, demand a
+# stronger Core score plus Strategy confirmation. V6.9.1 paper control is untouched.
+V72_ADAPTIVE_GATE = os.getenv("V72_ADAPTIVE_GATE", "true").lower() == "true"
+V72_DEGRADED_MIN_CORE = float(os.getenv("V72_DEGRADED_MIN_CORE", "80.0"))
+V72_DEGRADED_MIN_SELECTOR = float(os.getenv("V72_DEGRADED_MIN_SELECTOR", "68.0"))
 V71_CHALLENGER_DB_READY = False
 
 def _v71_init_challenger():
@@ -9755,6 +9789,22 @@ def _v71_live_candidate_gate(result, trades):
     if V71_COST_GATE and cost_r > V71_MAX_COST_FRACTION_R:
         reasons.append(f"estimated execution drag {cost_r:.2f}R > {V71_MAX_COST_FRACTION_R:.2f}R")
     selector_score=_v71_selector_score(result,cost_r,cluster_count)
+    degraded = bool(
+        cluster_count > 0
+        or risk.get("btc_weak")
+        or risk.get("macro_conflict")
+        or rd in {"CAUTION", "REDUCE"}
+        or sc in {"MIXED", "WAIT", "AVOID", "NO_DATA"}
+    )
+    if V72_ADAPTIVE_GATE and degraded:
+        core_score = num(result.get("best_score"))
+        strategy_confirmed = sc in {"CONFIRM", "STRONG_CONFIRM"}
+        if core_score < V72_DEGRADED_MIN_CORE:
+            reasons.append(f"adaptive degraded-regime Core threshold: {core_score:.1f} < {V72_DEGRADED_MIN_CORE:.1f}")
+        if not strategy_confirmed:
+            reasons.append(f"adaptive degraded-regime Strategy confirmation required ({sc})")
+        if selector_score < V72_DEGRADED_MIN_SELECTOR:
+            reasons.append(f"adaptive selector threshold: {selector_score:.1f} < {V72_DEGRADED_MIN_SELECTOR:.1f}")
     return {"eligible":not reasons,"decision":"ALLOW" if not reasons else "SKIP","reasons":reasons,
             "notes":notes,"risk_decision":rd,"strategy_consensus":sc,"btc_weak":bool(risk.get("btc_weak")),
             "macro_conflict":bool(risk.get("macro_conflict")),"recent_stop_count":cluster_count,
