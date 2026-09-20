@@ -7098,6 +7098,16 @@ V681_STOP_CLUSTER_MINUTES = int(os.getenv("V681_STOP_CLUSTER_MINUTES", "60"))
 
 def _v681_asset_bucket(symbol):
     symbol = str(symbol or "").upper()
+    # V7.3 can dynamically recognize plain-ticker MEXC Stock Futures (for
+    # example PLTR_USDT / QQQ_USDT) without routing them through BTC-specific
+    # crypto regime logic.  The helper is defined later in the file but is
+    # available by the time the scanner starts.
+    try:
+        equity_detector = globals().get("_v73_is_equity_symbol")
+        if equity_detector is not None and equity_detector(symbol):
+            return "EQUITY"
+    except Exception:
+        pass
     if any(token in symbol for token in ("STOCK", "SOXL", "SOXS", "TQQQ", "SQQQ")):
         return "EQUITY"
     if symbol.startswith(("XAU", "XAUT", "SILVER", "GOLD")):
@@ -9399,6 +9409,7 @@ async def main():
     v681_init_risk_lab()
     v69_init_strategy_lab()
     v691_init_supervisor_lab()
+    _v73_init_equity_lab()
     _v68_restore_subscribers()
     _v68_restore_latest_signal_file()
 
@@ -9442,6 +9453,7 @@ async def main():
     print("Risk challenger: SHADOW ONLY — portfolio/regime throttling is being measured")
     print("Strategy ensemble: SHADOW ONLY — 8 explicit playbooks on closed candles")
     print("Live trade supervisor: SHADOW ONLY — continuously re-evaluates every OPEN trade")
+    print("Equity Lab V7.3: SHADOW ONLY — separate 09:30 ET stock-futures ORB research")
     print("Durable signal queue: persist BEFORE Telegram")
     print("Paper/shadow/alert state: mirrored to Postgres")
     print(f"Paper trade expiry: {TRADE_EXPIRY_HOURS} hours")
@@ -9451,8 +9463,9 @@ async def main():
         "V6.7 trading logic is unchanged. Durable signal queue + persistent "
         "paper/shadow state + research farming are active.\n"
         "The V6.8.1 risk challenger, V6.9 strategy ensemble and V6.9.1 live trade supervisor are SHADOW-ONLY.\n"
+        "V7.3 Equity Lab is SHADOW-ONLY and uses a separate 09:30 ET stock-futures ORB model.\n"
         "The supervisor watches OPEN trades but never closes/resizes the control paper position.\n\n"
-        "Try /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
+        "Try /equity, /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
     )
 
     if gap_seconds > V68_DOWNTIME_THRESHOLD_SECONDS:
@@ -9522,6 +9535,10 @@ async def main():
 
             track_shadow_trades()
 
+            settled_equity = _v73_settle_equity_shadow()
+            if settled_equity:
+                print(f"V7.3 Equity Lab: settled {settled_equity} shadow outcome(s).")
+
             if now >= next_unsent_retry:
                 _v68_retry_unsent_signals(
                     trades,
@@ -9531,6 +9548,10 @@ async def main():
                 next_unsent_retry = now + V68_RETRY_UNSENT_SECONDS
 
             if now >= next_full_scan:
+                equity_created = _v73_scan_equity_shadow()
+                if equity_created:
+                    print(f"V7.3 Equity Lab: created {equity_created} new shadow signal(s).")
+
                 best = run_full_scan(
                     scan_symbols,
                     details,
@@ -9642,6 +9663,505 @@ async def main():
         await asyncio.sleep(sleep_for)
 
 
+
+
+# ============================================================
+# V7.3 EQUITY / STOCK FUTURES LAB — SHADOW ONLY
+# ============================================================
+# Purpose:
+# - keep V6.9.1 crypto/control logic untouched
+# - discover MEXC stock/index futures separately
+# - test a stock-specific 5m cash-open ORB model anchored to 09:30 New York
+# - record/settle its own paper outcomes in a dedicated Postgres table
+# - NEVER forward these equity-shadow signals to the live executor
+#
+# MEXC Stock Futures can trade outside the underlying US cash session.  This
+# research model intentionally uses the underlying 09:30 ET cash open as a
+# price-discovery anchor, then expires the test at 16:00 ET the same day.
+
+V73_EQUITY_VERSION = "7.3-equity-orb-shadow-1"
+V73_EQUITY_SHADOW_ENABLED = os.getenv("V73_EQUITY_SHADOW_ENABLED", "true").lower() == "true"
+V73_EQUITY_TOP_N = int(os.getenv("V73_EQUITY_TOP_N", "12"))
+V73_EQUITY_MIN_TURNOVER = float(os.getenv("V73_EQUITY_MIN_TURNOVER", "500000"))
+V73_EQUITY_MAX_SPREAD_PCT = float(os.getenv("V73_EQUITY_MAX_SPREAD_PCT", "0.25"))
+V73_EQUITY_ORB_WINDOW_MINUTES = int(os.getenv("V73_EQUITY_ORB_WINDOW_MINUTES", "180"))
+V73_EQUITY_MIN_SCORE = float(os.getenv("V73_EQUITY_MIN_SCORE", "72"))
+V73_EQUITY_MIN_RV = float(os.getenv("V73_EQUITY_MIN_RV", "1.00"))
+V73_EQUITY_MIN_ORB_ATR = float(os.getenv("V73_EQUITY_MIN_ORB_ATR", "0.30"))
+V73_EQUITY_MAX_ORB_ATR = float(os.getenv("V73_EQUITY_MAX_ORB_ATR", "2.25"))
+V73_EQUITY_MAX_BREAKOUT_EXTENSION_ATR = float(os.getenv("V73_EQUITY_MAX_BREAKOUT_EXTENSION_ATR", "0.80"))
+V73_EQUITY_MAX_RISK_PCT = float(os.getenv("V73_EQUITY_MAX_RISK_PCT", "3.50"))
+V73_EQUITY_NOTIFY = os.getenv("V73_EQUITY_NOTIFY", "false").lower() == "true"
+V73_EQUITY_DB_READY = False
+
+# Exact bases cover the plain-ticker form used by many MEXC stock futures.
+# The STOCK suffix remains auto-detected, and operators can extend the set via
+# V73_EQUITY_SYMBOLS="AAPL_USDT,NVDA_USDT,..." without a code deploy.
+V73_EQUITY_BASES = {
+    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOG","GOOGL","AMD","AVGO",
+    "NFLX","PLTR","COIN","MSTR","HOOD","RDDT","BABA","TSM","QCOM","INTC",
+    "MU","ARM","SMCI","ORCL","CRM","ADBE","CSCO","SNOW","CRWD","IONQ",
+    "RKLB","ONDS","CVNA","MELI","JPM","BAC","GS","V","MA","PYPL","SQ",
+    "XOM","CVX","COP","MCD","DIS","LLY","UNH","NKE","WMT","COST","GE",
+    "ACN","IBM","UBER","ABNB","SHOP","SPOT","PANW","APP","DELL","MRVL",
+    "QQQ","SPY","IWM","SOXL","SOXS","TQQQ","SQQQ","NAS100","US30","SP500",
+}
+
+
+def _v73_extra_equity_symbols():
+    raw = os.getenv("V73_EQUITY_SYMBOLS", "")
+    values = set()
+    for token in raw.split(","):
+        token = token.strip().upper()
+        if not token:
+            continue
+        if not token.endswith("_USDT"):
+            token = token + "_USDT"
+        values.add(token)
+    return values
+
+
+def _v73_is_equity_symbol(symbol):
+    symbol = str(symbol or "").upper().strip()
+    if not symbol.endswith("_USDT"):
+        return False
+    if symbol in _v73_extra_equity_symbols():
+        return True
+    base = symbol[:-5]
+    if "STOCK" in base:
+        return True
+    return base in V73_EQUITY_BASES
+
+
+def _v73_init_equity_lab():
+    global V73_EQUITY_DB_READY
+    if not V68_DB_READY or not V73_EQUITY_SHADOW_ENABLED:
+        V73_EQUITY_DB_READY = False
+        return False
+    table_sql = """
+    CREATE TABLE IF NOT EXISTS fh_v73_equity_shadow (
+        id BIGSERIAL PRIMARY KEY,
+        source_key TEXT UNIQUE NOT NULL,
+        strategy_version TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        session_date TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        score DOUBLE PRECISION NOT NULL,
+        entry DOUBLE PRECISION NOT NULL,
+        stop DOUBLE PRECISION NOT NULL,
+        risk DOUBLE PRECISION NOT NULL,
+        tp1 DOUBLE PRECISION NOT NULL,
+        tp2 DOUBLE PRECISION NOT NULL,
+        tp3 DOUBLE PRECISION NOT NULL,
+        signal_time DOUBLE PRECISION NOT NULL,
+        tracking_start DOUBLE PRECISION NOT NULL,
+        expiry_ts DOUBLE PRECISION NOT NULL,
+        last_checked DOUBLE PRECISION NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        tp2_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        tp3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        tp1_time DOUBLE PRECISION,
+        tp2_time DOUBLE PRECISION,
+        tp3_time DOUBLE PRECISION,
+        closed_time DOUBLE PRECISION,
+        final_r DOUBLE PRECISION,
+        orb_high DOUBLE PRECISION,
+        orb_low DOUBLE PRECISION,
+        orb_atr DOUBLE PRECISION,
+        relative_volume DOUBLE PRECISION,
+        spread_pct DOUBLE PRECISION,
+        event_risk TEXT,
+        reasons JSONB,
+        payload JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        settled_at TIMESTAMPTZ
+    )
+    """
+    ok = _v68_db_execute(table_sql)
+    if ok:
+        _v68_db_execute("CREATE INDEX IF NOT EXISTS idx_fh_v73_equity_shadow_status ON fh_v73_equity_shadow(status)")
+        _v68_db_execute("CREATE INDEX IF NOT EXISTS idx_fh_v73_equity_shadow_symbol_date ON fh_v73_equity_shadow(symbol, session_date)")
+    V73_EQUITY_DB_READY = bool(ok)
+    return V73_EQUITY_DB_READY
+
+
+def _v73_fetch_equity_tickers():
+    """Return liquid equity/stock futures without changing Core's crypto universe."""
+    try:
+        response = requests.get(f"{MEXC_REST}/api/v1/contract/ticker", timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            return []
+        data = payload.get("data") or []
+        if isinstance(data, dict):
+            data = [data]
+        rows = []
+        for ticker in data:
+            symbol = str(ticker.get("symbol") or "").upper()
+            if not _v73_is_equity_symbol(symbol):
+                continue
+            turnover = num(ticker.get("amount24"))
+            if turnover < V73_EQUITY_MIN_TURNOVER:
+                continue
+            bid = num(ticker.get("bid1")); ask = num(ticker.get("ask1"))
+            spread = 999.0
+            if bid > 0 and ask > 0:
+                spread = ((ask - bid) / ((ask + bid) / 2.0)) * 100.0
+            row = dict(ticker)
+            row["_turnover"] = turnover
+            row["_spread_pct"] = spread
+            rows.append(row)
+        rows.sort(key=lambda x: x.get("_turnover", 0.0), reverse=True)
+        return rows[:max(1, V73_EQUITY_TOP_N)]
+    except Exception as error:
+        print(f"V7.3 Equity Lab ticker discovery warning: {type(error).__name__}: {error}")
+        return []
+
+
+def _v73_session_bounds(reference_ts):
+    if ZoneInfo is None:
+        return None
+    ny = ZoneInfo("America/New_York")
+    dt_ny = datetime.fromtimestamp(reference_ts, tz=timezone.utc).astimezone(ny)
+    # No new US cash-open ORB on Saturday/Sunday. MEXC may still quote the
+    # contract, but that is deliberately outside this first stock strategy.
+    if dt_ny.weekday() >= 5:
+        return None
+    open_ny = datetime(dt_ny.year, dt_ny.month, dt_ny.day, 9, 30, tzinfo=ny)
+    close_ny = datetime(dt_ny.year, dt_ny.month, dt_ny.day, 16, 0, tzinfo=ny)
+    open_ts = open_ny.astimezone(timezone.utc).timestamp()
+    close_ts = close_ny.astimezone(timezone.utc).timestamp()
+    return {
+        "session_date": open_ny.strftime("%Y-%m-%d"),
+        "open_ts": open_ts,
+        "entry_start_ts": open_ts + 5 * 60,
+        "entry_end_ts": open_ts + max(5, V73_EQUITY_ORB_WINDOW_MINUTES) * 60,
+        "close_ts": close_ts,
+    }
+
+
+def _v73_equity_signal(symbol, ticker):
+    context = _v69_market_context(symbol)
+    if context is None:
+        return None
+
+    closed5, latest5, _ = _v69_rows(context.get("5m"))
+    closed15, latest15, _ = _v69_rows(context.get("15m"))
+    closed1h, latest1h, _ = _v69_rows(context.get("1h"))
+    if closed5 is None or latest5 is None or latest15 is None or latest1h is None:
+        return None
+
+    latest_start = normalize_candle_time(latest5.get("time"))
+    latest_close_ts = latest_start + 5 * 60
+    bounds = _v73_session_bounds(latest_close_ts)
+    if bounds is None:
+        return None
+    if not (bounds["entry_start_ts"] <= latest_close_ts <= bounds["entry_end_ts"]):
+        return None
+
+    opening = closed5[
+        (closed5["time"] >= bounds["open_ts"]) &
+        (closed5["time"] < bounds["open_ts"] + 5 * 60)
+    ]
+    if opening.empty:
+        return None
+    opening = opening.iloc[0]
+    orb_high = num(opening.get("high")); orb_low = num(opening.get("low"))
+    orb_range = orb_high - orb_low
+    atr5 = max(num(latest5.get("atr14")), 1e-12)
+    orb_atr = orb_range / atr5
+    close5 = num(latest5.get("close"))
+    if close5 > orb_high:
+        direction = "LONG"
+        extension_atr = (close5 - orb_high) / atr5
+    elif close5 < orb_low:
+        direction = "SHORT"
+        extension_atr = (orb_low - close5) / atr5
+    else:
+        return None
+
+    spread = num(ticker.get("_spread_pct"))
+    rv5 = num(latest5.get("relative_volume"))
+    loc5 = num(latest5.get("close_location"))
+    rsi15 = num(latest15.get("rsi14"))
+    adx15 = num(latest15.get("adx14"))
+    macd5 = num(latest5.get("macd_hist"))
+    close15 = num(latest15.get("close")); vwap15 = num(latest15.get("vwap20")); ema15 = num(latest15.get("ema20"))
+    close1h = num(latest1h.get("close")); ema20_1h = num(latest1h.get("ema20")); ema50_1h = num(latest1h.get("ema50"))
+
+    hard = []
+    if spread > V73_EQUITY_MAX_SPREAD_PCT:
+        hard.append(f"spread {spread:.3f}% > {V73_EQUITY_MAX_SPREAD_PCT:.3f}%")
+    if rv5 < V73_EQUITY_MIN_RV:
+        hard.append(f"breakout relative volume {rv5:.2f} < {V73_EQUITY_MIN_RV:.2f}")
+    if not (V73_EQUITY_MIN_ORB_ATR <= orb_atr <= V73_EQUITY_MAX_ORB_ATR):
+        hard.append(f"opening range {orb_atr:.2f} ATR outside {V73_EQUITY_MIN_ORB_ATR:.2f}-{V73_EQUITY_MAX_ORB_ATR:.2f}")
+    if extension_atr > V73_EQUITY_MAX_BREAKOUT_EXTENSION_ATR:
+        hard.append(f"breakout extended {extension_atr:.2f} ATR beyond ORB")
+
+    event_risk = str((get_macro_snapshot() or {}).get("event_risk") or "LOW").upper()
+    if event_risk == "EXTREME":
+        hard.append("EXTREME scheduled-event risk")
+
+    # Full opposite-side ORB invalidation.  This is deliberately conservative
+    # for the first research version; later data can test midpoint/ATR stops.
+    entry = close5
+    stop = orb_low if direction == "LONG" else orb_high
+    risk = abs(entry - stop)
+    risk_pct = risk / max(entry, 1e-12) * 100.0
+    if risk <= 0 or risk_pct > V73_EQUITY_MAX_RISK_PCT:
+        hard.append(f"ORB stop risk {risk_pct:.2f}% > {V73_EQUITY_MAX_RISK_PCT:.2f}%")
+    if hard:
+        return None
+
+    score = 35.0  # valid ORB break is mandatory
+    reasons = ["5m close broke the 09:30 ET cash-session opening range"]
+
+    if rv5 >= 1.50:
+        score += 12; reasons.append(f"strong breakout volume {rv5:.2f}x")
+    elif rv5 >= 1.20:
+        score += 9; reasons.append(f"healthy breakout volume {rv5:.2f}x")
+    else:
+        score += 5
+
+    if direction == "LONG":
+        if close15 > vwap15: score += 10; reasons.append("15m above VWAP")
+        if close15 > ema15: score += 8; reasons.append("15m above EMA20")
+        if close1h > ema20_1h and ema20_1h >= ema50_1h: score += 12; reasons.append("1h trend aligned")
+        if 52 <= rsi15 <= 78: score += 8; reasons.append(f"15m RSI supportive {rsi15:.0f}")
+        if macd5 > 0: score += 7
+        if loc5 >= 0.65: score += 5
+    else:
+        if close15 < vwap15: score += 10; reasons.append("15m below VWAP")
+        if close15 < ema15: score += 8; reasons.append("15m below EMA20")
+        if close1h < ema20_1h and ema20_1h <= ema50_1h: score += 12; reasons.append("1h trend aligned")
+        if 22 <= rsi15 <= 48: score += 8; reasons.append(f"15m RSI supportive {rsi15:.0f}")
+        if macd5 < 0: score += 7
+        if loc5 <= 0.35: score += 5
+
+    if adx15 >= 18: score += 3
+    if spread <= 0.10: score += 2
+    score = min(100.0, round(score, 1))
+    if score < V73_EQUITY_MIN_SCORE:
+        return None
+
+    if direction == "LONG":
+        tp1 = entry + risk; tp2 = entry + 2 * risk; tp3 = entry + 3 * risk
+    else:
+        tp1 = entry - risk; tp2 = entry - 2 * risk; tp3 = entry - 3 * risk
+
+    source_key = hashlib.sha256(
+        f"{V73_EQUITY_VERSION}|{symbol}|{bounds['session_date']}".encode("utf-8")
+    ).hexdigest()[:40]
+    payload = {
+        "version": V73_EQUITY_VERSION,
+        "symbol": symbol,
+        "session_date": bounds["session_date"],
+        "direction": direction,
+        "score": score,
+        "entry": entry,
+        "stop": stop,
+        "risk": risk,
+        "risk_pct": risk_pct,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "signal_time": latest_close_ts,
+        "tracking_start": latest_close_ts,
+        "expiry_ts": bounds["close_ts"],
+        "orb_high": orb_high,
+        "orb_low": orb_low,
+        "orb_atr": orb_atr,
+        "relative_volume": rv5,
+        "spread_pct": spread,
+        "event_risk": event_risk,
+        "reasons": reasons,
+    }
+    payload["source_key"] = source_key
+    return payload
+
+
+def _v73_store_equity_signal(signal):
+    if not V73_EQUITY_DB_READY or not signal:
+        return False
+    row = _v68_db_execute(
+        """INSERT INTO fh_v73_equity_shadow
+        (source_key,strategy_version,symbol,session_date,direction,score,entry,stop,risk,tp1,tp2,tp3,
+         signal_time,tracking_start,expiry_ts,last_checked,status,orb_high,orb_low,orb_atr,
+         relative_volume,spread_pct,event_risk,reasons,payload)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+        ON CONFLICT(source_key) DO NOTHING RETURNING id""",
+        (
+            signal["source_key"],V73_EQUITY_VERSION,signal["symbol"],signal["session_date"],signal["direction"],
+            signal["score"],signal["entry"],signal["stop"],signal["risk"],signal["tp1"],signal["tp2"],signal["tp3"],
+            signal["signal_time"],signal["tracking_start"],signal["expiry_ts"],signal["tracking_start"]-1,
+            signal["orb_high"],signal["orb_low"],signal["orb_atr"],signal["relative_volume"],signal["spread_pct"],
+            signal["event_risk"],json.dumps(signal.get("reasons") or []),json.dumps(_clean_json_value(signal)),
+        ), fetch="one"
+    )
+    return bool(row)
+
+
+def _v73_scan_equity_shadow():
+    if not V73_EQUITY_SHADOW_ENABLED or not V73_EQUITY_DB_READY:
+        return 0
+    tickers = _v73_fetch_equity_tickers()
+    created = 0
+    if tickers:
+        print(f"V7.3 Equity Lab: scanning {len(tickers)} liquid stock/index future(s) — SHADOW ONLY")
+    for ticker in tickers:
+        symbol = str(ticker.get("symbol") or "")
+        try:
+            signal = _v73_equity_signal(symbol, ticker)
+            if signal and _v73_store_equity_signal(signal):
+                created += 1
+                msg = (
+                    f"📈 V7.3 EQUITY SHADOW\n\n"
+                    f"{signal['symbol']} {signal['direction']}\n"
+                    f"Cash-open ORB score: {signal['score']:.0f}/100\n"
+                    f"Entry {signal['entry']:.6g} | Stop {signal['stop']:.6g}\n"
+                    f"TP1 {signal['tp1']:.6g} | TP2 {signal['tp2']:.6g} | TP3 {signal['tp3']:.6g}\n"
+                    f"ORB {signal['orb_atr']:.2f} ATR | RV {signal['relative_volume']:.2f}x | spread {signal['spread_pct']:.3f}%\n\n"
+                    "Research only — no live order was sent."
+                )
+                print(msg.replace("\n", " | "))
+                if V73_EQUITY_NOTIFY:
+                    send_telegram(msg)
+        except Exception as error:
+            print(f"V7.3 Equity Lab {symbol} warning: {type(error).__name__}: {error}")
+        time.sleep(0.05)
+    return created
+
+
+def _v73_open_rows():
+    if not V73_EQUITY_DB_READY:
+        return []
+    rows = _v68_db_execute(
+        """SELECT id,source_key,symbol,direction,entry,stop,risk,tp1,tp2,tp3,signal_time,
+        tracking_start,expiry_ts,last_checked,status,tp1_hit,tp2_hit,tp3_hit,tp1_time,tp2_time,tp3_time
+        FROM fh_v73_equity_shadow WHERE status='OPEN' ORDER BY signal_time""", fetch="all"
+    ) or []
+    keys = ["id","source_key","symbol","direction","entry","stop","risk","tp1","tp2","tp3","signal_time",
+            "tracking_start","expiry_ts","last_checked","status","tp1_hit","tp2_hit","tp3_hit","tp1_time","tp2_time","tp3_time"]
+    return [dict(zip(keys,row)) for row in rows]
+
+
+def _v73_update_trade(trade):
+    return _v68_db_execute(
+        """UPDATE fh_v73_equity_shadow SET
+        last_checked=%s,status=%s,tp1_hit=%s,tp2_hit=%s,tp3_hit=%s,tp1_time=%s,tp2_time=%s,tp3_time=%s,
+        closed_time=%s,final_r=%s,settled_at=CASE WHEN %s='OPEN' THEN settled_at ELSE NOW() END
+        WHERE id=%s""",
+        (trade.get("last_checked"),trade.get("status"),trade.get("tp1_hit"),trade.get("tp2_hit"),trade.get("tp3_hit"),
+         trade.get("tp1_time"),trade.get("tp2_time"),trade.get("tp3_time"),trade.get("closed_time"),trade.get("final_r"),
+         trade.get("status"),trade.get("id"))
+    )
+
+
+def _v73_settle_one_equity(trade):
+    df = get_candles(trade["symbol"], "Min1")
+    if df is None or len(df) == 0:
+        return None
+    df = df.copy()
+    df["time_norm"] = df["time"].apply(normalize_candle_time)
+    relevant = df[(df["time_norm"] > num(trade.get("last_checked"))) &
+                  (df["time_norm"] >= num(trade.get("tracking_start")))]
+    latest_price = num(df.iloc[-1]["close"])
+    latest_seen = num(trade.get("last_checked"))
+    event = None
+    for _, candle in relevant.iterrows():
+        candle_time = num(candle["time_norm"])
+        latest_seen = max(latest_seen, candle_time)
+        touched = trade_touches(trade, num(candle["high"]), num(candle["low"]))
+        if touched["stop"] and touched["tp3"]:
+            trade["status"] = "AMBIGUOUS"; trade["closed_time"] = candle_time; trade["final_r"] = None; event = "AMBIGUOUS"; break
+        if touched["stop"]:
+            trade["status"] = "STOP"; trade["closed_time"] = candle_time; trade["final_r"] = -1.0; event = "STOP"; break
+        if touched["tp3"]:
+            trade["tp1_hit"] = trade["tp2_hit"] = trade["tp3_hit"] = True
+            if not trade.get("tp1_time"): trade["tp1_time"] = candle_time
+            if not trade.get("tp2_time"): trade["tp2_time"] = candle_time
+            trade["tp3_time"] = candle_time; trade["status"] = "TP3"; trade["closed_time"] = candle_time; trade["final_r"] = 3.0; event = "TP3"; break
+        if touched["tp2"] and not trade.get("tp2_hit"):
+            trade["tp1_hit"] = True; trade["tp2_hit"] = True
+            if not trade.get("tp1_time"): trade["tp1_time"] = candle_time
+            trade["tp2_time"] = candle_time
+        elif touched["tp1"] and not trade.get("tp1_hit"):
+            trade["tp1_hit"] = True; trade["tp1_time"] = candle_time
+    trade["last_checked"] = latest_seen
+    if trade.get("status") == "OPEN" and time.time() >= num(trade.get("expiry_ts")):
+        final_r = current_r_for_price(trade, latest_price)
+        trade["final_r"] = round(max(-1.0, min(3.0, final_r)), 4)
+        trade["status"] = "EXPIRED"; trade["closed_time"] = time.time(); event = "EXPIRED"
+    _v73_update_trade(trade)
+    return event
+
+
+def _v73_settle_equity_shadow():
+    if not V73_EQUITY_DB_READY:
+        return 0
+    settled = 0
+    for trade in _v73_open_rows():
+        try:
+            event = _v73_settle_one_equity(trade)
+            if event:
+                settled += 1
+                print(f"V7.3 Equity Lab settled {trade['symbol']} {trade['direction']} → {event} ({trade.get('final_r')})")
+        except Exception as error:
+            print(f"V7.3 Equity settlement warning {trade.get('symbol')}: {type(error).__name__}: {error}")
+        time.sleep(0.05)
+    return settled
+
+
+def _v73_equity_summary_text():
+    if not V73_EQUITY_SHADOW_ENABLED:
+        return "V7.3 Equity Lab is disabled."
+    if not V73_EQUITY_DB_READY:
+        return "V7.3 Equity Lab is waiting for Postgres."
+    row = _v68_db_execute(
+        """SELECT COUNT(*),
+        COUNT(*) FILTER(WHERE status='OPEN'),
+        COUNT(*) FILTER(WHERE final_r IS NOT NULL),
+        COUNT(*) FILTER(WHERE final_r>0),
+        COALESCE(SUM(final_r) FILTER(WHERE final_r IS NOT NULL),0),
+        COALESCE(AVG(final_r) FILTER(WHERE final_r IS NOT NULL),0),
+        COUNT(*) FILTER(WHERE tp1_hit),COUNT(*) FILTER(WHERE tp2_hit),COUNT(*) FILTER(WHERE tp3_hit),
+        COUNT(*) FILTER(WHERE status='STOP'),COUNT(*) FILTER(WHERE status='AMBIGUOUS')
+        FROM fh_v73_equity_shadow""", fetch="one"
+    )
+    if not row:
+        return "V7.3 Equity Lab: no data yet."
+    total,open_n,settled,wins,total_r,avg_r,tp1,tp2,tp3,stops,amb = row
+    win_rate = (100.0 * num(wins) / num(settled)) if num(settled) else 0.0
+    latest = _v68_db_execute(
+        """SELECT symbol,direction,score,status,final_r,session_date
+        FROM fh_v73_equity_shadow ORDER BY signal_time DESC LIMIT 5""", fetch="all"
+    ) or []
+    lines = [
+        "📈 V7.3 EQUITY / STOCK FUTURES LAB — SHADOW ONLY",
+        f"Signals: {int(total or 0)} | Open: {int(open_n or 0)} | Settled: {int(settled or 0)}",
+        f"Win rate: {win_rate:.1f}% | Avg: {num(avg_r):+.2f}R | Cumulative: {num(total_r):+.2f}R",
+        f"TP1/TP2/TP3: {int(tp1 or 0)}/{int(tp2 or 0)}/{int(tp3 or 0)} | Stops: {int(stops or 0)} | Ambiguous: {int(amb or 0)}",
+        f"Model: 5m 09:30 ET cash-open ORB + volume/VWAP/EMA/1h trend; score ≥ {V73_EQUITY_MIN_SCORE:.0f}",
+        "No equity signal can place a live order in this version.",
+    ]
+    if latest:
+        lines.append("\nLatest:")
+        for sym,direction,score,status,final_r,session_date in latest:
+            rtxt = "OPEN" if final_r is None else f"{num(final_r):+.2f}R"
+            lines.append(f"• {session_date} {sym} {direction} {num(score):.0f} — {status} {rtxt}")
+    return "\n".join(lines)
+
+
+_V73_PREV_COMMAND = handle_telegram_command
+def handle_telegram_command(chat_id, text):
+    command = ((text or "").strip().split() or [""])[0].lower()
+    if command in {"/equity","/stocklab","/stocks","/orb"}:
+        send_to_chat(chat_id, _v73_equity_summary_text())
+        return
+    return _V73_PREV_COMMAND(chat_id, text)
 
 # ============================================================
 # V7.0 LIVE PILOT — FAIL-CLOSED EXECUTION WRAPPER
@@ -9882,7 +10402,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.1",
+                "version": "7.3",
+                "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
                 "v70_selective_gate": bool(V70_SELECTIVE_GATE),
                 "v70_same_symbol_cooldown_minutes": V70_SAME_SYMBOL_COOLDOWN_MINUTES,
