@@ -3895,9 +3895,23 @@ async def get_top_symbols():
             eligible = []
             all_symbols = set()
 
+            # Refresh once per cache window before crypto filtering so newly
+            # listed MEXC stock futures cannot leak into the crypto Core.
+            equity_refresh = globals().get("_v73_refresh_equity_symbol_cache")
+            if callable(equity_refresh):
+                try:
+                    equity_refresh()
+                except Exception as _equity_refresh_error:
+                    print(f"V7.5 equity-universe refresh warning: {type(_equity_refresh_error).__name__}: {_equity_refresh_error}")
+
             for ticker in tickers:
                 symbol = ticker.get("symbol", "")
                 if not symbol.endswith("_USDT"):
+                    continue
+                # V7.5 hard-separates stock/index futures from the crypto Core.
+                # Equity contracts are evaluated only by the dedicated NY cash-open ORB lab.
+                equity_detector = globals().get("_v73_is_equity_symbol")
+                if callable(equity_detector) and equity_detector(symbol):
                     continue
 
                 all_symbols.add(symbol)
@@ -9420,6 +9434,7 @@ async def main():
     v69_init_strategy_lab()
     v691_init_supervisor_lab()
     _v73_init_equity_lab()
+    _v75_init_equity_live_shadow()
     _v68_restore_subscribers()
     _v68_restore_latest_signal_file()
 
@@ -9463,7 +9478,8 @@ async def main():
     print("Risk challenger: SHADOW ONLY — portfolio/regime throttling is being measured")
     print("Strategy ensemble: SHADOW ONLY — 8 explicit playbooks on closed candles")
     print("Live trade supervisor: SHADOW ONLY — continuously re-evaluates every OPEN trade")
-    print("Equity Lab V7.3: SHADOW ONLY — separate 09:30 ET stock-futures ORB research")
+    print(f"Equity Lab V7.3: SHADOW research — top {V73_EQUITY_TOP_N} liquid stock/index futures, 09:30 ET ORB")
+    print(f"Equity Live V7.5: {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW FIRST'} — {V75_EQUITY_RISK_PCT*100:.2f}% risk if enabled, max {V75_EQUITY_MAX_OPEN} equity position")
     print("Durable signal queue: persist BEFORE Telegram")
     print("Paper/shadow/alert state: mirrored to Postgres")
     print(f"Paper trade expiry: {TRADE_EXPIRY_HOURS} hours")
@@ -9473,7 +9489,8 @@ async def main():
         "V6.7 trading logic is unchanged. Durable signal queue + persistent "
         "paper/shadow state + research farming are active.\n"
         "The V6.8.1 risk challenger, V6.9 strategy ensemble and V6.9.1 live trade supervisor are SHADOW-ONLY.\n"
-        "V7.3 Equity Lab is SHADOW-ONLY and uses a separate 09:30 ET stock-futures ORB model.\n"
+        f"V7.3 Equity Lab scans the top {V73_EQUITY_TOP_N} liquid stock/index futures with a separate 09:30 ET ORB model.\n"
+        f"V7.5 equity live path is {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW-FIRST/OFF'}; if later enabled it risks at most {V75_EQUITY_RISK_PCT*100:.2f}% per equity trade.\n"
         "The supervisor watches OPEN trades but never closes/resizes the control paper position.\n\n"
         "Try /equity, /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
     )
@@ -9548,6 +9565,7 @@ async def main():
             settled_equity = _v73_settle_equity_shadow()
             if settled_equity:
                 print(f"V7.3 Equity Lab: settled {settled_equity} shadow outcome(s).")
+            _v75_sync_equity_candidate_outcomes()
 
             if now >= next_unsent_retry:
                 _v68_retry_unsent_signals(
@@ -9701,14 +9719,14 @@ async def main():
 
 
 # ============================================================
-# V7.3 EQUITY / STOCK FUTURES LAB — SHADOW ONLY
+# V7.3 EQUITY / STOCK FUTURES LAB — RESEARCH FEED FOR V7.5
 # ============================================================
 # Purpose:
 # - keep V6.9.1 crypto/control logic untouched
 # - discover MEXC stock/index futures separately
 # - test a stock-specific 5m cash-open ORB model anchored to 09:30 New York
 # - record/settle its own paper outcomes in a dedicated Postgres table
-# - NEVER forward these equity-shadow signals to the live executor
+# - V7.3 never executes directly; qualifying signals are handed to the separate V7.5 gate
 #
 # MEXC Stock Futures can trade outside the underlying US cash session.  This
 # research model intentionally uses the underlying 09:30 ET cash open as a
@@ -9716,7 +9734,7 @@ async def main():
 
 V73_EQUITY_VERSION = "7.3-equity-orb-shadow-1"
 V73_EQUITY_SHADOW_ENABLED = os.getenv("V73_EQUITY_SHADOW_ENABLED", "true").lower() == "true"
-V73_EQUITY_TOP_N = int(os.getenv("V73_EQUITY_TOP_N", "12"))
+V73_EQUITY_TOP_N = int(os.getenv("V73_EQUITY_TOP_N", "30"))
 V73_EQUITY_MIN_TURNOVER = float(os.getenv("V73_EQUITY_MIN_TURNOVER", "500000"))
 V73_EQUITY_MAX_SPREAD_PCT = float(os.getenv("V73_EQUITY_MAX_SPREAD_PCT", "0.25"))
 V73_EQUITY_ORB_WINDOW_MINUTES = int(os.getenv("V73_EQUITY_ORB_WINDOW_MINUTES", "180"))
@@ -9728,8 +9746,13 @@ V73_EQUITY_MAX_BREAKOUT_EXTENSION_ATR = float(os.getenv("V73_EQUITY_MAX_BREAKOUT
 V73_EQUITY_MAX_RISK_PCT = float(os.getenv("V73_EQUITY_MAX_RISK_PCT", "3.50"))
 V73_EQUITY_NOTIFY = os.getenv("V73_EQUITY_NOTIFY", "false").lower() == "true"
 V73_EQUITY_DB_READY = False
+V73_EQUITY_META_CACHE_SECONDS = int(os.getenv("V73_EQUITY_META_CACHE_SECONDS", "3600"))
+V73_EQUITY_SYMBOL_CACHE = set()
+V73_EQUITY_META_CACHE = {}
+V73_EQUITY_META_CACHE_TS = 0.0
 
-# Exact bases cover the plain-ticker form used by many MEXC stock futures.
+# Exact bases are a fail-safe fallback. Primary discovery comes from MEXC
+# contract metadata so newly-listed stock futures do not require a code deploy.
 # The STOCK suffix remains auto-detected, and operators can extend the set via
 # V73_EQUITY_SYMBOLS="AAPL_USDT,NVDA_USDT,..." without a code deploy.
 V73_EQUITY_BASES = {
@@ -9740,7 +9763,50 @@ V73_EQUITY_BASES = {
     "XOM","CVX","COP","MCD","DIS","LLY","UNH","NKE","WMT","COST","GE",
     "ACN","IBM","UBER","ABNB","SHOP","SPOT","PANW","APP","DELL","MRVL",
     "QQQ","SPY","IWM","SOXL","SOXS","TQQQ","SQQQ","NAS100","US30","SP500",
+    "VST","UPST","FCX","BLK","AXP","CCL","CMCSA","MAR","FOXA","BX","CRDO","AXTI",
+    "RTX","NIO","AVAV","SMR","AEHR","TSLL","NVDL","RAM","POET","SPCX","DRAM","XLK",
+    "BRKB","HD","CCJ","DDOG",
 }
+
+
+def _v73_refresh_equity_symbol_cache(force=False):
+    global V73_EQUITY_SYMBOL_CACHE, V73_EQUITY_META_CACHE, V73_EQUITY_META_CACHE_TS
+    now = time.time()
+    if (not force and V73_EQUITY_SYMBOL_CACHE and
+            now - V73_EQUITY_META_CACHE_TS < max(60, V73_EQUITY_META_CACHE_SECONDS)):
+        return V73_EQUITY_SYMBOL_CACHE
+    try:
+        response = requests.get(f"{MEXC_REST}/api/v1/contract/detail", timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("data") or [] if payload.get("success") else []
+        discovered = set()
+        meta = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if not symbol.endswith("_USDT"):
+                continue
+            plates = {str(x or "").lower() for x in (row.get("conceptPlate") or [])}
+            base = symbol[:-5]
+            if "mc-trade-zone-stock" in plates or "STOCK" in base:
+                discovered.add(symbol)
+                meta[symbol] = {
+                    "display_name": str(row.get("displayNameEn") or row.get("displayName") or symbol),
+                    "base_name": str(row.get("baseCoinName") or row.get("baseCoin") or base),
+                    "api_allowed": bool(row.get("apiAllowed", False)),
+                    "state": int(row.get("state") or 0),
+                }
+        discovered.update(_v73_extra_equity_symbols())
+        if discovered:
+            V73_EQUITY_SYMBOL_CACHE = discovered
+            V73_EQUITY_META_CACHE = meta
+            V73_EQUITY_META_CACHE_TS = now
+            print(f"V7.5 Equity universe: discovered {len(discovered)} USDT stock/index future(s) from MEXC metadata")
+    except Exception as error:
+        print(f"V7.5 Equity metadata discovery warning: {type(error).__name__}: {error}")
+    return V73_EQUITY_SYMBOL_CACHE
 
 
 def _v73_extra_equity_symbols():
@@ -9760,7 +9826,7 @@ def _v73_is_equity_symbol(symbol):
     symbol = str(symbol or "").upper().strip()
     if not symbol.endswith("_USDT"):
         return False
-    if symbol in _v73_extra_equity_symbols():
+    if symbol in _v73_extra_equity_symbols() or symbol in V73_EQUITY_SYMBOL_CACHE:
         return True
     base = symbol[:-5]
     if "STOCK" in base:
@@ -9822,8 +9888,9 @@ def _v73_init_equity_lab():
 
 
 def _v73_fetch_equity_tickers():
-    """Return liquid equity/stock futures without changing Core's crypto universe."""
+    """Return the top liquid MEXC USDT stock/index futures, isolated from crypto Core."""
     try:
+        _v73_refresh_equity_symbol_cache()
         response = requests.get(f"{MEXC_REST}/api/v1/contract/ticker", timeout=10)
         response.raise_for_status()
         payload = response.json()
@@ -10009,6 +10076,7 @@ def _v73_equity_signal(symbol, ticker):
         "orb_high": orb_high,
         "orb_low": orb_low,
         "orb_atr": orb_atr,
+        "extension_atr": extension_atr,
         "relative_volume": rv5,
         "spread_pct": spread,
         "event_risk": event_risk,
@@ -10050,8 +10118,22 @@ def _v73_scan_equity_shadow():
         symbol = str(ticker.get("symbol") or "")
         try:
             signal = _v73_equity_signal(symbol, ticker)
-            if signal and _v73_store_equity_signal(signal):
-                created += 1
+            if signal:
+                is_new = _v73_store_equity_signal(signal)
+                if is_new:
+                    created += 1
+                # V7.5 gets every fresh qualifying scan, not only the first V7.3
+                # insert. That lets a setup rejected at 09:35 become eligible at
+                # 09:40/09:45 if volume/score/execution quality materially improves.
+                live_hook = globals().get("_v75_process_equity_candidate")
+                if callable(live_hook):
+                    try:
+                        live_hook(signal)
+                    except Exception as live_error:
+                        print(f"V7.5 Equity Live Shadow {symbol} warning: {type(live_error).__name__}: {live_error}")
+                if not is_new:
+                    time.sleep(0.05)
+                    continue
                 msg = (
                     f"📈 V7.3 EQUITY SHADOW\n\n"
                     f"{signal['symbol']} {signal['direction']}\n"
@@ -10059,7 +10141,7 @@ def _v73_scan_equity_shadow():
                     f"Entry {signal['entry']:.6g} | Stop {signal['stop']:.6g}\n"
                     f"TP1 {signal['tp1']:.6g} | TP2 {signal['tp2']:.6g} | TP3 {signal['tp3']:.6g}\n"
                     f"ORB {signal['orb_atr']:.2f} ATR | RV {signal['relative_volume']:.2f}x | spread {signal['spread_pct']:.3f}%\n\n"
-                    "Research only — no live order was sent."
+                    "V7.3 control signal — V7.5 evaluates any live action separately."
                 )
                 print(msg.replace("\n", " | "))
                 if V73_EQUITY_NOTIFY:
@@ -10180,7 +10262,7 @@ def _v73_equity_summary_text():
         f"Win rate: {win_rate:.1f}% | Avg: {num(avg_r):+.2f}R | Cumulative: {num(total_r):+.2f}R",
         f"TP1/TP2/TP3: {int(tp1 or 0)}/{int(tp2 or 0)}/{int(tp3 or 0)} | Stops: {int(stops or 0)} | Ambiguous: {int(amb or 0)}",
         f"Model: 5m 09:30 ET cash-open ORB + volume/VWAP/EMA/1h trend; score ≥ {V73_EQUITY_MIN_SCORE:.0f}",
-        "No equity signal can place a live order in this version.",
+        "V7.3 itself never executes; qualifying signals are passed to the separate V7.5 shadow/live gate.",
     ]
     if latest:
         lines.append("\nLatest:")
@@ -10207,6 +10289,529 @@ except Exception as _v70_import_error:
     V70_LIVE = None
     print(f"V7.0 live module import warning: {_v70_import_error}")
 
+
+# ============================================================
+# V7.5 EQUITY LIVE CANDIDATE — SHADOW-FIRST, LIVE-CAPABLE
+# ============================================================
+# The dedicated equity path is built now, but live execution is OFF by default.
+# This lets several NY cash sessions accumulate auditable "would take / would skip"
+# outcomes before the operator explicitly enables stock-futures live trading.
+V75_EQUITY_VERSION = "7.5.0-equity-live-shadow-ready"
+V75_EQUITY_LIVE_ENABLED = os.getenv("V75_EQUITY_LIVE_ENABLED", "false").lower() == "true"
+V75_EQUITY_RISK_PCT = min(0.005, max(0.001, float(os.getenv("V75_EQUITY_RISK_PCT", "0.005"))))
+V75_EQUITY_MIN_SCORE = float(os.getenv("V75_EQUITY_MIN_SCORE", "80"))
+V75_EQUITY_MIN_RV = float(os.getenv("V75_EQUITY_MIN_RV", "1.20"))
+V75_EQUITY_MAX_SPREAD_PCT = float(os.getenv("V75_EQUITY_MAX_SPREAD_PCT", "0.15"))
+V75_EQUITY_MAX_STOP_PCT = float(os.getenv("V75_EQUITY_MAX_STOP_PCT", "2.50"))
+V75_EQUITY_MAX_EXTENSION_ATR = float(os.getenv("V75_EQUITY_MAX_EXTENSION_ATR", "0.60"))
+V75_EQUITY_MAX_ENTRY_DRIFT_R = float(os.getenv("V75_EQUITY_MAX_ENTRY_DRIFT_R", "0.20"))
+V75_EQUITY_MAX_SIGNAL_AGE_SECONDS = int(os.getenv("V75_EQUITY_MAX_SIGNAL_AGE_SECONDS", "480"))
+V75_EQUITY_MAX_OPEN = min(1, max(1, int(os.getenv("V75_EQUITY_MAX_OPEN", "1"))))
+V75_EQUITY_SAME_SYMBOL_COOLDOWN_MINUTES = int(os.getenv("V75_EQUITY_SAME_SYMBOL_COOLDOWN_MINUTES", "120"))
+V75_EQUITY_LOSS_CLUSTER_COUNT = int(os.getenv("V75_EQUITY_LOSS_CLUSTER_COUNT", "2"))
+V75_EQUITY_LOSS_CLUSTER_MINUTES = int(os.getenv("V75_EQUITY_LOSS_CLUSTER_MINUTES", "390"))
+V75_EQUITY_MIN_SHADOW_SESSIONS = int(os.getenv("V75_EQUITY_MIN_SHADOW_SESSIONS", "3"))
+V75_EQUITY_MIN_SETTLED_FOR_REVIEW = int(os.getenv("V75_EQUITY_MIN_SETTLED_FOR_REVIEW", "20"))
+V75_EQUITY_NOTIFY = os.getenv("V75_EQUITY_NOTIFY", "true").lower() == "true"
+V75_EQUITY_DB_READY = False
+
+
+def _v75_init_equity_live_shadow():
+    global V75_EQUITY_DB_READY
+    if not V68_DB_READY:
+        V75_EQUITY_DB_READY = False
+        return False
+    ok = _v68_db_execute("""
+    CREATE TABLE IF NOT EXISTS fh_v75_equity_live_candidates (
+        source_key TEXT PRIMARY KEY,
+        version TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        session_date TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        score DOUBLE PRECISION NOT NULL,
+        decision TEXT NOT NULL,
+        reasons JSONB,
+        notes JSONB,
+        current_price DOUBLE PRECISION,
+        drift_r DOUBLE PRECISION,
+        live_stop_pct DOUBLE PRECISION,
+        risk_fraction DOUBLE PRECISION,
+        live_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        executed BOOLEAN NOT NULL DEFAULT FALSE,
+        execution_reason TEXT,
+        actual_status TEXT,
+        actual_final_r DOUBLE PRECISION,
+        shadow_entry DOUBLE PRECISION, shadow_stop DOUBLE PRECISION, shadow_risk DOUBLE PRECISION,
+        shadow_tp1 DOUBLE PRECISION, shadow_tp2 DOUBLE PRECISION, shadow_tp3 DOUBLE PRECISION,
+        shadow_tracking_start DOUBLE PRECISION, shadow_expiry_ts DOUBLE PRECISION, shadow_last_checked DOUBLE PRECISION,
+        shadow_tp1_hit BOOLEAN NOT NULL DEFAULT FALSE, shadow_tp2_hit BOOLEAN NOT NULL DEFAULT FALSE, shadow_tp3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        shadow_tp1_time DOUBLE PRECISION, shadow_tp2_time DOUBLE PRECISION, shadow_tp3_time DOUBLE PRECISION,
+        shadow_closed_time DOUBLE PRECISION,
+        payload JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        settled_at TIMESTAMPTZ
+    )
+    """)
+    if ok:
+        for ddl in (
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_entry DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_stop DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_risk DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp1 DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp2 DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp3 DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tracking_start DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_expiry_ts DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_last_checked DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp1_hit BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp2_hit BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp3_hit BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp1_time DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp2_time DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_tp3_time DOUBLE PRECISION",
+            "ALTER TABLE fh_v75_equity_live_candidates ADD COLUMN IF NOT EXISTS shadow_closed_time DOUBLE PRECISION",
+        ):
+            _v68_db_execute(ddl)
+        _v68_db_execute("CREATE INDEX IF NOT EXISTS idx_fh_v75_equity_decision ON fh_v75_equity_live_candidates(decision, created_at DESC)")
+        _v68_db_execute("CREATE INDEX IF NOT EXISTS idx_fh_v75_equity_shadow_status ON fh_v75_equity_live_candidates(actual_status, shadow_tracking_start)")
+    V75_EQUITY_DB_READY = bool(ok)
+    return V75_EQUITY_DB_READY
+
+
+def _v75_current_ticker(symbol):
+    response = requests.get(f"{MEXC_REST}/api/v1/contract/ticker", params={"symbol": symbol}, timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("success"):
+        raise RuntimeError(f"MEXC ticker failure {payload.get('code')} {payload.get('message')}")
+    data = payload.get("data")
+    if isinstance(data, list):
+        data = next((x for x in data if str(x.get("symbol") or "") == str(symbol)), None)
+    if not isinstance(data, dict):
+        raise RuntimeError("equity ticker unavailable")
+    return data
+
+
+def _v75_equity_live_gate(signal):
+    reasons = []
+    notes = []
+    symbol = str((signal or {}).get("symbol") or "")
+    direction = str((signal or {}).get("direction") or "").upper()
+    if not signal or not _v73_is_equity_symbol(symbol):
+        return {"decision":"SKIP","eligible":False,"reasons":["not a recognized equity/index future"],"notes":notes}
+    if V70_LIVE is None or not getattr(V70_LIVE, "ENABLED", False):
+        return {"decision":"SKIP","eligible":False,"reasons":["live executor unavailable/disabled"],"notes":notes}
+
+    # Real MEXC positions + real live ledger only. Paper positions are never used.
+    try:
+        snapshot = V70_LIVE.live_risk_snapshot(V75_EQUITY_LOSS_CLUSTER_MINUTES)
+    except Exception as error:
+        return {"decision":"SKIP","eligible":False,"reasons":[f"live risk snapshot failed: {type(error).__name__}: {error}"],"notes":notes}
+
+    open_equities = [p for p in (snapshot.get("open_positions") or []) if _v73_is_equity_symbol(p.get("symbol"))]
+    if any(str(p.get("symbol") or "") == symbol for p in open_equities):
+        reasons.append("same equity symbol already live")
+    if len(open_equities) >= V75_EQUITY_MAX_OPEN:
+        reasons.append(f"equity live-position cap reached ({len(open_equities)}/{V75_EQUITY_MAX_OPEN})")
+
+    recent_losses = [
+        x for x in (snapshot.get("recent_closed") or [])
+        if bool(x.get("stop_like"))
+        and _v73_is_equity_symbol(x.get("symbol"))
+        and str(x.get("direction") or "").upper() == direction
+    ]
+    if len(recent_losses) >= V75_EQUITY_LOSS_CLUSTER_COUNT:
+        reasons.append(f"equity LIVE loss-cluster breaker: {len(recent_losses)} same-direction stop-like losses/{V75_EQUITY_LOSS_CLUSTER_MINUTES}m")
+    same_symbol_losses = [
+        x for x in recent_losses
+        if str(x.get("symbol") or "") == symbol
+        and time.time() - num(x.get("closed_time")) <= V75_EQUITY_SAME_SYMBOL_COOLDOWN_MINUTES * 60
+    ]
+    if same_symbol_losses:
+        age_m = (time.time() - max(num(x.get("closed_time")) for x in same_symbol_losses)) / 60.0
+        reasons.append(f"same-symbol equity LIVE loss cooldown ({age_m:.0f}m ago)")
+
+    signal_age = max(0.0, time.time() - num(signal.get("signal_time")))
+    if signal_age > V75_EQUITY_MAX_SIGNAL_AGE_SECONDS:
+        reasons.append(f"equity signal stale {signal_age:.0f}s > {V75_EQUITY_MAX_SIGNAL_AGE_SECONDS}s")
+
+    event_risk = str(signal.get("event_risk") or "LOW").upper()
+    if event_risk in {"HIGH", "EXTREME"}:
+        reasons.append(f"scheduled-event risk {event_risk}")
+    macro = get_macro_snapshot() or {}
+    macro_conflict, strong_macro_conflict = _v681_directional_macro_conflict(direction, "EQUITY", num(macro.get("combined_score")))
+    if strong_macro_conflict:
+        reasons.append(f"strong macro conflict {num(macro.get('combined_score')):+.1f}")
+    elif macro_conflict:
+        notes.append(f"moderate macro conflict {num(macro.get('combined_score')):+.1f}")
+
+    score = num(signal.get("score"))
+    rv = num(signal.get("relative_volume"))
+    spread = num(signal.get("spread_pct"))
+    extension = num(signal.get("extension_atr"))
+    if score < V75_EQUITY_MIN_SCORE:
+        reasons.append(f"live score {score:.1f} < {V75_EQUITY_MIN_SCORE:.1f}")
+    if rv < V75_EQUITY_MIN_RV:
+        reasons.append(f"live RV {rv:.2f} < {V75_EQUITY_MIN_RV:.2f}")
+    if spread > V75_EQUITY_MAX_SPREAD_PCT:
+        reasons.append(f"live spread {spread:.3f}% > {V75_EQUITY_MAX_SPREAD_PCT:.3f}%")
+    if extension > V75_EQUITY_MAX_EXTENSION_ATR:
+        reasons.append(f"live breakout extension {extension:.2f} ATR > {V75_EQUITY_MAX_EXTENSION_ATR:.2f}")
+
+    current_price = 0.0
+    drift_r = 999.0
+    live_stop_pct = 999.0
+    try:
+        ticker = _v75_current_ticker(symbol)
+        current_price = num(ticker.get("fairPrice") or ticker.get("lastPrice") or ticker.get("indexPrice"))
+        if current_price <= 0:
+            raise RuntimeError("invalid live ticker price")
+        bid = num(ticker.get("bid1")); ask = num(ticker.get("ask1"))
+        if bid > 0 and ask > 0:
+            current_spread = ((ask - bid) / max(1e-12, (ask + bid) / 2.0)) * 100.0
+            if current_spread > V75_EQUITY_MAX_SPREAD_PCT:
+                reasons.append(f"current spread {current_spread:.3f}% > {V75_EQUITY_MAX_SPREAD_PCT:.3f}%")
+        original_entry = num(signal.get("entry")); original_risk = max(num(signal.get("risk")), 1e-12)
+        sign = 1.0 if direction == "LONG" else -1.0
+        drift_r = ((current_price - original_entry) * sign) / original_risk
+        if drift_r > V75_EQUITY_MAX_ENTRY_DRIFT_R:
+            reasons.append(f"entry chase {drift_r:.2f}R > {V75_EQUITY_MAX_ENTRY_DRIFT_R:.2f}R")
+        if direction == "LONG" and current_price <= num(signal.get("orb_high")):
+            reasons.append("live price fell back inside/below opening-range breakout")
+        if direction == "SHORT" and current_price >= num(signal.get("orb_low")):
+            reasons.append("live price rose back inside/above opening-range breakout")
+        live_stop_pct = abs(current_price - num(signal.get("stop"))) / current_price * 100.0
+        if live_stop_pct <= 0 or live_stop_pct > V75_EQUITY_MAX_STOP_PCT:
+            reasons.append(f"live ORB stop {live_stop_pct:.2f}% > {V75_EQUITY_MAX_STOP_PCT:.2f}%")
+        c = V70_LIVE.contract(symbol)
+        if not c.get("apiAllowed", False):
+            reasons.append("MEXC API trading not allowed for contract")
+        if int(c.get("state", 1)) != 0:
+            reasons.append("MEXC contract not enabled")
+        if int(c.get("positionOpenType", 0)) not in {1, 3}:
+            reasons.append("isolated margin unsupported")
+    except Exception as error:
+        reasons.append(f"live market/contract validation failed: {type(error).__name__}: {error}")
+
+    preview = {}
+    # Shadow decisions should mirror the real executor as closely as possible:
+    # total-position cap, exchange min size, 0.5% risk sizing, available margin,
+    # and the 25/25/50 contract split are checked without sending an order.
+    if not reasons and V70_LIVE is not None:
+        preview_fn = getattr(V70_LIVE, "preview_signal", None)
+        if callable(preview_fn):
+            try:
+                preview_result = _v75_result_from_signal(signal, {"current_price": current_price})
+                preview = preview_fn(preview_result) or {}
+                if not preview.get("eligible"):
+                    reasons.append(str(preview.get("reason") or "executor preview rejected"))
+            except Exception as error:
+                reasons.append(f"executor preview failed: {type(error).__name__}: {error}")
+        else:
+            reasons.append("executor lacks read-only preview_signal")
+
+    return {
+        "version": V75_EQUITY_VERSION,
+        "decision": "ALLOW" if not reasons else "SKIP",
+        "eligible": not reasons,
+        "reasons": reasons,
+        "notes": notes,
+        "current_price": current_price,
+        "drift_r": drift_r,
+        "live_stop_pct": live_stop_pct,
+        "live_equity_open": len(open_equities),
+        "recent_live_equity_losses": len(recent_losses),
+        "risk_fraction": V75_EQUITY_RISK_PCT,
+        "live_enabled": V75_EQUITY_LIVE_ENABLED,
+        "preview": preview,
+    }
+
+
+def _v75_result_from_signal(signal, gate):
+    entry = num(gate.get("current_price")) or num(signal.get("entry"))
+    stop = num(signal.get("stop"))
+    risk = abs(entry - stop)
+    sign = 1.0 if signal.get("direction") == "LONG" else -1.0
+    return {
+        "symbol": signal["symbol"],
+        "direction": signal["direction"],
+        "price": entry,
+        "best_score": num(signal.get("score")),
+        "selected_regime": "EQUITY_ORB",
+        "risk_plan": {
+            "stop": stop,
+            "tp1": entry + sign * risk,
+            "tp2": entry + sign * 2.0 * risk,
+            "tp3": entry + sign * 3.0 * risk,
+        },
+        "live_risk_pct_override": V75_EQUITY_RISK_PCT,
+        "live_expiry_ts": num(signal.get("expiry_ts")),
+        "live_strategy_tag": "EQUITY_ORB_0930_ET",
+    }
+
+
+def _v75_store_equity_candidate(signal, gate, outcome):
+    if not V75_EQUITY_DB_READY:
+        return False
+    outcome = outcome or {}
+    return bool(_v68_db_execute("""
+    INSERT INTO fh_v75_equity_live_candidates
+    (source_key,version,symbol,session_date,direction,score,decision,reasons,notes,current_price,drift_r,
+     live_stop_pct,risk_fraction,live_enabled,executed,execution_reason,payload,updated_at)
+    VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
+    ON CONFLICT(source_key) DO UPDATE SET
+      score=EXCLUDED.score,decision=EXCLUDED.decision,reasons=EXCLUDED.reasons,notes=EXCLUDED.notes,current_price=EXCLUDED.current_price,
+      drift_r=EXCLUDED.drift_r,live_stop_pct=EXCLUDED.live_stop_pct,risk_fraction=EXCLUDED.risk_fraction,
+      live_enabled=EXCLUDED.live_enabled,executed=(fh_v75_equity_live_candidates.executed OR EXCLUDED.executed),
+      execution_reason=EXCLUDED.execution_reason,payload=EXCLUDED.payload,updated_at=NOW()
+    RETURNING source_key
+    """, (
+        signal.get("source_key"),V75_EQUITY_VERSION,signal.get("symbol"),signal.get("session_date"),signal.get("direction"),
+        num(signal.get("score")),gate.get("decision"),json.dumps(gate.get("reasons") or []),json.dumps(gate.get("notes") or []),
+        num(gate.get("current_price")),num(gate.get("drift_r")),num(gate.get("live_stop_pct")),V75_EQUITY_RISK_PCT,
+        V75_EQUITY_LIVE_ENABLED,bool(outcome.get("executed")),str(outcome.get("reason") or ("submitted/confirmed" if outcome.get("executed") else "shadow-only")),
+        json.dumps(_clean_json_value({"signal":signal,"gate":gate,"outcome":outcome})),
+    ), fetch="one"))
+
+
+def _v75_process_equity_candidate(signal):
+    # Once a V7.5 shadow/live candidate has been accepted, keep its original
+    # execution-time geometry immutable. Subsequent scans must not move the
+    # hypothetical entry/stop/targets or submit another real order.
+    existing = None
+    if V75_EQUITY_DB_READY:
+        existing = _v68_db_execute(
+            "SELECT decision,actual_status,executed,score FROM fh_v75_equity_live_candidates WHERE source_key=%s",
+            (signal.get("source_key"),), fetch="one"
+        )
+    if existing and (bool(existing[2]) or str(existing[0] or "").upper() == "ALLOW"):
+        return {"gate": {"decision": "LOCKED", "eligible": False}, "outcome": {"executed": bool(existing[2]), "reason": "candidate already accepted"}}
+
+    gate = _v75_equity_live_gate(signal)
+    outcome = {"executed": False, "reason": "shadow-only; V75_EQUITY_LIVE_ENABLED=false"}
+    result = None
+    if gate.get("eligible"):
+        result = _v75_result_from_signal(signal, gate)
+        if V75_EQUITY_LIVE_ENABLED:
+            trade = {
+                "signal_id": f"equity_{signal.get('source_key')}",
+                "source_key": signal.get("source_key"),
+                "symbol": signal.get("symbol"),
+                "direction": signal.get("direction"),
+                "score": num(signal.get("score")),
+                "signal_time": num(signal.get("signal_time")),
+                "status": "LIVE_CANDIDATE",
+            }
+            outcome = V70_LIVE.execute_signal(result, trade)
+            if not isinstance(outcome, dict):
+                outcome = {"executed": bool(outcome)}
+
+    _v75_store_equity_candidate(signal, gate, outcome)
+
+    # Start a separate V7.5 shadow trade at the exact live-gate geometry. This
+    # is deliberately independent of V7.3's earlier control entry, otherwise
+    # our few-day validation would measure the wrong trade.
+    if gate.get("eligible") and V75_EQUITY_DB_READY and result is not None:
+        plan = result.get("risk_plan") or {}
+        entry = num(result.get("price")); stop = num(plan.get("stop")); risk = abs(entry-stop)
+        # Start from the next full 1-minute candle. This avoids pretending we
+        # know the intraminute high/low ordering before the shadow decision.
+        tracking_start = (int(time.time() // 60) + 1) * 60
+        _v68_db_execute("""UPDATE fh_v75_equity_live_candidates SET
+            actual_status='OPEN',actual_final_r=NULL,settled_at=NULL,
+            shadow_entry=%s,shadow_stop=%s,shadow_risk=%s,shadow_tp1=%s,shadow_tp2=%s,shadow_tp3=%s,
+            shadow_tracking_start=%s,shadow_expiry_ts=%s,shadow_last_checked=%s,
+            shadow_tp1_hit=FALSE,shadow_tp2_hit=FALSE,shadow_tp3_hit=FALSE,
+            shadow_tp1_time=NULL,shadow_tp2_time=NULL,shadow_tp3_time=NULL,shadow_closed_time=NULL,updated_at=NOW()
+            WHERE source_key=%s""", (
+            entry,stop,risk,num(plan.get("tp1")),num(plan.get("tp2")),num(plan.get("tp3")),
+            tracking_start,num(result.get("live_expiry_ts")),tracking_start-1,signal.get("source_key")
+        ))
+
+    mode = "LIVE" if V75_EQUITY_LIVE_ENABLED else "SHADOW"
+    detail = "; ".join(gate.get("reasons") or gate.get("notes") or ["all live-pilot gates passed"])
+    preview = gate.get("preview") or {}
+    print(
+        f"V7.5 EQUITY {mode}: {signal.get('symbol')} {signal.get('direction')} {gate.get('decision')} "
+        f"score={num(signal.get('score')):.1f} px={num(gate.get('current_price')):.6g} "
+        f"stop={num(gate.get('live_stop_pct')):.2f}% drift={num(gate.get('drift_r')):.2f}R "
+        f"riskcap={V75_EQUITY_RISK_PCT*100:.2f}% notional={num(preview.get('actual_notional')):.2f} — {detail}"
+    )
+    if V75_EQUITY_NOTIFY and gate.get("eligible"):
+        action = "LIVE ORDER PATH ENABLED" if V75_EQUITY_LIVE_ENABLED else "WOULD TAKE — SHADOW ONLY"
+        send_telegram(
+            f"🏛️ V7.5 EQUITY {action}\n\n"
+            f"{signal.get('symbol')} {signal.get('direction')} | score {num(signal.get('score')):.1f}\n"
+            f"Live check {num(gate.get('current_price')):.6g} | stop risk {num(gate.get('live_stop_pct')):.2f}% | drift {num(gate.get('drift_r')):.2f}R\n"
+            f"Risk cap if live: {V75_EQUITY_RISK_PCT*100:.2f}% of equity\n"
+            f"Session expiry: 16:00 New York"
+        )
+    return {"gate": gate, "outcome": outcome}
+
+
+def _v75_shadow_stop_r(trade, stage):
+    entry=num(trade.get("entry")); risk=max(num(trade.get("risk")),1e-12)
+    direction=str(trade.get("direction") or "").upper()
+    if stage <= 0:
+        return -1.0
+    if stage == 1:
+        bps = num(getattr(V70_LIVE, "BE_BUFFER_BPS", 10.0) if V70_LIVE else 10.0)
+        stop_px = entry * (1.0 + bps/10000.0) if direction == "LONG" else entry * (1.0 - bps/10000.0)
+        return current_r_for_price({"entry":entry,"risk":risk,"direction":direction}, stop_px)
+    return 1.0
+
+
+def _v75_shadow_final_r_at_stop(trade, stage):
+    if stage <= 0:
+        return -1.0
+    if stage == 1:
+        # 25% banked at +1R; 75% exits at the BE-buffer stop.
+        return 0.25 + 0.75 * _v75_shadow_stop_r(trade, stage)
+    # 25% at +1R + 25% at +2R + remaining 50% at +1R stop.
+    return 0.25 + 0.50 + 0.50
+
+
+def _v75_shadow_current_final_r(trade, current_r):
+    stage = 2 if trade.get("tp2_hit") else (1 if trade.get("tp1_hit") else 0)
+    if stage == 0:
+        return current_r
+    if stage == 1:
+        return 0.25 + 0.75 * current_r
+    return 0.75 + 0.50 * current_r
+
+
+def _v75_open_shadow_rows():
+    if not V75_EQUITY_DB_READY:
+        return []
+    rows=_v68_db_execute("""SELECT source_key,symbol,direction,shadow_entry,shadow_stop,shadow_risk,
+        shadow_tp1,shadow_tp2,shadow_tp3,shadow_tracking_start,shadow_expiry_ts,shadow_last_checked,
+        shadow_tp1_hit,shadow_tp2_hit,shadow_tp3_hit,shadow_tp1_time,shadow_tp2_time,shadow_tp3_time
+        FROM fh_v75_equity_live_candidates WHERE decision='ALLOW' AND actual_status='OPEN'
+        ORDER BY shadow_tracking_start""",fetch="all") or []
+    keys=["source_key","symbol","direction","entry","stop","risk","tp1","tp2","tp3","tracking_start","expiry_ts","last_checked",
+          "tp1_hit","tp2_hit","tp3_hit","tp1_time","tp2_time","tp3_time"]
+    return [dict(zip(keys,row)) for row in rows]
+
+
+def _v75_update_shadow_trade(trade):
+    return _v68_db_execute("""UPDATE fh_v75_equity_live_candidates SET
+        shadow_last_checked=%s,actual_status=%s,actual_final_r=%s,
+        shadow_tp1_hit=%s,shadow_tp2_hit=%s,shadow_tp3_hit=%s,
+        shadow_tp1_time=%s,shadow_tp2_time=%s,shadow_tp3_time=%s,shadow_closed_time=%s,
+        settled_at=CASE WHEN %s='OPEN' THEN settled_at ELSE COALESCE(settled_at,NOW()) END,updated_at=NOW()
+        WHERE source_key=%s""",(
+        trade.get("last_checked"),trade.get("status"),trade.get("final_r"),
+        trade.get("tp1_hit"),trade.get("tp2_hit"),trade.get("tp3_hit"),
+        trade.get("tp1_time"),trade.get("tp2_time"),trade.get("tp3_time"),trade.get("closed_time"),
+        trade.get("status"),trade.get("source_key")
+    ))
+
+
+def _v75_settle_one_shadow(trade):
+    df=get_candles(trade["symbol"],"Min1")
+    if df is None or len(df)==0:
+        return None
+    df=df.copy(); df["time_norm"]=df["time"].apply(normalize_candle_time)
+    relevant=df[(df["time_norm"]>num(trade.get("last_checked"))) & (df["time_norm"]>=num(trade.get("tracking_start")))]
+    latest_price=num(df.iloc[-1]["close"]); latest_seen=num(trade.get("last_checked")); event=None
+    direction=str(trade.get("direction") or "").upper()
+    for _,candle in relevant.iterrows():
+        t=num(candle["time_norm"]); latest_seen=max(latest_seen,t)
+        high=num(candle["high"]); low=num(candle["low"])
+        stage=2 if trade.get("tp2_hit") else (1 if trade.get("tp1_hit") else 0)
+        stop_r=_v75_shadow_stop_r(trade,stage)
+        entry=num(trade.get("entry")); risk=max(num(trade.get("risk")),1e-12)
+        managed_stop=(entry + stop_r*risk) if direction=="LONG" else (entry - stop_r*risk)
+        stop_touched = low <= managed_stop if direction=="LONG" else high >= managed_stop
+        next_target_touched = False
+        if not trade.get("tp1_hit"):
+            next_target_touched = high >= num(trade.get("tp1")) if direction=="LONG" else low <= num(trade.get("tp1"))
+        elif not trade.get("tp2_hit"):
+            next_target_touched = high >= num(trade.get("tp2")) if direction=="LONG" else low <= num(trade.get("tp2"))
+        else:
+            next_target_touched = high >= num(trade.get("tp3")) if direction=="LONG" else low <= num(trade.get("tp3"))
+        # If both the active stop and a fresh target are inside the same 1m bar,
+        # sequence is unknowable from OHLC; exclude it from expectancy.
+        if stop_touched and next_target_touched:
+            trade["status"]="AMBIGUOUS"; trade["final_r"]=None; trade["closed_time"]=t; event="AMBIGUOUS"; break
+        if stop_touched:
+            trade["status"]="STOP"; trade["final_r"]=round(_v75_shadow_final_r_at_stop(trade,stage),4); trade["closed_time"]=t; event="STOP"; break
+        tp3_touched = high >= num(trade.get("tp3")) if direction=="LONG" else low <= num(trade.get("tp3"))
+        tp2_touched = high >= num(trade.get("tp2")) if direction=="LONG" else low <= num(trade.get("tp2"))
+        tp1_touched = high >= num(trade.get("tp1")) if direction=="LONG" else low <= num(trade.get("tp1"))
+        if tp3_touched:
+            trade["tp1_hit"]=trade["tp2_hit"]=trade["tp3_hit"]=True
+            if not trade.get("tp1_time"): trade["tp1_time"]=t
+            if not trade.get("tp2_time"): trade["tp2_time"]=t
+            trade["tp3_time"]=t; trade["status"]="TP3"; trade["final_r"]=2.25; trade["closed_time"]=t; event="TP3"; break
+        if tp2_touched and not trade.get("tp2_hit"):
+            trade["tp1_hit"]=True; trade["tp2_hit"]=True
+            if not trade.get("tp1_time"): trade["tp1_time"]=t
+            trade["tp2_time"]=t
+        elif tp1_touched and not trade.get("tp1_hit"):
+            trade["tp1_hit"]=True; trade["tp1_time"]=t
+    trade["last_checked"]=latest_seen
+    trade.setdefault("status","OPEN")
+    if trade.get("status")=="OPEN" and time.time()>=num(trade.get("expiry_ts")):
+        current_r=current_r_for_price(trade,latest_price)
+        trade["final_r"]=round(max(-1.0,min(2.25,_v75_shadow_current_final_r(trade,current_r))),4)
+        trade["status"]="EXPIRED"; trade["closed_time"]=time.time(); event="EXPIRED"
+    _v75_update_shadow_trade(trade)
+    return event
+
+
+def _v75_sync_equity_candidate_outcomes():
+    if not V75_EQUITY_DB_READY:
+        return 0
+    settled=0
+    for trade in _v75_open_shadow_rows():
+        try:
+            event=_v75_settle_one_shadow(trade)
+            if event:
+                settled+=1
+                print(f"V7.5 Equity shadow settled {trade['symbol']} {trade['direction']} → {event} ({trade.get('final_r')})")
+        except Exception as error:
+            print(f"V7.5 Equity shadow settlement warning {trade.get('symbol')}: {type(error).__name__}: {error}")
+        time.sleep(0.03)
+    return settled
+
+
+def _v75_equity_live_summary_text():
+    if not V75_EQUITY_DB_READY:
+        return "V7.5 Equity Live Shadow is waiting for Postgres."
+    row = _v68_db_execute("""
+    SELECT COUNT(*),
+           COUNT(*) FILTER(WHERE decision='ALLOW'),
+           COUNT(*) FILTER(WHERE decision='SKIP'),
+           COUNT(*) FILTER(WHERE actual_final_r IS NOT NULL),
+           COALESCE(AVG(actual_final_r) FILTER(WHERE decision='ALLOW' AND actual_final_r IS NOT NULL),0),
+           COALESCE(SUM(actual_final_r) FILTER(WHERE decision='ALLOW' AND actual_final_r IS NOT NULL),0),
+           COUNT(*) FILTER(WHERE executed),
+           COUNT(DISTINCT session_date) FILTER(WHERE decision='ALLOW'),
+           COUNT(*) FILTER(WHERE decision='ALLOW' AND actual_final_r IS NOT NULL),
+           COUNT(*) FILTER(WHERE decision='ALLOW' AND actual_final_r>0),
+           COUNT(*) FILTER(WHERE decision='ALLOW' AND actual_status='AMBIGUOUS'),
+           COUNT(*) FILTER(WHERE decision='ALLOW' AND actual_status='OPEN')
+      FROM fh_v75_equity_live_candidates
+    """, fetch="one")
+    if not row:
+        return "V7.5 Equity Live Shadow: no candidates yet."
+    sessions=int(row[7] or 0); settled_allows=int(row[8] or 0); wins=int(row[9] or 0); ambiguous=int(row[10] or 0); open_n=int(row[11] or 0)
+    win_rate=100.0*wins/max(1,settled_allows)
+    evidence_ready=(sessions>=V75_EQUITY_MIN_SHADOW_SESSIONS and settled_allows>=V75_EQUITY_MIN_SETTLED_FOR_REVIEW and num(row[4])>0)
+    return (
+        "🏛️ V7.5 EQUITY LIVE SHADOW\n"
+        f"Universe: up to top {V73_EQUITY_TOP_N} liquid MEXC USDT stock/index futures\n"
+        f"Live execution: {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'OFF — SHADOW FIRST'}\n"
+        f"Candidate risk if enabled: {V75_EQUITY_RISK_PCT*100:.2f}% | Max equity positions: {V75_EQUITY_MAX_OPEN} | Global max: {getattr(V70_LIVE,'MAX_POSITIONS','?') if V70_LIVE else '?'}\n"
+        f"Candidates: {int(row[0] or 0)} | WOULD-TAKE {int(row[1] or 0)} | SKIP {int(row[2] or 0)} | Open shadow {open_n} | Sessions {sessions}\n"
+        f"Settled WOULD-TAKEs: {settled_allows} | Win {win_rate:.1f}% | Avg {num(row[4]):+.2f}R | Total {num(row[5]):+.2f}R | Ambiguous {ambiguous} | Actual live {int(row[6] or 0)}\n"
+        f"Evidence target: {V75_EQUITY_MIN_SHADOW_SESSIONS} sessions + {V75_EQUITY_MIN_SETTLED_FOR_REVIEW} settled + positive avg R → {'READY FOR MANUAL REVIEW' if evidence_ready else 'COLLECTING'}\n"
+        f"Live gates: score≥{V75_EQUITY_MIN_SCORE:.0f}, RV≥{V75_EQUITY_MIN_RV:.2f}x, spread≤{V75_EQUITY_MAX_SPREAD_PCT:.2f}%, stop≤{V75_EQUITY_MAX_STOP_PCT:.2f}%, chase≤{V75_EQUITY_MAX_ENTRY_DRIFT_R:.2f}R. Promotion is manual only."
+    )
+
+
 _V70_PREV_COMMAND = handle_telegram_command
 
 def handle_telegram_command(chat_id, text):
@@ -10223,6 +10828,9 @@ def handle_telegram_command(chat_id, text):
             send_to_chat(chat_id, "V7 Live Pilot module unavailable.")
         else:
             send_to_chat(chat_id, V70_LIVE.live_position_text())
+        return
+    if command in {"/equitylive", "/stocklive", "/orblive"}:
+        send_to_chat(chat_id, _v75_equity_live_summary_text())
         return
     return _V70_PREV_COMMAND(chat_id, text)
 
@@ -10547,7 +11155,7 @@ _V70_PAPER_CREATE = create_paper_trade
 
 # Separate cadence for live-only bridge evaluations. This mirrors the normal
 # alert cooldown/score-improvement behavior without mutating paper alert state.
-V743_BRIDGE_VERSION = "7.4.4-live-riskfix"
+V743_BRIDGE_VERSION = "7.5.0-equity-shadow-ready"
 V71_LIVE_BRIDGE_STATE = {}
 
 def _v71_live_bridge_due(result):
@@ -10680,8 +11288,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.4.4-live-riskfix",
+                "version": "7.5.0-equity-shadow-ready",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
+                "equity_top_n": V73_EQUITY_TOP_N,
+                "equity_live_path": ("enabled" if V75_EQUITY_LIVE_ENABLED else "shadow_first"),
+                "equity_live_risk_pct": V75_EQUITY_RISK_PCT,
+                "equity_live_max_open": V75_EQUITY_MAX_OPEN,
                 "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
                 "v70_selective_gate": bool(V70_SELECTIVE_GATE),
                 "v70_same_symbol_cooldown_minutes": V70_SAME_SYMBOL_COOLDOWN_MINUTES,

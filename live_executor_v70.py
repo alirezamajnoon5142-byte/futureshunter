@@ -14,7 +14,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.4.4-live-riskfix-multitp"
+V70_VERSION = "7.5.0-equity-shadow-ready"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -154,7 +154,7 @@ def init_db():
       slippage_bps DOUBLE PRECISION, entry_fee DOUBLE PRECISION DEFAULT 0, exit_fee DOUBLE PRECISION DEFAULT 0,
       funding DOUBLE PRECISION DEFAULT 0, gross_pnl DOUBLE PRECISION, net_pnl DOUBLE PRECISION,
       gross_r DOUBLE PRECISION, net_r DOUBLE PRECISION, paper_status TEXT, paper_r DOUBLE PRECISION,
-      protection_confirmed BOOLEAN NOT NULL DEFAULT FALSE, opened_at TIMESTAMPTZ, closed_at TIMESTAMPTZ,
+      protection_confirmed BOOLEAN NOT NULL DEFAULT FALSE, opened_at TIMESTAMPTZ, expiry_ts TIMESTAMPTZ, closed_at TIMESTAMPTZ,
       halt_reason TEXT, payload JSONB, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
     # Forward-compatible migration for deployments created before the live manager.
     for ddl in (
@@ -169,6 +169,7 @@ def init_db():
         "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp1_time TIMESTAMPTZ",
         "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp2_time TIMESTAMPTZ",
         "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS management_stage TEXT NOT NULL DEFAULT 'INITIAL'",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS expiry_ts TIMESTAMPTZ",
     ):
         _db(ddl)
     # Adopt positions opened by the pre-multi-TP executor. Those rows already own the
@@ -486,6 +487,73 @@ def live_risk_snapshot(lookback_minutes=180):
     }
 
 
+def _signal_risk_pct(result):
+    """Per-signal risk override may only REDUCE the global account-risk cap."""
+    try:
+        requested = float((result or {}).get("live_risk_pct_override", RISK_PCT))
+    except Exception:
+        requested = RISK_PCT
+    return min(RISK_PCT, max(0.0001, requested))
+
+
+def preview_signal(result):
+    """Read-only sizing/preflight preview for a candidate. No MEXC write request."""
+    if not ENABLED:
+        return {"eligible": False, "reason": "live executor disabled"}
+    with _lock:
+        ok, state = preflight()
+        if not ok:
+            return {"eligible": False, "reason": str(state)}
+        try:
+            plan = result["risk_plan"]; symbol = result["symbol"]; direction = result["direction"]
+            for p in state.get("positions") or []:
+                if str(p.get("symbol") or p.get("contractCode") or "") == str(symbol):
+                    return {"eligible": False, "reason": "live position already open for symbol"}
+            c = contract(symbol)
+            if not c.get("apiAllowed", False): return {"eligible": False, "reason": "contract API trading not allowed"}
+            if int(c.get("state", 1)) != 0: return {"eligible": False, "reason": "contract not enabled"}
+            if int(c.get("positionOpenType", 0)) not in {1,3}: return {"eligible": False, "reason": "isolated margin unsupported"}
+            entry=float(result["price"]); stop=float(plan["stop"]); tp1=float(plan.get("tp1") or 0); tp2=float(plan.get("tp2") or 0); tp3=float(plan["tp3"])
+            if entry <= 0 or stop <= 0 or tp3 <= 0:
+                return {"eligible": False, "reason": "invalid price geometry"}
+            if MULTI_TP_ENABLED and (tp1 <= 0 or tp2 <= 0):
+                return {"eligible": False, "reason": "multi-TP requires valid TP1/TP2"}
+            stop_pct=abs(entry-stop)/entry*100.0
+            if stop_pct <= 0: return {"eligible": False, "reason": "invalid stop distance"}
+            limits=state["limits"]; effective_risk_pct=_signal_risk_pct(result)
+            risk_usdt=float(limits["equity"])*effective_risk_pct
+            max_notional=float(limits["max_notional"]); risk_notional=risk_usdt/(stop_pct/100.0)
+            requested_notional=min(max_notional,risk_notional)
+            contract_size=float(c["contractSize"]); step=float(c.get("volUnit") or 1); min_vol=float(c.get("minVol") or step)
+            contracts=_floor_step(requested_notional/(entry*contract_size),step)
+            if contracts < min_vol: return {"eligible": False, "reason": "pilot size below exchange minimum"}
+            split=_three_way_split(contracts,step,min_vol) if MULTI_TP_ENABLED else None
+            if MULTI_TP_ENABLED and not split:
+                return {"eligible": False, "reason": "position too small for three exchange-valid TP slices"}
+            actual_notional=contracts*contract_size*entry
+            actual_risk=actual_notional*stop_pct/100.0
+            if actual_notional > max_notional + 1e-8:
+                return {"eligible": False, "reason": "notional cap calculation failed"}
+            if actual_risk > risk_usdt + 1e-6:
+                return {"eligible": False, "reason": "risk cap calculation failed"}
+            leverage=min(MAX_LEVERAGE,int(c.get("maxLeverage") or MAX_LEVERAGE))
+            a=state["asset"]; available=float(a.get("availableOpen") or a.get("availableBalance") or 0)
+            margin=actual_notional/max(1,leverage)
+            if margin > available:
+                return {"eligible": False, "reason": "insufficient margin"}
+            v1,v2,v3=split if split else (0.0,0.0,contracts)
+            return {
+                "eligible": True, "reason": "read-only preview passed", "symbol": symbol, "direction": direction,
+                "entry": entry, "stop": stop, "stop_pct": stop_pct, "effective_risk_pct": effective_risk_pct,
+                "risk_budget": risk_usdt, "requested_notional": requested_notional, "actual_notional": actual_notional,
+                "actual_risk": actual_risk, "contracts": contracts, "contract_size": contract_size, "leverage": leverage,
+                "margin_required": margin, "tp1_vol": v1, "tp2_vol": v2, "tp3_vol": v3,
+                "exchange_open_positions": len(state.get("positions") or []), "max_positions": MAX_POSITIONS,
+            }
+        except Exception as e:
+            return {"eligible": False, "reason": f"preview exception: {type(e).__name__}: {e}"}
+
+
 def execute_signal(result, paper_trade=None):
     """Attempt one live mirror of a Core ENTRY. Any uncertainty fails closed."""
     if not ENABLED: return {"executed": False, "reason": "disabled"}
@@ -509,7 +577,8 @@ def execute_signal(result, paper_trade=None):
         stop_pct = abs(entry-stop)/entry*100.0
         if stop_pct <= 0: return {"executed": False, "reason": "invalid stop distance"}
         limits = state["limits"]
-        risk_usdt = limits["risk_usdt"]
+        effective_risk_pct = _signal_risk_pct(result)
+        risk_usdt = float(limits["equity"]) * effective_risk_pct
         max_notional = limits["max_notional"]
         risk_notional = risk_usdt / (stop_pct/100.0)
         requested_notional = min(max_notional, risk_notional)
@@ -528,9 +597,21 @@ def execute_signal(result, paper_trade=None):
         a = state["asset"]; available = float(a.get("availableOpen") or a.get("availableBalance") or 0)
         if actual_notional/leverage > available: return {"executed": False, "reason": "insufficient margin"}
         oid = _oid(signal_id, "E")
+        expiry_ts = None
+        try:
+            raw_expiry = float(result.get("live_expiry_ts") or 0)
+            if raw_expiry > 0:
+                expiry_ts = datetime.fromtimestamp(raw_expiry, tz=timezone.utc)
+        except Exception:
+            expiry_ts = None
         payload = {"symbol":symbol,"price":entry,"vol":contracts,"leverage":leverage,"side":1 if direction=="LONG" else 3,"type":5,"openType":1,"externalOid":oid,"stopLossPrice":stop,"takeProfitPrice":tp3,"lossTrend":2,"profitTrend":2,"positionMode":1}
-        _db("""INSERT INTO fh_live_trades(signal_id,symbol,direction,status,external_oid,paper_entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop_price,tp1_price,tp2_price,tp3_price,initial_stop_price,managed_stop_price,tp1_vol,tp2_vol,stop_pct,management_stage,payload) VALUES(%s,%s,%s,'SUBMITTING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INITIAL',%s)""",
-            (signal_id,symbol,direction,oid,entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop,tp1,tp2,tp3,stop,stop,tp1_vol,tp2_vol,stop_pct,Jsonb(payload) if Jsonb else json.dumps(payload)))
+        ledger_payload = dict(payload)
+        ledger_payload["effectiveRiskPct"] = effective_risk_pct
+        ledger_payload["strategyTag"] = str(result.get("live_strategy_tag") or "CORE")
+        if expiry_ts is not None:
+            ledger_payload["expiryTs"] = expiry_ts.isoformat()
+        _db("""INSERT INTO fh_live_trades(signal_id,symbol,direction,status,external_oid,paper_entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop_price,tp1_price,tp2_price,tp3_price,initial_stop_price,managed_stop_price,tp1_vol,tp2_vol,stop_pct,management_stage,expiry_ts,payload) VALUES(%s,%s,%s,'SUBMITTING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INITIAL',%s,%s)""",
+            (signal_id,symbol,direction,oid,entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop,tp1,tp2,tp3,stop,stop,tp1_vol,tp2_vol,stop_pct,expiry_ts,Jsonb(ledger_payload) if Jsonb else json.dumps(ledger_payload)))
         try:
             created = _signed("POST", "/api/v1/private/order/create", payload)
             order_id = str(created.get("orderId"))
@@ -563,7 +644,7 @@ def execute_signal(result, paper_trade=None):
                 halt(f"protective stop/TP3 could not be confirmed for {symbol}; position flattened")
                 return {"executed": False, "reason": "protection failed; flattened"}
             _db("UPDATE fh_live_trades SET status='OPEN',protection_confirmed=TRUE,updated_at=NOW() WHERE signal_id=%s", (signal_id,))
-            _msg(f"🔴 V7.0 LIVE PILOT OPEN\n{symbol} {direction}\nFill: {fill}\nNotional: {actual_notional:.2f} USDT | Risk: {actual_risk:.3f} USDT | {leverage}x isolated\nStop: {stop} | TP1: {tp1} ({tp1_vol:g}) | TP2: {tp2} ({tp2_vol:g}) | TP3: {tp3} ({tp3_vol:g})\nManager: {'25/25/50 preferred' if MULTI_TP_ENABLED else 'disabled'} | Protection: CONFIRMED")
+            _msg(f"🔴 V7.0 LIVE PILOT OPEN\n{symbol} {direction}\nFill: {fill}\nNotional: {actual_notional:.2f} USDT | Risk: {actual_risk:.3f} USDT ({effective_risk_pct*100:.2f}% cap) | {leverage}x isolated\nStop: {stop} | TP1: {tp1} ({tp1_vol:g}) | TP2: {tp2} ({tp2_vol:g}) | TP3: {tp3} ({tp3_vol:g})\nManager: {'25/25/50 preferred' if MULTI_TP_ENABLED else 'disabled'} | Protection: CONFIRMED")
             return {"executed": True, "signal_id": signal_id, "fill": fill, "position_id": position_id}
         except Exception as e:
             # If an exception occurs after submission, never assume no fill. Check the exchange and flatten a matching position.
@@ -675,7 +756,7 @@ def _manage_open_trade(row, exchange_pos):
     """Scale out at TP1/TP2 and ratchet the exchange-side stop. TP3 remains server-side."""
     if not MULTI_TP_ENABLED:
         return
-    signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop,initial_stop,tp1,tp2,tp3,tp1_vol,tp2_vol,tp1_done,tp2_done,stage=row
+    signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop,initial_stop,tp1,tp2,tp3,tp1_vol,tp2_vol,tp1_done,tp2_done,stage,*_extra=row
     targets=_management_targets(row)
     if not targets:
         halt(f"live manager cannot reconstruct targets for {symbol}")
@@ -826,7 +907,7 @@ def reconcile_once():
     if not ENABLED: return
     with _lock:
         try:
-            halted,_=halt_status(); ex=positions(); dbrows=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage FROM fh_live_trades WHERE status='OPEN'""",fetch="all") or []
+            halted,_=halt_status(); ex=positions(); dbrows=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts FROM fh_live_trades WHERE status='OPEN'""",fetch="all") or []
             exids={int(x.get("positionId") or 0):x for x in ex}; dbids={int(r[3] or 0):r for r in dbrows}
             unknown=[p for pid,p in exids.items() if pid not in dbids]
             if unknown:
@@ -834,14 +915,23 @@ def reconcile_once():
                 return
             for pid,row in dbids.items():
                 if pid in exids:
-                    # Preserve Core's 24h expiry rule for live positions.
+                    # Crypto defaults to the global 24h expiry. Strategies such as
+                    # the equity cash-session ORB can supply an earlier hard expiry.
                     opened_at = row[9]
-                    if opened_at is not None:
+                    expiry_override = row[20] if len(row) > 20 else None
+                    expired = False
+                    expiry_label = None
+                    if expiry_override is not None:
+                        expired = datetime.now(timezone.utc) >= expiry_override
+                        expiry_label = expiry_override.isoformat()
+                    elif opened_at is not None:
                         age = (datetime.now(timezone.utc) - opened_at).total_seconds()
-                        if age >= EXPIRY_HOURS * 3600:
-                            _emergency_close(row[1], row[2], pid, float((exids[pid] or {}).get("holdVol") or row[4]), row[0])
-                            _msg(f"⏰ V7.0 expiry close sent for {row[1]} after {EXPIRY_HOURS:g}h")
-                            continue
+                        expired = age >= EXPIRY_HOURS * 3600
+                        expiry_label = f"{EXPIRY_HOURS:g}h"
+                    if expired:
+                        _emergency_close(row[1], row[2], pid, float((exids[pid] or {}).get("holdVol") or row[4]), row[0])
+                        _msg(f"⏰ V7 LIVE expiry close sent for {row[1]} at {expiry_label}")
+                        continue
                     # Manage TP1/TP2 first. TP3 and stop remain exchange-side throughout.
                     _manage_open_trade(row, exids[pid])
                     # A server-side TP3 or manual/exchange close can race this pass. If the
