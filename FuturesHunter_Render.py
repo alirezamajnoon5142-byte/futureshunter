@@ -9436,6 +9436,7 @@ async def main():
     _v73_init_equity_lab()
     _v75_init_equity_live_shadow()
     _v76_init_equity_agent_lab()
+    _v77_init_optimizer_lab()
     _v68_restore_subscribers()
     _v68_restore_latest_signal_file()
 
@@ -9462,6 +9463,10 @@ async def main():
     if imported:
         print(f"Imported {imported} recent local paper signal(s) into tracking.")
 
+    if V77_DB_READY:
+        v77_backfilled = _v77_sync_control_history(trades)
+        print(f"V7.7 optimizer lab: historical control rows synchronized={v77_backfilled}")
+
     # Recover any setup that reached the durable queue but crashed before all
     # local side effects / Telegram delivery completed.
     _v68_retry_unsent_signals(trades, alert_state, max_count=25)
@@ -9481,6 +9486,7 @@ async def main():
     print("Live trade supervisor: SHADOW ONLY — continuously re-evaluates every OPEN trade")
     print(f"Equity Agent Ensemble V7.6: SHADOW research — top {V73_EQUITY_TOP_N} liquid stock/index futures, 6 specialist agents + regime-aware meta-agent")
     print(f"Equity Live V7.5 gate: {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW FIRST'} — {V75_EQUITY_RISK_PCT*100:.2f}% risk if enabled, max {V75_EQUITY_MAX_OPEN} equity position")
+    print(f"V7.7 Crypto/Metals Optimizer: SHADOW ONLY — max {V77_MAX_OPEN} portfolio positions, correlation/cost/managed-exit challengers")
     print("Durable signal queue: persist BEFORE Telegram")
     print("Paper/shadow/alert state: mirrored to Postgres")
     print(f"Paper trade expiry: {TRADE_EXPIRY_HOURS} hours")
@@ -9492,8 +9498,9 @@ async def main():
         "The V6.8.1 risk challenger, V6.9 strategy ensemble and V6.9.1 live trade supervisor are SHADOW-ONLY.\n"
         f"V7.6 Equity Agent Ensemble scans the top {V73_EQUITY_TOP_N} liquid stock/index futures with six specialist strategies and a regime-aware meta-agent.\n"
         f"V7.5 equity execution gate is {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW-FIRST/OFF'}; if later enabled it risks at most {V75_EQUITY_RISK_PCT*100:.2f}% per equity trade.\n"
+        f"V7.7 Crypto/Metals Optimizer is SHADOW-ONLY: max {V77_MAX_OPEN} realistic positions, correlation guard, cost-adjusted R, 25/25/50 managed exits and metals cross-confirmation.\n"
         "The supervisor watches OPEN trades but never closes/resizes the control paper position.\n\n"
-        "Try /agents, /equitylive, /equity, /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
+        "Try /optimizer, /agents, /equitylive, /equity, /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
     )
 
     if gap_seconds > V68_DOWNTIME_THRESHOLD_SECONDS:
@@ -9560,6 +9567,10 @@ async def main():
             supervised = _v691_monitor_open_trades(trades, details, oi_metrics)
             if supervised:
                 print(f"V6.9.1 Live Supervisor: refreshed {supervised} open trade(s).")
+
+            v77_changed = _v77_sync_optimizer_shadow(trades)
+            if v77_changed:
+                print(f"V7.7 Optimizer Lab: updated {v77_changed} exact portfolio shadow(s).")
 
             track_shadow_trades()
 
@@ -11870,7 +11881,7 @@ _V70_PAPER_CREATE = create_paper_trade
 
 # Separate cadence for live-only bridge evaluations. This mirrors the normal
 # alert cooldown/score-improvement behavior without mutating paper alert state.
-V743_BRIDGE_VERSION = "7.6.0-equity-agent-ensemble-shadow"
+V743_BRIDGE_VERSION = "7.7.1-crypto-metals-optimizer-shadow"
 V71_LIVE_BRIDGE_STATE = {}
 
 def _v71_live_bridge_due(result):
@@ -11993,6 +12004,730 @@ def create_paper_trade(result, trades):
     _v71_execute_live_gate(result, trade, gate, bridge_mode=False)
     return trade
 
+
+# ============================================================
+# V7.7 CRYPTO + METALS OPTIMIZER LAB (SHADOW ONLY)
+# ============================================================
+# Purpose:
+#   1) Maintain a realistic max-2 portfolio shadow with correlation control.
+#   2) Measure gross R versus execution-cost-adjusted R.
+#   3) Measure the live-style 25/25/50 managed exit path independently.
+#   4) Backfill the existing control-paper ledger into analyzable score/bucket/
+#      strategy cohorts without changing the control ledger or live executor.
+#   5) Give metals their own cross-metal context instead of BTC regime logic.
+#
+# This entire block is research-only. It NEVER submits, closes, resizes or
+# modifies a real MEXC position and it never changes the original paper trade.
+
+V77_VERSION = "7.7.1-crypto-metals-optimizer-shadow"
+V77_DB_READY = False
+V77_MAX_OPEN = min(2, max(1, int(os.getenv("V77_MAX_OPEN", "2"))))
+V77_MAX_SAME_BUCKET_DIRECTION = min(2, max(1, int(os.getenv("V77_MAX_SAME_BUCKET_DIRECTION", "1"))))
+V77_LOSS_CLUSTER_COUNT = int(os.getenv("V77_LOSS_CLUSTER_COUNT", str(V71_LOSS_CLUSTER_COUNT)))
+V77_LOSS_CLUSTER_MINUTES = int(os.getenv("V77_LOSS_CLUSTER_MINUTES", str(V71_LOSS_CLUSTER_MINUTES)))
+V77_SAME_SYMBOL_COOLDOWN_MINUTES = int(os.getenv("V77_SAME_SYMBOL_COOLDOWN_MINUTES", str(V70_SAME_SYMBOL_COOLDOWN_MINUTES)))
+V77_MAX_COST_R = float(os.getenv("V77_MAX_COST_R", str(V71_MAX_COST_FRACTION_R)))
+V77_DEGRADED_MIN_CORE = float(os.getenv("V77_DEGRADED_MIN_CORE", str(V72_DEGRADED_MIN_CORE)))
+V77_DEGRADED_MIN_SELECTOR = float(os.getenv("V77_DEGRADED_MIN_SELECTOR", str(V72_DEGRADED_MIN_SELECTOR)))
+V77_BE_BUFFER_BPS = float(os.getenv("V77_BE_BUFFER_BPS", "10"))
+V77_TRACK_LIMIT = max(2, int(os.getenv("V77_TRACK_LIMIT", "50")))
+V77_MIN_COHORT_N = max(3, int(os.getenv("V77_MIN_COHORT_N", "5")))
+
+
+def _v77_score_bucket(score):
+    score = num(score)
+    if score >= 90:
+        return "90+"
+    if score >= 85:
+        return "85-89"
+    if score >= 80:
+        return "80-84"
+    if score >= 70:
+        return "70-79"
+    return "<70"
+
+
+def _v77_cost_r_from_geometry(entry, stop):
+    entry = abs(num(entry)); stop = num(stop)
+    if entry <= 0:
+        return 0.0
+    stop_fraction = abs(entry - stop) / entry
+    if stop_fraction <= 0:
+        return 0.0
+    fee_bps = num(globals().get("V71_EST_TAKER_FEE_BPS", 2.0))
+    slip_bps = num(globals().get("V71_EST_SLIPPAGE_BPS", 2.0))
+    round_trip_fraction = (2.0 * fee_bps + 2.0 * slip_bps) / 10000.0
+    return round(round_trip_fraction / stop_fraction, 4)
+
+
+def _v77_be_buffer_r(entry, risk):
+    entry = abs(num(entry)); risk = abs(num(risk))
+    if entry <= 0 or risk <= 0:
+        return 0.0
+    buffer_price = entry * V77_BE_BUFFER_BPS / 10000.0
+    return max(0.0, buffer_price / risk)
+
+
+def _v77_managed_r_from_control_trade(trade):
+    """Approximate live 25/25/50 management from an already-settled control row.
+
+    Exact V7.7 candidates are tracked candle-by-candle below. This helper exists
+    only to backfill the 130+ historical control trades using milestones already
+    recorded in the durable paper ledger.
+    """
+    if trade.get("final_r") is None:
+        return None
+    status = str(trade.get("status") or "").upper()
+    gross = num(trade.get("final_r"))
+    tp1 = bool(trade.get("tp1_hit")); tp2 = bool(trade.get("tp2_hit")); tp3 = bool(trade.get("tp3_hit"))
+    if tp3 or status == "TP3":
+        return 2.375  # .25*1.5 + .25*2 + .50*3
+    if status == "STOP":
+        if tp2:
+            return 1.375  # .25*1.5 + .25*2 + .50*1
+        if tp1:
+            be_r = _v77_be_buffer_r(trade.get("entry"), trade.get("risk"))
+            return round(0.375 + 0.75 * be_r, 4)
+        return -1.0
+    if status == "EXPIRED":
+        if tp2:
+            return round(0.875 + 0.50 * gross, 4)
+        if tp1:
+            return round(0.375 + 0.75 * gross, 4)
+        return round(gross, 4)
+    return round(gross, 4)
+
+
+def _v77_control_row(trade):
+    if not trade or trade.get("status") == "OPEN" or trade.get("final_r") is None:
+        return None
+    risk_meta = trade.get("risk_challenger") or {}
+    strategy = trade.get("strategy_ensemble") or {}
+    gross = num(trade.get("final_r"))
+    cost_r = _v77_cost_r_from_geometry(trade.get("entry"), trade.get("stop"))
+    managed = _v77_managed_r_from_control_trade(trade)
+    supervisor = trade.get("supervisor") or {}
+    pp_triggered = supervisor.get("profit_protect_exit_r") is not None
+    pp_r = num(supervisor.get("profit_protect_exit_r")) if pp_triggered else gross
+    bucket = str(risk_meta.get("asset_bucket") or _v681_asset_bucket(trade.get("symbol")))
+    strategy_consensus = str(strategy.get("consensus") or "NO_DATA").upper()
+    risk_decision = str(risk_meta.get("decision") or "NO_DATA").upper()
+    regime = str(risk_meta.get("signal_regime") or trade.get("entry_regime") or "UNKNOWN")
+    return (
+        str(trade.get("signal_id")), str(trade.get("source_key") or ""), str(trade.get("symbol") or ""),
+        str(trade.get("direction") or ""), bucket, num(trade.get("score")), _v77_score_bucket(trade.get("score")),
+        strategy_consensus, risk_decision, regime, str(trade.get("status") or ""), gross, cost_r,
+        round(gross - cost_r, 4), managed, None if managed is None else round(managed - cost_r, 4),
+        bool(pp_triggered), pp_r, num(trade.get("signal_time")), num(trade.get("closed_time")),
+    )
+
+
+def _v77_init_optimizer_lab():
+    global V77_DB_READY
+    if not V68_DB_READY:
+        V77_DB_READY = False
+        return False
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS fh_v77_control_history (
+            signal_id TEXT PRIMARY KEY,
+            source_key TEXT,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            asset_bucket TEXT NOT NULL,
+            core_score DOUBLE PRECISION,
+            score_bucket TEXT,
+            strategy_consensus TEXT,
+            risk_decision TEXT,
+            entry_regime TEXT,
+            actual_status TEXT,
+            gross_r DOUBLE PRECISION,
+            estimated_cost_r DOUBLE PRECISION,
+            estimated_net_r DOUBLE PRECISION,
+            managed_estimate_r DOUBLE PRECISION,
+            managed_net_estimate_r DOUBLE PRECISION,
+            profit_protect_triggered BOOLEAN NOT NULL DEFAULT FALSE,
+            profit_protect_strategy_r DOUBLE PRECISION,
+            signal_ts DOUBLE PRECISION,
+            closed_ts DOUBLE PRECISION,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_v77_control_bucket ON fh_v77_control_history(asset_bucket, direction, score_bucket)",
+        """
+        CREATE TABLE IF NOT EXISTS fh_v77_optimizer_candidates (
+            source_key TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            signal_ts DOUBLE PRECISION NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            asset_bucket TEXT NOT NULL,
+            core_score DOUBLE PRECISION,
+            score_bucket TEXT,
+            strategy_consensus TEXT,
+            risk_decision TEXT,
+            selector_score DOUBLE PRECISION,
+            estimated_cost_r DOUBLE PRECISION,
+            decision TEXT NOT NULL,
+            reasons JSONB NOT NULL,
+            notes JSONB NOT NULL,
+            entry DOUBLE PRECISION,
+            stop DOUBLE PRECISION,
+            tp1 DOUBLE PRECISION,
+            tp2 DOUBLE PRECISION,
+            tp3 DOUBLE PRECISION,
+            risk DOUBLE PRECISION,
+            tracking_start DOUBLE PRECISION,
+            last_checked DOUBLE PRECISION,
+            control_status TEXT NOT NULL DEFAULT 'NOT_TRACKED',
+            managed_status TEXT NOT NULL DEFAULT 'NOT_TRACKED',
+            control_tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
+            control_tp2_hit BOOLEAN NOT NULL DEFAULT FALSE,
+            control_tp3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+            managed_tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
+            managed_tp2_hit BOOLEAN NOT NULL DEFAULT FALSE,
+            managed_tp3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+            control_final_r DOUBLE PRECISION,
+            managed_final_r DOUBLE PRECISION,
+            managed_net_r DOUBLE PRECISION,
+            reference_control_r DOUBLE PRECISION,
+            control_closed_ts DOUBLE PRECISION,
+            managed_closed_ts DOUBLE PRECISION,
+            closed_ts DOUBLE PRECISION,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_v77_candidate_open ON fh_v77_optimizer_candidates(decision, managed_status, signal_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_v77_candidate_bucket ON fh_v77_optimizer_candidates(asset_bucket, direction, decision)",
+        "ALTER TABLE fh_v77_optimizer_candidates ADD COLUMN IF NOT EXISTS control_closed_ts DOUBLE PRECISION",
+        "ALTER TABLE fh_v77_optimizer_candidates ADD COLUMN IF NOT EXISTS managed_closed_ts DOUBLE PRECISION",
+    ]
+    for statement in statements:
+        if _v68_db_execute(statement) is None:
+            V77_DB_READY = False
+            return False
+    V77_DB_READY = True
+    print("V7.7 optimizer lab: POSTGRES READY — portfolio/cost/managed-exit/metals shadows active")
+    return True
+
+
+def _v77_sync_control_history(trades):
+    if not V77_DB_READY:
+        return 0
+    rows = [row for row in (_v77_control_row(t) for t in (trades or [])) if row]
+    if not rows:
+        return 0
+    ok = _v68_db_executemany(
+        """
+        INSERT INTO fh_v77_control_history
+        (signal_id,source_key,symbol,direction,asset_bucket,core_score,score_bucket,strategy_consensus,risk_decision,
+         entry_regime,actual_status,gross_r,estimated_cost_r,estimated_net_r,managed_estimate_r,managed_net_estimate_r,
+         profit_protect_triggered,profit_protect_strategy_r,signal_ts,closed_ts)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(signal_id) DO UPDATE SET
+          source_key=EXCLUDED.source_key,symbol=EXCLUDED.symbol,direction=EXCLUDED.direction,asset_bucket=EXCLUDED.asset_bucket,
+          core_score=EXCLUDED.core_score,score_bucket=EXCLUDED.score_bucket,strategy_consensus=EXCLUDED.strategy_consensus,
+          risk_decision=EXCLUDED.risk_decision,entry_regime=EXCLUDED.entry_regime,actual_status=EXCLUDED.actual_status,
+          gross_r=EXCLUDED.gross_r,estimated_cost_r=EXCLUDED.estimated_cost_r,estimated_net_r=EXCLUDED.estimated_net_r,
+          managed_estimate_r=EXCLUDED.managed_estimate_r,managed_net_estimate_r=EXCLUDED.managed_net_estimate_r,
+          profit_protect_triggered=EXCLUDED.profit_protect_triggered,profit_protect_strategy_r=EXCLUDED.profit_protect_strategy_r,
+          signal_ts=EXCLUDED.signal_ts,closed_ts=EXCLUDED.closed_ts,updated_at=NOW()
+        """, rows)
+    if ok:
+        # Link exact V7.7 candidates back to the control book where both share a durable source key.
+        _v68_db_execute("""
+          UPDATE fh_v77_optimizer_candidates c
+          SET reference_control_r=h.gross_r, updated_at=NOW()
+          FROM fh_v77_control_history h
+          WHERE c.source_key=h.source_key AND c.reference_control_r IS DISTINCT FROM h.gross_r
+        """)
+        return len(rows)
+    return 0
+
+
+def _v77_metals_context(result):
+    """Cross-metal confirmation for XAU/XAUT/SILVER; deliberately no BTC proxy."""
+    symbol = str(result.get("symbol") or "")
+    direction = str(result.get("direction") or "").upper()
+    aligned = []; opposed = []
+    for row in V681_LAST_SCAN_RESULTS or []:
+        other = str(row.get("symbol") or "")
+        if other == symbol or _v681_asset_bucket(other) != "METAL":
+            continue
+        state = str(row.get("signal_state") or "").upper()
+        score = num(row.get("best_score"))
+        if state not in {"ENTRY", "ARMED", "WATCH"} or score < 68:
+            continue
+        odir = str(row.get("direction") or "").upper()
+        item = {"symbol": other, "direction": odir, "state": state, "score": round(score, 1)}
+        if odir == direction:
+            aligned.append(item)
+        elif odir in {"LONG", "SHORT"}:
+            opposed.append(item)
+    adjustment = min(8.0, 4.0 * len(aligned)) - min(12.0, 6.0 * len(opposed))
+    return {"aligned": aligned, "opposed": opposed, "score_adjustment": adjustment}
+
+
+def _v77_open_portfolio_rows():
+    if not V77_DB_READY:
+        return []
+    rows = _v68_db_execute("""
+      SELECT source_key,symbol,direction,asset_bucket,signal_ts
+      FROM fh_v77_optimizer_candidates
+      WHERE decision='ALLOW' AND managed_status='OPEN'
+      ORDER BY signal_ts
+    """, fetch="all") or []
+    return [
+        {"source_key":r[0],"symbol":r[1],"direction":r[2],"asset_bucket":r[3],"signal_ts":num(r[4])}
+        for r in rows
+    ]
+
+
+def _v77_recent_shadow_losses(symbol, direction, bucket, minutes, same_symbol=False):
+    if not V77_DB_READY:
+        return []
+    cutoff = time.time() - max(1, int(minutes)) * 60
+    rows = _v68_db_execute("""
+      SELECT symbol,direction,asset_bucket,managed_final_r,managed_closed_ts
+      FROM fh_v77_optimizer_candidates
+      WHERE decision='ALLOW' AND managed_status NOT IN ('OPEN','NOT_TRACKED','AMBIGUOUS')
+        AND managed_final_r IS NOT NULL AND managed_final_r <= -0.75 AND managed_closed_ts >= %s
+      ORDER BY managed_closed_ts DESC
+    """, (cutoff,), fetch="all") or []
+    hits=[]
+    for r in rows:
+        rsym, rdir, rbucket, rr, rclosed = r
+        if str(rdir).upper() != str(direction).upper():
+            continue
+        if same_symbol:
+            if str(rsym) != str(symbol):
+                continue
+        elif str(rbucket) != str(bucket):
+            continue
+        hits.append({"symbol":rsym,"direction":rdir,"asset_bucket":rbucket,"final_r":num(rr),"closed_time":num(rclosed)})
+    return hits
+
+
+def _v77_shadow_gate(result):
+    symbol = str(result.get("symbol") or "")
+    direction = str(result.get("direction") or "").upper()
+    bucket = _v681_asset_bucket(symbol)
+    if bucket == "EQUITY":
+        return {"eligible":False,"decision":"SKIP","reasons":["equity handled by V7.6 ensemble"],"notes":[],"selector_score":0.0,"asset_bucket":bucket}
+
+    strategy = result.get("strategy_ensemble") or {}
+    sc = str(strategy.get("consensus") or "NO_DATA").upper()
+    macro = get_macro_snapshot() or {}
+    combined = num(macro.get("combined_score"))
+    event_risk = str(macro.get("event_risk") or "LOW").upper()
+    btc = _v681_btc_scan_snapshot()
+    macro_conflict, strong_macro_conflict = _v681_directional_macro_conflict(direction, bucket, combined)
+    btc_weak = _v681_btc_is_weak_for(direction, bucket, btc) if bucket == "CRYPTO" else False
+    open_rows = _v77_open_portfolio_rows()
+    same_bucket_dir = [r for r in open_rows if r.get("asset_bucket")==bucket and str(r.get("direction")).upper()==direction]
+    same_symbol_open = [r for r in open_rows if r.get("symbol")==symbol]
+    same_symbol_losses = _v77_recent_shadow_losses(symbol,direction,bucket,V77_SAME_SYMBOL_COOLDOWN_MINUTES,True)
+    cluster = _v77_recent_shadow_losses(symbol,direction,bucket,V77_LOSS_CLUSTER_MINUTES,False)
+    cost_r = _v71_estimated_cost_r(result)
+
+    risk_decision = "ALLOW"
+    reasons=[]; notes=[]
+    if event_risk == "EXTREME":
+        risk_decision="BLOCK"; reasons.append("EXTREME scheduled-event danger window")
+    elif event_risk == "HIGH":
+        risk_decision="CAUTION"; notes.append("HIGH scheduled-event risk")
+    if bucket == "CRYPTO" and btc_weak:
+        notes.append(f"BTC not ENTRY-aligned ({btc.get('direction') or 'N/A'} {btc.get('state') or 'N/A'} {num(btc.get('score')):.1f})")
+    if macro_conflict:
+        notes.append(f"{bucket} {direction} conflicts with macro/news score {combined:+.1f}")
+        if strong_macro_conflict and risk_decision == "ALLOW":
+            risk_decision="CAUTION"
+    if bucket == "CRYPTO" and btc_weak and macro_conflict:
+        risk_decision="BLOCK"; reasons.append("crypto regime conflict: weak BTC + macro conflict")
+    if len(open_rows) >= V77_MAX_OPEN:
+        reasons.append(f"V7.7 portfolio full ({len(open_rows)}/{V77_MAX_OPEN})")
+    if same_symbol_open:
+        reasons.append("V7.7 same-symbol position already open")
+    if len(same_bucket_dir) >= V77_MAX_SAME_BUCKET_DIRECTION:
+        reasons.append(f"correlation guard: {len(same_bucket_dir)} {bucket} {direction} already open")
+    if same_symbol_losses:
+        age=(time.time()-num(same_symbol_losses[0].get("closed_time")))/60.0
+        reasons.append(f"same-symbol V7.7 loss cooldown ({age:.0f}m ago)")
+    if len(cluster) >= V77_LOSS_CLUSTER_COUNT:
+        risk_decision="BLOCK"; reasons.append(f"V7.7 loss-cluster breaker: {len(cluster)} {bucket} {direction} losses/{V77_LOSS_CLUSTER_MINUTES}m")
+    if cost_r > V77_MAX_COST_R:
+        reasons.append(f"estimated execution drag {cost_r:.2f}R > {V77_MAX_COST_R:.2f}R")
+
+    metal_context = None
+    metal_adjustment = 0.0
+    if bucket == "METAL":
+        metal_context = _v77_metals_context(result)
+        metal_adjustment = num(metal_context.get("score_adjustment"))
+        if metal_context.get("aligned"):
+            notes.append("cross-metal alignment: " + ",".join(x["symbol"] for x in metal_context["aligned"]))
+        if metal_context.get("opposed"):
+            notes.append("cross-metal opposition: " + ",".join(x["symbol"] for x in metal_context["opposed"]))
+
+    score = num(result.get("best_score"))
+    score += {"ALLOW":8,"CAUTION":3,"REDUCE":-4,"BLOCK":-25}.get(risk_decision,0)
+    score += {"STRONG_CONFIRM":8,"CONFIRM":5,"MIXED":0,"WAIT":-4,"AVOID":-10}.get(sc,0)
+    if btc_weak: score -= 8
+    if macro_conflict: score -= 6
+    score -= min(12.0, len(cluster)*4.0)
+    score -= min(12.0, cost_r*10.0)
+    score += metal_adjustment
+    selector_score=round(max(0.0,min(100.0,score)),2)
+
+    degraded = bool(
+        len(cluster)>0 or btc_weak or macro_conflict or event_risk in {"HIGH","EXTREME"}
+        or risk_decision in {"CAUTION","REDUCE","BLOCK"} or sc in {"MIXED","WAIT","AVOID","NO_DATA"}
+        or (bucket=="METAL" and metal_context and len(metal_context.get("opposed") or [])>0)
+    )
+    if degraded:
+        if num(result.get("best_score")) < V77_DEGRADED_MIN_CORE:
+            reasons.append(f"degraded-regime Core threshold: {num(result.get('best_score')):.1f} < {V77_DEGRADED_MIN_CORE:.1f}")
+        if sc not in {"CONFIRM","STRONG_CONFIRM"}:
+            reasons.append(f"degraded-regime Strategy confirmation required ({sc})")
+        if selector_score < V77_DEGRADED_MIN_SELECTOR:
+            reasons.append(f"degraded-regime selector threshold: {selector_score:.1f} < {V77_DEGRADED_MIN_SELECTOR:.1f}")
+    if bucket == "METAL" and metal_context and len(metal_context.get("opposed") or []) >= 2 and selector_score < 80:
+        reasons.append("metals cross-market conflict")
+
+    return {
+        "eligible": not reasons,
+        "decision": "ALLOW" if not reasons else "SKIP",
+        "reasons": reasons,
+        "notes": notes,
+        "asset_bucket": bucket,
+        "risk_decision": risk_decision,
+        "strategy_consensus": sc,
+        "selector_score": selector_score,
+        "estimated_cost_r": round(cost_r,4),
+        "btc_weak": bool(btc_weak),
+        "macro_conflict": bool(macro_conflict),
+        "event_risk": event_risk,
+        "portfolio_open": len(open_rows),
+        "same_bucket_direction_open": len(same_bucket_dir),
+        "recent_loss_count": len(cluster),
+        "metal_context": metal_context,
+        "version": V77_VERSION,
+    }
+
+
+def _v77_process_candidate(result, source_key=None):
+    if not V77_DB_READY or not isinstance(result, dict):
+        return None
+    symbol=str(result.get("symbol") or "")
+    if _v681_asset_bucket(symbol) == "EQUITY":
+        return None
+    source_key=str(source_key or _v68_signal_key(result))
+    # Lock the first evaluation for a durable signal. Repeated bridge scans cannot
+    # rewrite history after portfolio state or price has changed.
+    existing=_v68_db_execute("SELECT decision FROM fh_v77_optimizer_candidates WHERE source_key=%s",(source_key,),fetch="one")
+    if existing:
+        return {"decision":existing[0],"existing":True}
+    gate=_v77_shadow_gate(result)
+    plan=result.get("risk_plan") or {}
+    entry=num(result.get("price")); stop=num(plan.get("stop")); risk=abs(num(plan.get("risk")) or (entry-stop))
+    tracking_start=(int(time.time()//60)+1)*60
+    tracked = bool(gate.get("eligible") and entry>0 and risk>0)
+    control_status="OPEN" if tracked else "NOT_TRACKED"
+    managed_status="OPEN" if tracked else "NOT_TRACKED"
+    payload={"gate":gate,"core_score":num(result.get("best_score")),"regime":result.get("regime"),"risk_plan":plan}
+    row=_v68_db_execute("""
+      INSERT INTO fh_v77_optimizer_candidates
+      (source_key,version,signal_ts,symbol,direction,asset_bucket,core_score,score_bucket,strategy_consensus,risk_decision,
+       selector_score,estimated_cost_r,decision,reasons,notes,entry,stop,tp1,tp2,tp3,risk,tracking_start,last_checked,
+       control_status,managed_status,payload)
+      VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+      ON CONFLICT(source_key) DO NOTHING RETURNING source_key
+    """,(
+      source_key,V77_VERSION,time.time(),symbol,str(result.get("direction") or ""),gate.get("asset_bucket"),num(result.get("best_score")),
+      _v77_score_bucket(result.get("best_score")),gate.get("strategy_consensus"),gate.get("risk_decision"),gate.get("selector_score"),gate.get("estimated_cost_r"),
+      gate.get("decision"),json.dumps(gate.get("reasons") or []),json.dumps(gate.get("notes") or []),entry,stop,num(plan.get("tp1")),num(plan.get("tp2")),num(plan.get("tp3")),risk,
+      tracking_start,tracking_start-1,control_status,managed_status,json.dumps(_clean_json_value(payload))
+    ),fetch="one")
+    if row:
+        print(
+            f"V7.7 OPTIMIZER: {symbol} {result.get('direction')} → {gate.get('decision')} "
+            f"selector={gate.get('selector_score'):.1f} cost={gate.get('estimated_cost_r'):.2f}R "
+            f"bucket={gate.get('asset_bucket')} portfolio={gate.get('portfolio_open')}/{V77_MAX_OPEN}"
+            + (" — " + "; ".join(gate.get("reasons")[:2]) if gate.get("reasons") else "")
+        )
+    return gate
+
+
+def _v77_open_tracked_rows():
+    if not V77_DB_READY:
+        return []
+    rows=_v68_db_execute("""
+      SELECT source_key,symbol,direction,entry,stop,tp1,tp2,tp3,risk,tracking_start,last_checked,
+             control_status,managed_status,control_tp1_hit,control_tp2_hit,control_tp3_hit,
+             managed_tp1_hit,managed_tp2_hit,managed_tp3_hit,estimated_cost_r,signal_ts
+      FROM fh_v77_optimizer_candidates
+      WHERE decision='ALLOW' AND (control_status='OPEN' OR managed_status='OPEN')
+      ORDER BY signal_ts LIMIT %s
+    """,(V77_TRACK_LIMIT,),fetch="all") or []
+    keys=["source_key","symbol","direction","entry","stop","tp1","tp2","tp3","risk","tracking_start","last_checked",
+          "control_status","managed_status","control_tp1_hit","control_tp2_hit","control_tp3_hit",
+          "managed_tp1_hit","managed_tp2_hit","managed_tp3_hit","estimated_cost_r","signal_ts"]
+    return [dict(zip(keys,r)) for r in rows]
+
+
+def _v77_managed_stop_r(row):
+    if row.get("managed_tp2_hit"):
+        return 1.0
+    if row.get("managed_tp1_hit"):
+        return _v77_be_buffer_r(row.get("entry"), row.get("risk"))
+    return -1.0
+
+
+def _v77_managed_realized_on_stop(row):
+    if row.get("managed_tp2_hit"):
+        return 1.375
+    if row.get("managed_tp1_hit"):
+        return round(0.375 + 0.75 * _v77_be_buffer_r(row.get("entry"), row.get("risk")),4)
+    return -1.0
+
+
+def _v77_managed_realized_at_r(row, current_r):
+    if row.get("managed_tp2_hit"):
+        return round(0.875 + 0.50 * current_r,4)
+    if row.get("managed_tp1_hit"):
+        return round(0.375 + 0.75 * current_r,4)
+    return round(current_r,4)
+
+
+def _v77_touch(direction, level, high, low, is_target=True):
+    direction=str(direction or "").upper()
+    if direction=="LONG":
+        return high >= level if is_target else low <= level
+    return low <= level if is_target else high >= level
+
+
+def _v77_settle_row(row):
+    df=get_candles(row["symbol"],"Min1")
+    if df is None or len(df)==0:
+        return False
+    df=df.copy(); df["time_norm"]=df["time"].apply(normalize_candle_time)
+    relevant=df[(df["time_norm"]>num(row.get("last_checked"))) & (df["time_norm"]>=num(row.get("tracking_start")))]
+    latest_price=num(df.iloc[-1]["close"]); latest_seen=num(row.get("last_checked"))
+    direction=str(row.get("direction") or "").upper(); entry=num(row.get("entry")); risk=max(abs(num(row.get("risk"))),1e-12)
+    changed=False; closed_ts=None; control_closed_ts=None; managed_closed_ts=None
+    for _,c in relevant.iterrows():
+        t=num(c["time_norm"]); high=num(c["high"]); low=num(c["low"]); latest_seen=max(latest_seen,t)
+        # Exact managed path first: dynamic stop after each prior confirmed milestone.
+        if row.get("managed_status")=="OPEN":
+            stop_r=_v77_managed_stop_r(row)
+            managed_stop=entry + stop_r*risk if direction=="LONG" else entry - stop_r*risk
+            stop_touch=_v77_touch(direction,managed_stop,high,low,is_target=False)
+            next_level = num(row.get("tp3")) if row.get("managed_tp2_hit") else (num(row.get("tp2")) if row.get("managed_tp1_hit") else num(row.get("tp1")))
+            target_touch=_v77_touch(direction,next_level,high,low,is_target=True)
+            if stop_touch and target_touch:
+                row["managed_status"]="AMBIGUOUS"; row["managed_final_r"]=None; managed_closed_ts=t; closed_ts=t; changed=True
+            elif stop_touch:
+                row["managed_status"]="STOP"; row["managed_final_r"]=_v77_managed_realized_on_stop(row); managed_closed_ts=t; closed_ts=t; changed=True
+            else:
+                tp3=_v77_touch(direction,num(row.get("tp3")),high,low,True)
+                tp2=_v77_touch(direction,num(row.get("tp2")),high,low,True)
+                tp1=_v77_touch(direction,num(row.get("tp1")),high,low,True)
+                if tp3:
+                    row["managed_tp1_hit"]=row["managed_tp2_hit"]=row["managed_tp3_hit"]=True
+                    row["managed_status"]="TP3"; row["managed_final_r"]=2.375; managed_closed_ts=t; closed_ts=t; changed=True
+                elif tp2 and not row.get("managed_tp2_hit"):
+                    row["managed_tp1_hit"]=row["managed_tp2_hit"]=True; changed=True
+                elif tp1 and not row.get("managed_tp1_hit"):
+                    row["managed_tp1_hit"]=True; changed=True
+        # Gross/control path stays independent and uses original fixed stop/full TP3.
+        if row.get("control_status")=="OPEN":
+            stop_touch=_v77_touch(direction,num(row.get("stop")),high,low,False)
+            tp3=_v77_touch(direction,num(row.get("tp3")),high,low,True)
+            if stop_touch and tp3:
+                row["control_status"]="AMBIGUOUS"; row["control_final_r"]=None; control_closed_ts=t; closed_ts=closed_ts or t; changed=True
+            elif stop_touch:
+                row["control_status"]="STOP"; row["control_final_r"]=-1.0; control_closed_ts=t; closed_ts=closed_ts or t; changed=True
+            elif tp3:
+                row["control_tp1_hit"]=row["control_tp2_hit"]=row["control_tp3_hit"]=True
+                row["control_status"]="TP3"; row["control_final_r"]=3.0; control_closed_ts=t; closed_ts=closed_ts or t; changed=True
+            else:
+                tp2=_v77_touch(direction,num(row.get("tp2")),high,low,True)
+                tp1=_v77_touch(direction,num(row.get("tp1")),high,low,True)
+                if tp2 and not row.get("control_tp2_hit"):
+                    row["control_tp1_hit"]=row["control_tp2_hit"]=True; changed=True
+                elif tp1 and not row.get("control_tp1_hit"):
+                    row["control_tp1_hit"]=True; changed=True
+    age=time.time()-num(row.get("signal_ts"))
+    if age >= TRADE_EXPIRY_HOURS*3600:
+        current_r=(latest_price-entry)/risk if direction=="LONG" else (entry-latest_price)/risk
+        current_r=max(-1.0,min(3.0,current_r))
+        if row.get("control_status")=="OPEN":
+            row["control_status"]="EXPIRED"; row["control_final_r"]=round(current_r,4); control_closed_ts=time.time(); changed=True
+        if row.get("managed_status")=="OPEN":
+            row["managed_status"]="EXPIRED"; row["managed_final_r"]=_v77_managed_realized_at_r(row,current_r); managed_closed_ts=time.time(); changed=True
+        closed_ts=closed_ts or time.time()
+    row["last_checked"]=latest_seen
+    managed_net=None if row.get("managed_final_r") is None else round(num(row.get("managed_final_r"))-num(row.get("estimated_cost_r")),4)
+    terminal = row.get("control_status")!="OPEN" and row.get("managed_status")!="OPEN"
+    _v68_db_execute("""
+      UPDATE fh_v77_optimizer_candidates SET
+        last_checked=%s,control_status=%s,managed_status=%s,
+        control_tp1_hit=%s,control_tp2_hit=%s,control_tp3_hit=%s,
+        managed_tp1_hit=%s,managed_tp2_hit=%s,managed_tp3_hit=%s,
+        control_final_r=%s,managed_final_r=%s,managed_net_r=%s,
+        control_closed_ts=COALESCE(control_closed_ts,%s),managed_closed_ts=COALESCE(managed_closed_ts,%s),
+        closed_ts=CASE WHEN %s THEN COALESCE(closed_ts,%s) ELSE closed_ts END,updated_at=NOW()
+      WHERE source_key=%s
+    """,(
+      row.get("last_checked"),row.get("control_status"),row.get("managed_status"),
+      bool(row.get("control_tp1_hit")),bool(row.get("control_tp2_hit")),bool(row.get("control_tp3_hit")),
+      bool(row.get("managed_tp1_hit")),bool(row.get("managed_tp2_hit")),bool(row.get("managed_tp3_hit")),
+      row.get("control_final_r"),row.get("managed_final_r"),managed_net,control_closed_ts,managed_closed_ts,bool(terminal),closed_ts,row.get("source_key")
+    ))
+    return changed
+
+
+def _v77_sync_optimizer_shadow(trades=None):
+    if not V77_DB_READY:
+        return 0
+    if trades is not None:
+        _v77_sync_control_history(trades)
+    changed=0
+    for row in _v77_open_tracked_rows():
+        try:
+            if _v77_settle_row(row):
+                changed+=1
+        except Exception as e:
+            print(f"V7.7 optimizer settlement warning {row.get('symbol')}: {type(e).__name__}: {e}")
+        time.sleep(0.02)
+    return changed
+
+
+def _v77_optimizer_summary_text():
+    if not V77_DB_READY:
+        return "V7.7 Optimizer Lab: database unavailable"
+    control=_v68_db_execute("""
+      SELECT COUNT(*),COALESCE(SUM(gross_r),0),COALESCE(AVG(gross_r),0),
+             COALESCE(100.0*AVG(CASE WHEN gross_r>0 THEN 1.0 ELSE 0.0 END),0),
+             COALESCE(SUM(estimated_net_r),0),COALESCE(AVG(estimated_net_r),0),
+             COALESCE(SUM(managed_estimate_r),0),COALESCE(SUM(managed_net_estimate_r),0),
+             COUNT(*) FILTER(WHERE profit_protect_triggered),COALESCE(SUM(profit_protect_strategy_r),0)
+      FROM fh_v77_control_history
+    """,fetch="one") or (0,0,0,0,0,0,0,0,0,0)
+    portfolio=_v68_db_execute("""
+      SELECT COUNT(*),COUNT(*) FILTER(WHERE decision='ALLOW'),COUNT(*) FILTER(WHERE decision='SKIP'),
+             COUNT(*) FILTER(WHERE decision='ALLOW' AND managed_status NOT IN('OPEN','NOT_TRACKED')),
+             COALESCE(SUM(control_final_r) FILTER(WHERE decision='ALLOW' AND control_final_r IS NOT NULL),0),
+             COALESCE(SUM(managed_final_r) FILTER(WHERE decision='ALLOW' AND managed_final_r IS NOT NULL),0),
+             COALESCE(SUM(managed_net_r) FILTER(WHERE decision='ALLOW' AND managed_net_r IS NOT NULL),0),
+             COUNT(*) FILTER(WHERE decision='ALLOW' AND managed_status='OPEN')
+      FROM fh_v77_optimizer_candidates
+    """,fetch="one") or (0,0,0,0,0,0,0,0)
+    selector_compare=_v68_db_execute("""
+      SELECT decision,COUNT(*) FILTER(WHERE reference_control_r IS NOT NULL),
+             COALESCE(AVG(reference_control_r) FILTER(WHERE reference_control_r IS NOT NULL),0),
+             COALESCE(SUM(reference_control_r) FILTER(WHERE reference_control_r IS NOT NULL),0),
+             COALESCE(100.0*AVG(CASE WHEN reference_control_r>0 THEN 1.0 ELSE 0.0 END)
+                      FILTER(WHERE reference_control_r IS NOT NULL),0)
+      FROM fh_v77_optimizer_candidates
+      GROUP BY decision ORDER BY decision
+    """,fetch="all") or []
+    score_rows=_v68_db_execute("""
+      SELECT score_bucket,COUNT(*),COALESCE(AVG(gross_r),0),COALESCE(SUM(gross_r),0),
+             COALESCE(100.0*AVG(CASE WHEN gross_r>0 THEN 1.0 ELSE 0.0 END),0)
+      FROM fh_v77_control_history GROUP BY score_bucket ORDER BY
+        CASE score_bucket WHEN '<70' THEN 0 WHEN '70-79' THEN 1 WHEN '80-84' THEN 2 WHEN '85-89' THEN 3 ELSE 4 END
+    """,fetch="all") or []
+    bucket_rows=_v68_db_execute("""
+      SELECT asset_bucket,COUNT(*),COALESCE(AVG(gross_r),0),COALESCE(SUM(gross_r),0),
+             COALESCE(AVG(estimated_net_r),0)
+      FROM fh_v77_control_history GROUP BY asset_bucket ORDER BY COUNT(*) DESC
+    """,fetch="all") or []
+    cohort_rows=_v68_db_execute("""
+      SELECT asset_bucket,direction,score_bucket,strategy_consensus,COUNT(*),
+             COALESCE(AVG(gross_r),0),COALESCE(AVG(estimated_net_r),0),
+             COALESCE(100.0*AVG(CASE WHEN gross_r>0 THEN 1.0 ELSE 0.0 END),0)
+      FROM fh_v77_control_history
+      GROUP BY asset_bucket,direction,score_bucket,strategy_consensus
+      HAVING COUNT(*) >= %s
+      ORDER BY AVG(estimated_net_r) DESC
+    """,(V77_MIN_COHORT_N,),fetch="all") or []
+    pp_edge=num(control[9])-num(control[1])
+    lines=[
+      "🧪 V7.7 CRYPTO + METALS OPTIMIZER — SHADOW",
+      f"Control settled: {int(control[0])} | win {num(control[3]):.1f}% | gross {num(control[1]):+.2f}R ({num(control[2]):+.2f}R/trade)",
+      f"Cost-adjusted estimate: {num(control[4]):+.2f}R ({num(control[5]):+.2f}R/trade)",
+      f"25/25/50 managed estimate: gross {num(control[6]):+.2f}R | after estimated costs {num(control[7]):+.2f}R",
+      f"Profit-Protect strategy: {int(control[8])} triggers | full-book counterfactual {num(control[9]):+.2f}R | edge {pp_edge:+.2f}R",
+      "",
+      f"Realistic portfolio: {int(portfolio[0])} candidates | ALLOW {int(portfolio[1])} | SKIP {int(portfolio[2])} | open {int(portfolio[7])}/{V77_MAX_OPEN}",
+      f"Settled ALLOW: {int(portfolio[3])} | fixed-exit {num(portfolio[4]):+.2f}R | managed {num(portfolio[5]):+.2f}R | managed net {num(portfolio[6]):+.2f}R",
+      f"Correlation guard: max {V77_MAX_SAME_BUCKET_DIRECTION} same-direction position per asset bucket | cost gate {V77_MAX_COST_R:.2f}R",
+      "",
+      "Selector audit (linked control outcomes):",
+    ]
+    if selector_compare:
+        for decision,n,avg_r,total_r,wr in selector_compare:
+            lines.append(f"{decision}: n={int(n)} | avg {num(avg_r):+.2f}R | total {num(total_r):+.2f}R | win {num(wr):.1f}%")
+    else:
+        lines.append("waiting for linked outcomes")
+    lines.extend(["", "Score cohorts (n | avgR | totalR | win):"])
+    for b,n,avg_r,total_r,wr in score_rows:
+        lines.append(f"{b}: {int(n)} | {num(avg_r):+.2f} | {num(total_r):+.2f} | {num(wr):.1f}%")
+    lines.append("")
+    lines.append("Asset cohorts (n | avg grossR | totalR | avg netR):")
+    for b,n,avg_r,total_r,net_avg in bucket_rows:
+        lines.append(f"{b}: {int(n)} | {num(avg_r):+.2f} | {num(total_r):+.2f} | {num(net_avg):+.2f}")
+    lines.append("")
+    lines.append(f"Adaptive cohort learner (minimum n={V77_MIN_COHORT_N}; ranked by avg net R):")
+    if cohort_rows:
+        best=cohort_rows[:3]
+        worst=list(reversed(cohort_rows[-3:]))
+        for label,rows in (("BEST",best),("WEAK",worst)):
+            for b,d,sb,sc,n,avg_r,net_r,wr in rows:
+                lines.append(
+                    f"{label} {b} {d} score {sb} / {sc}: n={int(n)} | "
+                    f"gross {num(avg_r):+.2f}R | net {num(net_r):+.2f}R | win {num(wr):.1f}%"
+                )
+    else:
+        lines.append("waiting for enough settled trades per cohort")
+    lines.append("Research-only. Learner never auto-promotes filters; control paper and live execution are untouched.")
+    return "\n".join(lines)
+
+
+# Wrap the final live/paper bridge only after all previous wrappers are in place.
+_V77_PREV_CREATE_PAPER_TRADE = create_paper_trade
+
+def create_paper_trade(result, trades):
+    trade = _V77_PREV_CREATE_PAPER_TRADE(result, trades)
+    try:
+        _v77_process_candidate(result, trade.get("source_key") if trade else None)
+    except Exception as e:
+        print(f"V7.7 optimizer candidate warning: {type(e).__name__}: {e}")
+    return trade
+
+
+_V77_PREV_LIVE_NO_PAPER = _v71_evaluate_live_without_paper
+
+def _v71_evaluate_live_without_paper(result, trades, source_key):
+    outcome = _V77_PREV_LIVE_NO_PAPER(result, trades, source_key)
+    try:
+        _v77_process_candidate(result, source_key)
+    except Exception as e:
+        print(f"V7.7 live-bridge optimizer warning: {type(e).__name__}: {e}")
+    return outcome
+
+
+_V77_PREV_COMMAND = handle_telegram_command
+
+def handle_telegram_command(chat_id, text):
+    command=((text or "").strip().split() or [""])[0].lower()
+    if command in {"/optimizer","/v77","/portfolio","/paperopt","/cryptolab"}:
+        send_to_chat(chat_id,_v77_optimizer_summary_text()); return
+    return _V77_PREV_COMMAND(chat_id,text)
+
+
 # ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
@@ -12003,7 +12738,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.6.0-equity-agent-ensemble-shadow",
+                "version": "7.7.1-crypto-metals-optimizer-shadow",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "equity_agent_ensemble": ("active" if V76_DB_READY else "disabled_or_unavailable"),
                 "equity_agents": list(V76_AGENT_NAMES),
@@ -12012,6 +12747,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 "equity_live_path": ("enabled" if V75_EQUITY_LIVE_ENABLED else "shadow_first"),
                 "equity_live_risk_pct": V75_EQUITY_RISK_PCT,
                 "equity_live_max_open": V75_EQUITY_MAX_OPEN,
+                "v77_optimizer_lab": ("active" if V77_DB_READY else "disabled_or_unavailable"),
+                "v77_portfolio_max_open": V77_MAX_OPEN,
+                "v77_same_bucket_direction_max": V77_MAX_SAME_BUCKET_DIRECTION,
+                "v77_cost_gate_r": V77_MAX_COST_R,
+                "v77_managed_exit_shadow": "25_25_50",
+                "v77_metals_context": "cross_metal_shadow",
                 "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
                 "v70_selective_gate": bool(V70_SELECTIVE_GATE),
                 "v70_same_symbol_cooldown_minutes": V70_SAME_SYMBOL_COOLDOWN_MINUTES,
