@@ -9435,6 +9435,7 @@ async def main():
     v691_init_supervisor_lab()
     _v73_init_equity_lab()
     _v75_init_equity_live_shadow()
+    _v76_init_equity_agent_lab()
     _v68_restore_subscribers()
     _v68_restore_latest_signal_file()
 
@@ -9478,8 +9479,8 @@ async def main():
     print("Risk challenger: SHADOW ONLY — portfolio/regime throttling is being measured")
     print("Strategy ensemble: SHADOW ONLY — 8 explicit playbooks on closed candles")
     print("Live trade supervisor: SHADOW ONLY — continuously re-evaluates every OPEN trade")
-    print(f"Equity Lab V7.3: SHADOW research — top {V73_EQUITY_TOP_N} liquid stock/index futures, 09:30 ET ORB")
-    print(f"Equity Live V7.5: {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW FIRST'} — {V75_EQUITY_RISK_PCT*100:.2f}% risk if enabled, max {V75_EQUITY_MAX_OPEN} equity position")
+    print(f"Equity Agent Ensemble V7.6: SHADOW research — top {V73_EQUITY_TOP_N} liquid stock/index futures, 6 specialist agents + regime-aware meta-agent")
+    print(f"Equity Live V7.5 gate: {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW FIRST'} — {V75_EQUITY_RISK_PCT*100:.2f}% risk if enabled, max {V75_EQUITY_MAX_OPEN} equity position")
     print("Durable signal queue: persist BEFORE Telegram")
     print("Paper/shadow/alert state: mirrored to Postgres")
     print(f"Paper trade expiry: {TRADE_EXPIRY_HOURS} hours")
@@ -9489,10 +9490,10 @@ async def main():
         "V6.7 trading logic is unchanged. Durable signal queue + persistent "
         "paper/shadow state + research farming are active.\n"
         "The V6.8.1 risk challenger, V6.9 strategy ensemble and V6.9.1 live trade supervisor are SHADOW-ONLY.\n"
-        f"V7.3 Equity Lab scans the top {V73_EQUITY_TOP_N} liquid stock/index futures with a separate 09:30 ET ORB model.\n"
-        f"V7.5 equity live path is {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW-FIRST/OFF'}; if later enabled it risks at most {V75_EQUITY_RISK_PCT*100:.2f}% per equity trade.\n"
+        f"V7.6 Equity Agent Ensemble scans the top {V73_EQUITY_TOP_N} liquid stock/index futures with six specialist strategies and a regime-aware meta-agent.\n"
+        f"V7.5 equity execution gate is {'ENABLED' if V75_EQUITY_LIVE_ENABLED else 'SHADOW-FIRST/OFF'}; if later enabled it risks at most {V75_EQUITY_RISK_PCT*100:.2f}% per equity trade.\n"
         "The supervisor watches OPEN trades but never closes/resizes the control paper position.\n\n"
-        "Try /equity, /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
+        "Try /agents, /equitylive, /equity, /supervisor, /trade HYPE, /research, /risklab, /strategylab, /dbstatus or /macro."
     )
 
     if gap_seconds > V68_DOWNTIME_THRESHOLD_SECONDS:
@@ -9566,6 +9567,7 @@ async def main():
             if settled_equity:
                 print(f"V7.3 Equity Lab: settled {settled_equity} shadow outcome(s).")
             _v75_sync_equity_candidate_outcomes()
+            _v76_sync_agent_outcomes()
 
             if now >= next_unsent_retry:
                 _v68_retry_unsent_signals(
@@ -9576,9 +9578,13 @@ async def main():
                 next_unsent_retry = now + V68_RETRY_UNSENT_SECONDS
 
             if now >= next_full_scan:
-                equity_created = _v73_scan_equity_shadow()
-                if equity_created:
-                    print(f"V7.3 Equity Lab: created {equity_created} new shadow signal(s).")
+                equity_stats = _v76_scan_equity_agents()
+                if equity_stats.get("agent_signals") or equity_stats.get("meta_candidates"):
+                    print(
+                        f"V7.6 Equity Agents: {equity_stats.get('agent_signals', 0)} new agent shadow(s), "
+                        f"{equity_stats.get('meta_candidates', 0)} meta candidate(s), "
+                        f"{equity_stats.get('would_take', 0)} WOULD-TAKE"
+                    )
 
                 best = run_full_scan(
                     scan_symbols,
@@ -10122,15 +10128,6 @@ def _v73_scan_equity_shadow():
                 is_new = _v73_store_equity_signal(signal)
                 if is_new:
                     created += 1
-                # V7.5 gets every fresh qualifying scan, not only the first V7.3
-                # insert. That lets a setup rejected at 09:35 become eligible at
-                # 09:40/09:45 if volume/score/execution quality materially improves.
-                live_hook = globals().get("_v75_process_equity_candidate")
-                if callable(live_hook):
-                    try:
-                        live_hook(signal)
-                    except Exception as live_error:
-                        print(f"V7.5 Equity Live Shadow {symbol} warning: {type(live_error).__name__}: {live_error}")
                 if not is_new:
                     time.sleep(0.05)
                     continue
@@ -10305,6 +10302,7 @@ V75_EQUITY_MAX_SPREAD_PCT = float(os.getenv("V75_EQUITY_MAX_SPREAD_PCT", "0.15")
 V75_EQUITY_MAX_STOP_PCT = float(os.getenv("V75_EQUITY_MAX_STOP_PCT", "2.50"))
 V75_EQUITY_MAX_EXTENSION_ATR = float(os.getenv("V75_EQUITY_MAX_EXTENSION_ATR", "0.60"))
 V75_EQUITY_MAX_ENTRY_DRIFT_R = float(os.getenv("V75_EQUITY_MAX_ENTRY_DRIFT_R", "0.20"))
+V75_EQUITY_MAX_ADVERSE_DRIFT_R = float(os.getenv("V75_EQUITY_MAX_ADVERSE_DRIFT_R", "0.35"))
 V75_EQUITY_MAX_SIGNAL_AGE_SECONDS = int(os.getenv("V75_EQUITY_MAX_SIGNAL_AGE_SECONDS", "480"))
 V75_EQUITY_MAX_OPEN = min(1, max(1, int(os.getenv("V75_EQUITY_MAX_OPEN", "1"))))
 V75_EQUITY_SAME_SYMBOL_COOLDOWN_MINUTES = int(os.getenv("V75_EQUITY_SAME_SYMBOL_COOLDOWN_MINUTES", "120"))
@@ -10446,6 +10444,7 @@ def _v75_equity_live_gate(signal):
     elif macro_conflict:
         notes.append(f"moderate macro conflict {num(macro.get('combined_score')):+.1f}")
 
+    setup_type = str(signal.get("setup_type") or signal.get("agent_name") or "ORB").upper()
     score = num(signal.get("score"))
     rv = num(signal.get("relative_volume"))
     spread = num(signal.get("spread_pct"))
@@ -10456,7 +10455,9 @@ def _v75_equity_live_gate(signal):
         reasons.append(f"live RV {rv:.2f} < {V75_EQUITY_MIN_RV:.2f}")
     if spread > V75_EQUITY_MAX_SPREAD_PCT:
         reasons.append(f"live spread {spread:.3f}% > {V75_EQUITY_MAX_SPREAD_PCT:.3f}%")
-    if extension > V75_EQUITY_MAX_EXTENSION_ATR:
+    # Extension is a hard chase filter only for breakout-family setups.  Mean-
+    # reversion/reversal agents intentionally begin from large VWAP displacement.
+    if setup_type in {"ORB", "GAP_GO"} and extension > V75_EQUITY_MAX_EXTENSION_ATR:
         reasons.append(f"live breakout extension {extension:.2f} ATR > {V75_EQUITY_MAX_EXTENSION_ATR:.2f}")
 
     current_price = 0.0
@@ -10477,11 +10478,20 @@ def _v75_equity_live_gate(signal):
         drift_r = ((current_price - original_entry) * sign) / original_risk
         if drift_r > V75_EQUITY_MAX_ENTRY_DRIFT_R:
             reasons.append(f"entry chase {drift_r:.2f}R > {V75_EQUITY_MAX_ENTRY_DRIFT_R:.2f}R")
-        if direction == "LONG" and current_price <= num(signal.get("orb_high")):
-            reasons.append("live price fell back inside/below opening-range breakout")
-        if direction == "SHORT" and current_price >= num(signal.get("orb_low")):
-            reasons.append("live price rose back inside/above opening-range breakout")
-        live_stop_pct = abs(current_price - num(signal.get("stop"))) / current_price * 100.0
+        if drift_r < -V75_EQUITY_MAX_ADVERSE_DRIFT_R:
+            reasons.append(f"setup deteriorated {drift_r:.2f}R < -{V75_EQUITY_MAX_ADVERSE_DRIFT_R:.2f}R")
+        validation_mode = str(signal.get("validation_mode") or "NONE").upper()
+        validation_level = num(signal.get("validation_level"))
+        if validation_mode == "ABOVE" and validation_level > 0 and current_price <= validation_level:
+            reasons.append(f"live price lost required support/trigger {validation_level:.6g}")
+        elif validation_mode == "BELOW" and validation_level > 0 and current_price >= validation_level:
+            reasons.append(f"live price lost required resistance/trigger {validation_level:.6g}")
+        stop_px = num(signal.get("stop"))
+        if direction == "LONG" and current_price <= stop_px:
+            reasons.append("live price already crossed long invalidation stop")
+        if direction == "SHORT" and current_price >= stop_px:
+            reasons.append("live price already crossed short invalidation stop")
+        live_stop_pct = abs(current_price - stop_px) / current_price * 100.0
         if live_stop_pct <= 0 or live_stop_pct > V75_EQUITY_MAX_STOP_PCT:
             reasons.append(f"live ORB stop {live_stop_pct:.2f}% > {V75_EQUITY_MAX_STOP_PCT:.2f}%")
         c = V70_LIVE.contract(symbol)
@@ -10538,7 +10548,7 @@ def _v75_result_from_signal(signal, gate):
         "direction": signal["direction"],
         "price": entry,
         "best_score": num(signal.get("score")),
-        "selected_regime": "EQUITY_ORB",
+        "selected_regime": str(signal.get("regime") or signal.get("setup_type") or "EQUITY_AGENT"),
         "risk_plan": {
             "stop": stop,
             "tp1": entry + sign * risk,
@@ -10547,7 +10557,7 @@ def _v75_result_from_signal(signal, gate):
         },
         "live_risk_pct_override": V75_EQUITY_RISK_PCT,
         "live_expiry_ts": num(signal.get("expiry_ts")),
-        "live_strategy_tag": "EQUITY_ORB_0930_ET",
+        "live_strategy_tag": str(signal.get("live_strategy_tag") or f"EQUITY_{signal.get('setup_type') or signal.get('agent_name') or 'AGENT'}"),
     }
 
 
@@ -10561,6 +10571,7 @@ def _v75_store_equity_candidate(signal, gate, outcome):
      live_stop_pct,risk_fraction,live_enabled,executed,execution_reason,payload,updated_at)
     VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())
     ON CONFLICT(source_key) DO UPDATE SET
+      version=EXCLUDED.version,symbol=EXCLUDED.symbol,session_date=EXCLUDED.session_date,direction=EXCLUDED.direction,
       score=EXCLUDED.score,decision=EXCLUDED.decision,reasons=EXCLUDED.reasons,notes=EXCLUDED.notes,current_price=EXCLUDED.current_price,
       drift_r=EXCLUDED.drift_r,live_stop_pct=EXCLUDED.live_stop_pct,risk_fraction=EXCLUDED.risk_fraction,
       live_enabled=EXCLUDED.live_enabled,executed=(fh_v75_equity_live_candidates.executed OR EXCLUDED.executed),
@@ -10812,6 +10823,707 @@ def _v75_equity_live_summary_text():
     )
 
 
+# ============================================================
+# V7.6 EQUITY AGENT ENSEMBLE — SIX SPECIALISTS + META-AGENT
+# ============================================================
+# Shadow-first research architecture.  Each specialist owns a distinct setup,
+# records its own counterfactual outcome, and contributes to a regime-aware
+# meta-agent.  Only the meta-agent can hand a candidate to the V7.5 risk/execution
+# gate, so several agents agreeing on the same move never create duplicate orders.
+V76_EQUITY_VERSION = "7.6.0-equity-agent-ensemble-shadow"
+V76_AGENT_NAMES = (
+    "ORB",
+    "VWAP_MOMENTUM",
+    "BREAKOUT_RETEST",
+    "GAP_GO",
+    "MEAN_REVERSION",
+    "LATE_REVERSAL",
+)
+V76_AGENT_MIN_SCORE = float(os.getenv("V76_AGENT_MIN_SCORE", "72"))
+V76_META_MIN_SCORE = float(os.getenv("V76_META_MIN_SCORE", "80"))
+V76_META_STRONG_SINGLE_SCORE = float(os.getenv("V76_META_STRONG_SINGLE_SCORE", "90"))
+V76_META_MIN_DIRECTION_EDGE = float(os.getenv("V76_META_MIN_DIRECTION_EDGE", "1.20"))
+V76_AGENT_MAX_STOP_PCT = float(os.getenv("V76_AGENT_MAX_STOP_PCT", "3.50"))
+V76_WEIGHT_CACHE_SECONDS = int(os.getenv("V76_WEIGHT_CACHE_SECONDS", "900"))
+V76_NOTIFY = os.getenv("V76_NOTIFY", "true").lower() == "true"
+V76_DB_READY = False
+V76_WEIGHT_CACHE = {}
+V76_PRIOR_CLOSE_CACHE = {}
+
+
+def _v76_init_equity_agent_lab():
+    global V76_DB_READY
+    if not V68_DB_READY:
+        V76_DB_READY = False
+        return False
+    agent_ok = _v68_db_execute("""
+    CREATE TABLE IF NOT EXISTS fh_v76_equity_agent_shadow (
+        source_key TEXT PRIMARY KEY,
+        version TEXT NOT NULL,
+        agent_name TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        session_date TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        regime TEXT NOT NULL,
+        score DOUBLE PRECISION NOT NULL,
+        entry DOUBLE PRECISION NOT NULL,
+        stop DOUBLE PRECISION NOT NULL,
+        risk DOUBLE PRECISION NOT NULL,
+        tp1 DOUBLE PRECISION NOT NULL,
+        tp2 DOUBLE PRECISION NOT NULL,
+        tp3 DOUBLE PRECISION NOT NULL,
+        signal_time DOUBLE PRECISION NOT NULL,
+        tracking_start DOUBLE PRECISION NOT NULL,
+        expiry_ts DOUBLE PRECISION NOT NULL,
+        last_checked DOUBLE PRECISION NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        tp2_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        tp3_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        tp1_time DOUBLE PRECISION,
+        tp2_time DOUBLE PRECISION,
+        tp3_time DOUBLE PRECISION,
+        closed_time DOUBLE PRECISION,
+        final_r DOUBLE PRECISION,
+        mfe_r DOUBLE PRECISION NOT NULL DEFAULT 0,
+        mae_r DOUBLE PRECISION NOT NULL DEFAULT 0,
+        reasons JSONB,
+        payload JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        settled_at TIMESTAMPTZ
+    )
+    """)
+    meta_ok = _v68_db_execute("""
+    CREATE TABLE IF NOT EXISTS fh_v76_equity_meta (
+        source_key TEXT PRIMARY KEY,
+        version TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        session_date TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        regime TEXT NOT NULL,
+        meta_score DOUBLE PRECISION NOT NULL,
+        primary_agent TEXT NOT NULL,
+        supporting_agents JSONB,
+        conflicting_agents JSONB,
+        weights JSONB,
+        v75_decision TEXT,
+        v75_reasons JSONB,
+        executed BOOLEAN NOT NULL DEFAULT FALSE,
+        payload JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """)
+    if agent_ok:
+        _v68_db_execute("CREATE INDEX IF NOT EXISTS idx_fh_v76_agent_name_status ON fh_v76_equity_agent_shadow(agent_name,status)")
+        _v68_db_execute("CREATE INDEX IF NOT EXISTS idx_fh_v76_agent_symbol_session ON fh_v76_equity_agent_shadow(symbol,session_date)")
+    if meta_ok:
+        _v68_db_execute("CREATE INDEX IF NOT EXISTS idx_fh_v76_meta_session ON fh_v76_equity_meta(session_date,meta_score DESC)")
+    V76_DB_READY = bool(agent_ok and meta_ok)
+    return V76_DB_READY
+
+
+def _v76_previous_cash_close(symbol, bounds):
+    key = (str(symbol), str(bounds.get("session_date")))
+    if key in V76_PRIOR_CLOSE_CACHE:
+        return V76_PRIOR_CLOSE_CACHE[key]
+    if ZoneInfo is None:
+        return None
+    ny = ZoneInfo("America/New_York")
+    open_dt = datetime.fromtimestamp(num(bounds.get("open_ts")), tz=timezone.utc).astimezone(ny)
+    prev = open_dt - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    start_ny = datetime(prev.year, prev.month, prev.day, 15, 40, tzinfo=ny)
+    end_ny = datetime(prev.year, prev.month, prev.day, 16, 5, tzinfo=ny)
+    try:
+        response = requests.get(
+            f"{MEXC_REST}/api/v1/contract/kline/{symbol}",
+            params={
+                "interval": "Min5",
+                "start": int(start_ny.astimezone(timezone.utc).timestamp()),
+                "end": int(end_ny.astimezone(timezone.utc).timestamp()),
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") or {}
+        times = data.get("time") or []
+        closes = data.get("close") or []
+        cutoff = datetime(prev.year, prev.month, prev.day, 16, 0, tzinfo=ny).astimezone(timezone.utc).timestamp()
+        candidates = []
+        for t, c in zip(times, closes):
+            ts = normalize_candle_time(t)
+            if ts <= cutoff and num(c) > 0:
+                candidates.append((ts, num(c)))
+        value = max(candidates, key=lambda x: x[0])[1] if candidates else None
+        V76_PRIOR_CLOSE_CACHE[key] = value
+        return value
+    except Exception as error:
+        print(f"V7.6 prior cash-close warning {symbol}: {type(error).__name__}: {error}")
+        V76_PRIOR_CLOSE_CACHE[key] = None
+        return None
+
+
+def _v76_market_snapshot(symbol, ticker):
+    context = _v69_market_context(symbol)
+    if context is None:
+        return None
+    closed5, latest5, previous5 = _v69_rows(context.get("5m"))
+    closed15, latest15, previous15 = _v69_rows(context.get("15m"))
+    closed1h, latest1h, previous1h = _v69_rows(context.get("1h"))
+    if any(x is None for x in (closed5, latest5, previous5, latest15, previous15, latest1h, previous1h)):
+        return None
+    latest_start = normalize_candle_time(latest5.get("time"))
+    latest_close_ts = latest_start + 5 * 60
+    bounds = _v73_session_bounds(latest_close_ts)
+    if bounds is None:
+        return None
+    # Agents only research the underlying U.S. cash session.
+    if latest_close_ts < bounds["entry_start_ts"] or latest_close_ts > bounds["close_ts"]:
+        return None
+    opening = closed5[(closed5["time"] >= bounds["open_ts"]) & (closed5["time"] < bounds["open_ts"] + 5 * 60)]
+    if opening.empty:
+        return None
+    opening = opening.iloc[0]
+    session5 = closed5[(closed5["time"] >= bounds["open_ts"]) & (closed5["time"] <= latest_start)]
+    if session5.empty:
+        return None
+    close5 = num(latest5.get("close")); atr5 = max(num(latest5.get("atr14")), 1e-12)
+    close15 = num(latest15.get("close")); atr15 = max(num(latest15.get("atr14")), 1e-12)
+    open_px = num(opening.get("open")); orb_high = num(opening.get("high")); orb_low = num(opening.get("low"))
+    session_high = max(num(x) for x in session5["high"].tolist())
+    session_low = min(num(x) for x in session5["low"].tolist())
+    rv5 = num(latest5.get("relative_volume")); spread = num(ticker.get("_spread_pct"))
+    vwap5 = num(latest5.get("vwap20")); vwap15 = num(latest15.get("vwap20"))
+    ema5 = num(latest5.get("ema20")); ema15 = num(latest15.get("ema20"))
+    ema20_1h = num(latest1h.get("ema20")); ema50_1h = num(latest1h.get("ema50"))
+    adx15 = num(latest15.get("adx14")); rsi15 = num(latest15.get("rsi14"))
+    mins = (latest_close_ts - bounds["open_ts"]) / 60.0
+    orb_atr = (orb_high - orb_low) / atr5
+    dist_vwap_atr = (close15 - vwap15) / atr15 if atr15 > 0 else 0.0
+    if mins >= 270:
+        regime = "LATE"
+    elif mins <= 120 and rv5 >= 1.50 and orb_atr >= 0.75:
+        regime = "EXPANSION"
+    elif adx15 >= 24 and ((close15 > ema15 and ema20_1h >= ema50_1h) or (close15 < ema15 and ema20_1h <= ema50_1h)):
+        regime = "TREND"
+    elif adx15 <= 18:
+        regime = "RANGE"
+    else:
+        regime = "MIXED"
+    return {
+        "symbol": symbol, "ticker": ticker, "context": context,
+        "closed5": closed5, "latest5": latest5, "previous5": previous5,
+        "latest15": latest15, "previous15": previous15,
+        "latest1h": latest1h, "previous1h": previous1h,
+        "bounds": bounds, "session5": session5, "latest_start": latest_start, "latest_close_ts": latest_close_ts,
+        "minutes_since_open": mins, "session_date": bounds["session_date"], "session_open": open_px,
+        "orb_high": orb_high, "orb_low": orb_low, "orb_atr": orb_atr,
+        "session_high": session_high, "session_low": session_low,
+        "close5": close5, "close15": close15, "atr5": atr5, "atr15": atr15,
+        "vwap5": vwap5, "vwap15": vwap15, "ema5": ema5, "ema15": ema15,
+        "ema20_1h": ema20_1h, "ema50_1h": ema50_1h,
+        "rv5": rv5, "spread_pct": spread, "rsi15": rsi15, "adx15": adx15,
+        "macd5": num(latest5.get("macd_hist")), "macd5_prev": num(previous5.get("macd_hist")),
+        "loc5": num(latest5.get("close_location")), "body5": num(latest5.get("body_pct")),
+        "dist_vwap_atr": dist_vwap_atr, "event_risk": str((get_macro_snapshot() or {}).get("event_risk") or "LOW").upper(),
+        "regime": regime,
+    }
+
+
+def _v76_candidate(ctx, agent_name, direction, score, entry, stop, reasons,
+                   validation_mode="NONE", validation_level=None, extension_atr=0.0, extra=None):
+    entry = num(entry); stop = num(stop); score = min(100.0, max(0.0, num(score)))
+    if entry <= 0 or stop <= 0 or direction not in {"LONG", "SHORT"}:
+        return None
+    risk = abs(entry - stop)
+    risk_pct = risk / max(entry, 1e-12) * 100.0
+    if risk <= 0 or risk_pct > V76_AGENT_MAX_STOP_PCT or score < V76_AGENT_MIN_SCORE:
+        return None
+    sign = 1.0 if direction == "LONG" else -1.0
+    source_key = hashlib.sha256(
+        f"{V76_EQUITY_VERSION}|{agent_name}|{ctx['symbol']}|{ctx['session_date']}|{direction}".encode("utf-8")
+    ).hexdigest()[:40]
+    out = {
+        "version": V76_EQUITY_VERSION,
+        "agent_name": agent_name,
+        "setup_type": agent_name,
+        "symbol": ctx["symbol"], "session_date": ctx["session_date"], "direction": direction,
+        "regime": ctx["regime"], "score": round(score, 1), "entry": entry, "stop": stop, "risk": risk,
+        "risk_pct": risk_pct, "tp1": entry + sign * risk, "tp2": entry + sign * 2 * risk, "tp3": entry + sign * 3 * risk,
+        "signal_time": ctx["latest_close_ts"], "expiry_ts": ctx["bounds"]["close_ts"],
+        "relative_volume": ctx["rv5"], "spread_pct": ctx["spread_pct"], "extension_atr": num(extension_atr),
+        "orb_high": ctx["orb_high"], "orb_low": ctx["orb_low"], "orb_atr": ctx["orb_atr"],
+        "event_risk": ctx["event_risk"], "reasons": list(reasons or []),
+        "validation_mode": validation_mode, "validation_level": num(validation_level) if validation_level is not None else None,
+        "source_key": source_key,
+    }
+    if extra:
+        out.update(_clean_json_value(extra))
+    return out
+
+
+def _v76_agent_orb(ctx):
+    if not (5 <= ctx["minutes_since_open"] <= V73_EQUITY_ORB_WINDOW_MINUTES):
+        return None
+    close = ctx["close5"]; atr = ctx["atr5"]
+    if close > ctx["orb_high"]:
+        direction = "LONG"; extension = (close - ctx["orb_high"]) / atr
+    elif close < ctx["orb_low"]:
+        direction = "SHORT"; extension = (ctx["orb_low"] - close) / atr
+    else:
+        return None
+    if ctx["spread_pct"] > 0.25 or ctx["rv5"] < 1.0 or not (0.30 <= ctx["orb_atr"] <= 2.25) or extension > 0.80:
+        return None
+    score = 48.0
+    reasons = ["5m cash-open range break"]
+    if ctx["rv5"] >= 1.5: score += 12; reasons.append("strong breakout volume")
+    elif ctx["rv5"] >= 1.2: score += 9
+    else: score += 5
+    if direction == "LONG":
+        if ctx["close15"] > ctx["vwap15"]: score += 10
+        if ctx["close15"] > ctx["ema15"]: score += 8
+        if ctx["ema20_1h"] >= ctx["ema50_1h"]: score += 10
+        if ctx["loc5"] >= 0.65: score += 5
+        stop = ctx["orb_low"]; mode = "ABOVE"; level = ctx["orb_high"]
+    else:
+        if ctx["close15"] < ctx["vwap15"]: score += 10
+        if ctx["close15"] < ctx["ema15"]: score += 8
+        if ctx["ema20_1h"] <= ctx["ema50_1h"]: score += 10
+        if ctx["loc5"] <= 0.35: score += 5
+        stop = ctx["orb_high"]; mode = "BELOW"; level = ctx["orb_low"]
+    if ctx["adx15"] >= 18: score += 4
+    return _v76_candidate(ctx, "ORB", direction, score, close, stop, reasons, mode, level, extension)
+
+
+def _v76_agent_vwap_momentum(ctx):
+    if not (15 <= ctx["minutes_since_open"] <= 360) or ctx["rv5"] < 0.90 or ctx["adx15"] < 18:
+        return None
+    close = ctx["close5"]; atr = ctx["atr5"]
+    long_ok = (close > ctx["vwap5"] and ctx["close15"] > ctx["vwap15"] and ctx["close15"] > ctx["ema15"] and ctx["ema20_1h"] >= ctx["ema50_1h"] and ctx["loc5"] >= 0.58)
+    short_ok = (close < ctx["vwap5"] and ctx["close15"] < ctx["vwap15"] and ctx["close15"] < ctx["ema15"] and ctx["ema20_1h"] <= ctx["ema50_1h"] and ctx["loc5"] <= 0.42)
+    if long_ok == short_ok:
+        return None
+    direction = "LONG" if long_ok else "SHORT"
+    distance = abs(close - ctx["vwap5"]) / atr
+    if distance > 0.90:
+        return None
+    reasons = ["5m/15m VWAP momentum alignment", "1h EMA trend aligned"]
+    score = 56 + min(12, max(0, (ctx["adx15"] - 18) * 0.8)) + min(10, max(0, (ctx["rv5"] - 0.9) * 12))
+    if direction == "LONG":
+        if ctx["macd5"] > 0: score += 8
+        if 50 <= ctx["rsi15"] <= 75: score += 8
+        stop = min(ctx["vwap5"], ctx["ema5"], num(ctx["latest5"].get("low"))) - 0.10 * atr
+        mode = "ABOVE"; level = ctx["vwap5"]
+    else:
+        if ctx["macd5"] < 0: score += 8
+        if 25 <= ctx["rsi15"] <= 50: score += 8
+        stop = max(ctx["vwap5"], ctx["ema5"], num(ctx["latest5"].get("high"))) + 0.10 * atr
+        mode = "BELOW"; level = ctx["vwap5"]
+    return _v76_candidate(ctx, "VWAP_MOMENTUM", direction, score, close, stop, reasons, mode, level, distance)
+
+
+def _v76_agent_breakout_retest(ctx):
+    if not (10 <= ctx["minutes_since_open"] <= 330):
+        return None
+    past = ctx["session5"].iloc[:-1]
+    if past.empty:
+        return None
+    close = ctx["close5"]; atr = ctx["atr5"]
+    latest_low = num(ctx["latest5"].get("low")); latest_high = num(ctx["latest5"].get("high"))
+    broke_long = bool((past["close"] > ctx["orb_high"]).any())
+    broke_short = bool((past["close"] < ctx["orb_low"]).any())
+    long_ok = broke_long and latest_low <= ctx["orb_high"] + 0.18 * atr and close > ctx["orb_high"] and ctx["loc5"] >= 0.55
+    short_ok = broke_short and latest_high >= ctx["orb_low"] - 0.18 * atr and close < ctx["orb_low"] and ctx["loc5"] <= 0.45
+    if long_ok == short_ok:
+        return None
+    direction = "LONG" if long_ok else "SHORT"
+    score = 62 + min(10, max(0, (ctx["rv5"] - 0.8) * 10))
+    reasons = ["opening-range breakout retested and held"]
+    if direction == "LONG":
+        if ctx["close15"] > ctx["vwap15"]: score += 8
+        if ctx["ema20_1h"] >= ctx["ema50_1h"]: score += 7
+        if ctx["macd5"] >= ctx["macd5_prev"]: score += 5
+        stop = min(latest_low, ctx["orb_high"] - 0.18 * atr) - 0.05 * atr
+        mode = "ABOVE"; level = ctx["orb_high"]
+    else:
+        if ctx["close15"] < ctx["vwap15"]: score += 8
+        if ctx["ema20_1h"] <= ctx["ema50_1h"]: score += 7
+        if ctx["macd5"] <= ctx["macd5_prev"]: score += 5
+        stop = max(latest_high, ctx["orb_low"] + 0.18 * atr) + 0.05 * atr
+        mode = "BELOW"; level = ctx["orb_low"]
+    return _v76_candidate(ctx, "BREAKOUT_RETEST", direction, score, close, stop, reasons, mode, level, 0.0)
+
+
+def _v76_agent_gap_go(ctx):
+    if not (5 <= ctx["minutes_since_open"] <= 120):
+        return None
+    prior_close = _v76_previous_cash_close(ctx["symbol"], ctx["bounds"])
+    if not prior_close or prior_close <= 0:
+        return None
+    gap_pct = (ctx["session_open"] / prior_close - 1.0) * 100.0
+    if abs(gap_pct) < 0.50 or abs(gap_pct) > 10.0 or ctx["rv5"] < 1.0:
+        return None
+    close = ctx["close5"]
+    if gap_pct > 0:
+        direction = "LONG"
+        if close <= ctx["session_open"] or close <= ctx["vwap5"] or ctx["loc5"] < 0.55:
+            return None
+        stop = min(ctx["orb_low"], ctx["session_open"] - 0.10 * ctx["atr5"])
+        mode = "ABOVE"; level = ctx["session_open"]
+    else:
+        direction = "SHORT"
+        if close >= ctx["session_open"] or close >= ctx["vwap5"] or ctx["loc5"] > 0.45:
+            return None
+        stop = max(ctx["orb_high"], ctx["session_open"] + 0.10 * ctx["atr5"])
+        mode = "BELOW"; level = ctx["session_open"]
+    score = 54 + min(14, abs(gap_pct) * 3) + min(12, max(0, (ctx["rv5"] - 1.0) * 10))
+    if (direction == "LONG" and ctx["ema20_1h"] >= ctx["ema50_1h"]) or (direction == "SHORT" and ctx["ema20_1h"] <= ctx["ema50_1h"]):
+        score += 8
+    reasons = [f"cash-open gap {gap_pct:+.2f}% continuing with VWAP support"]
+    return _v76_candidate(ctx, "GAP_GO", direction, score, close, stop, reasons, mode, level, 0.0, {"gap_pct": gap_pct, "prior_cash_close": prior_close})
+
+
+def _v76_agent_mean_reversion(ctx):
+    if not (30 <= ctx["minutes_since_open"] <= 330) or ctx["adx15"] > 23:
+        return None
+    dist = ctx["dist_vwap_atr"]
+    close = ctx["close5"]; atr = ctx["atr5"]
+    latest_open = num(ctx["latest5"].get("open")); latest_low = num(ctx["latest5"].get("low")); latest_high = num(ctx["latest5"].get("high"))
+    long_ok = dist <= -1.00 and ctx["rsi15"] <= 38 and close > latest_open and ctx["loc5"] >= 0.58
+    short_ok = dist >= 1.00 and ctx["rsi15"] >= 62 and close < latest_open and ctx["loc5"] <= 0.42
+    if long_ok == short_ok:
+        return None
+    direction = "LONG" if long_ok else "SHORT"
+    score = 56 + min(14, max(0, abs(dist) - 1.0) * 12) + min(8, max(0, 23 - ctx["adx15"]) * 0.7)
+    reasons = [f"mean-reversion stretch {dist:+.2f} ATR from 15m VWAP", "low-trend regime"]
+    if direction == "LONG":
+        if ctx["macd5"] > ctx["macd5_prev"]: score += 8
+        stop = min(ctx["session_low"], latest_low) - 0.15 * atr
+        mode = "BELOW"; level = ctx["vwap15"]
+    else:
+        if ctx["macd5"] < ctx["macd5_prev"]: score += 8
+        stop = max(ctx["session_high"], latest_high) + 0.15 * atr
+        mode = "ABOVE"; level = ctx["vwap15"]
+    return _v76_candidate(ctx, "MEAN_REVERSION", direction, score, close, stop, reasons, mode, level, abs(dist))
+
+
+def _v76_agent_late_reversal(ctx):
+    if not (300 <= ctx["minutes_since_open"] <= 380):
+        return None
+    close = ctx["close5"]; open_px = ctx["session_open"]; atr = ctx["atr5"]
+    if open_px <= 0:
+        return None
+    move_pct = (close / open_px - 1.0) * 100.0
+    latest_open = num(ctx["latest5"].get("open"))
+    long_ok = move_pct <= -1.20 and ctx["dist_vwap_atr"] <= -0.80 and close > latest_open and ctx["loc5"] >= 0.63 and ctx["rsi15"] <= 45
+    short_ok = move_pct >= 1.20 and ctx["dist_vwap_atr"] >= 0.80 and close < latest_open and ctx["loc5"] <= 0.37 and ctx["rsi15"] >= 55
+    if long_ok == short_ok:
+        return None
+    direction = "LONG" if long_ok else "SHORT"
+    score = 58 + min(15, max(0, abs(move_pct) - 1.2) * 5) + min(10, max(0, abs(ctx["dist_vwap_atr"]) - 0.8) * 8)
+    if direction == "LONG":
+        if ctx["macd5"] > ctx["macd5_prev"]: score += 8
+        stop = ctx["session_low"] - 0.15 * atr
+    else:
+        if ctx["macd5"] < ctx["macd5_prev"]: score += 8
+        stop = ctx["session_high"] + 0.15 * atr
+    reasons = [f"late-session reversal after {move_pct:+.2f}% cash-session move"]
+    return _v76_candidate(ctx, "LATE_REVERSAL", direction, score, close, stop, reasons, "NONE", None, abs(ctx["dist_vwap_atr"]), {"session_move_pct": move_pct})
+
+
+V76_AGENT_FUNCTIONS = (
+    _v76_agent_orb,
+    _v76_agent_vwap_momentum,
+    _v76_agent_breakout_retest,
+    _v76_agent_gap_go,
+    _v76_agent_mean_reversion,
+    _v76_agent_late_reversal,
+)
+
+
+def _v76_store_agent_shadow(candidate):
+    if not V76_DB_READY or not candidate:
+        return False
+    tracking_start = (int(time.time() // 60) + 1) * 60
+    row = _v68_db_execute("""
+    INSERT INTO fh_v76_equity_agent_shadow
+    (source_key,version,agent_name,symbol,session_date,direction,regime,score,entry,stop,risk,tp1,tp2,tp3,
+     signal_time,tracking_start,expiry_ts,last_checked,status,reasons,payload)
+    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s::jsonb,%s::jsonb)
+    ON CONFLICT(source_key) DO NOTHING RETURNING source_key
+    """, (
+        candidate["source_key"],V76_EQUITY_VERSION,candidate["agent_name"],candidate["symbol"],candidate["session_date"],candidate["direction"],candidate["regime"],
+        candidate["score"],candidate["entry"],candidate["stop"],candidate["risk"],candidate["tp1"],candidate["tp2"],candidate["tp3"],
+        candidate["signal_time"],tracking_start,candidate["expiry_ts"],tracking_start-1,
+        json.dumps(candidate.get("reasons") or []),json.dumps(_clean_json_value(candidate)),
+    ), fetch="one")
+    return bool(row)
+
+
+def _v76_agent_history_weight(agent_name, symbol, regime):
+    base_by_regime = {
+        "EXPANSION": {"ORB":1.25,"VWAP_MOMENTUM":1.15,"BREAKOUT_RETEST":1.15,"GAP_GO":1.30,"MEAN_REVERSION":0.55,"LATE_REVERSAL":0.60},
+        "TREND": {"ORB":1.10,"VWAP_MOMENTUM":1.30,"BREAKOUT_RETEST":1.25,"GAP_GO":1.10,"MEAN_REVERSION":0.60,"LATE_REVERSAL":0.70},
+        "RANGE": {"ORB":0.70,"VWAP_MOMENTUM":0.75,"BREAKOUT_RETEST":0.90,"GAP_GO":0.70,"MEAN_REVERSION":1.35,"LATE_REVERSAL":1.05},
+        "LATE": {"ORB":0.55,"VWAP_MOMENTUM":0.85,"BREAKOUT_RETEST":0.80,"GAP_GO":0.45,"MEAN_REVERSION":1.10,"LATE_REVERSAL":1.40},
+        "MIXED": {name:1.0 for name in V76_AGENT_NAMES},
+    }
+    base = num(base_by_regime.get(regime, base_by_regime["MIXED"]).get(agent_name, 1.0))
+    if not V76_DB_READY:
+        return base, {"base":base,"history":1.0,"n":0}
+    key=(agent_name,symbol,regime)
+    cached=V76_WEIGHT_CACHE.get(key)
+    if cached and time.time()-num(cached.get("ts")) < V76_WEIGHT_CACHE_SECONDS:
+        return cached["weight"], cached["detail"]
+    row=_v68_db_execute("""
+    SELECT COUNT(*) FILTER(WHERE final_r IS NOT NULL AND status<>'AMBIGUOUS'),
+           COALESCE(AVG(final_r) FILTER(WHERE final_r IS NOT NULL AND status<>'AMBIGUOUS'),0),
+           COUNT(*) FILTER(WHERE final_r IS NOT NULL AND status<>'AMBIGUOUS' AND symbol=%s),
+           COALESCE(AVG(final_r) FILTER(WHERE final_r IS NOT NULL AND status<>'AMBIGUOUS' AND symbol=%s),0),
+           COUNT(*) FILTER(WHERE final_r IS NOT NULL AND status<>'AMBIGUOUS' AND regime=%s),
+           COALESCE(AVG(final_r) FILTER(WHERE final_r IS NOT NULL AND status<>'AMBIGUOUS' AND regime=%s),0)
+      FROM fh_v76_equity_agent_shadow WHERE agent_name=%s
+    """,(symbol,symbol,regime,regime,agent_name),fetch="one")
+    n,avg_r,sn,savg,rn,ravg = row if row else (0,0,0,0,0,0)
+    history = 1.0
+    history += 0.18 * np.tanh(num(avg_r)) * min(1.0, num(n)/30.0)
+    history += 0.12 * np.tanh(num(savg)) * min(1.0, num(sn)/10.0)
+    history += 0.08 * np.tanh(num(ravg)) * min(1.0, num(rn)/15.0)
+    history = min(1.30,max(0.70,history))
+    weight = min(1.60,max(0.45,base*history))
+    detail={"base":round(base,3),"history":round(history,3),"n":int(n or 0),"avg_r":round(num(avg_r),3),"symbol_n":int(sn or 0),"symbol_avg_r":round(num(savg),3),"regime_n":int(rn or 0),"regime_avg_r":round(num(ravg),3)}
+    V76_WEIGHT_CACHE[key]={"ts":time.time(),"weight":weight,"detail":detail}
+    return weight,detail
+
+
+def _v76_meta_candidate(ctx, candidates):
+    if not candidates:
+        return None
+    weighted=[]
+    evidence={"LONG":0.0,"SHORT":0.0}
+    for c in candidates:
+        weight,detail=_v76_agent_history_weight(c["agent_name"],c["symbol"],ctx["regime"])
+        utility=weight*max(0.0,num(c["score"])-50.0)
+        evidence[c["direction"]]+=utility
+        weighted.append((c,weight,detail,utility))
+    winner="LONG" if evidence["LONG"]>=evidence["SHORT"] else "SHORT"
+    loser="SHORT" if winner=="LONG" else "LONG"
+    if evidence[winner] <= 0:
+        return None
+    if evidence[loser] > 0 and evidence[winner] / max(evidence[loser],1e-12) < V76_META_MIN_DIRECTION_EDGE:
+        return None
+    agree=[x for x in weighted if x[0]["direction"]==winner]
+    conflict=[x for x in weighted if x[0]["direction"]!=winner]
+    denom=sum(x[1] for x in agree) or 1.0
+    weighted_score=sum(num(x[0]["score"])*x[1] for x in agree)/denom
+    consensus_bonus=min(8.0,max(0,len(agree)-1)*3.0)
+    conflict_penalty=min(10.0,len(conflict)*3.0)
+    meta_score=min(100.0,max(0.0,weighted_score+consensus_bonus-conflict_penalty))
+    primary=max(agree,key=lambda x:num(x[0]["score"])*x[1])
+    primary_c=primary[0]
+    if meta_score < V76_META_MIN_SCORE:
+        return None
+    if len(agree)<2 and num(primary_c["score"])<V76_META_STRONG_SINGLE_SCORE:
+        return None
+    source_key=hashlib.sha256(f"{V76_EQUITY_VERSION}|META|{ctx['symbol']}|{ctx['session_date']}".encode("utf-8")).hexdigest()[:40]
+    weights_payload={x[0]["agent_name"]:{"weight":round(x[1],3),**x[2]} for x in weighted}
+    signal=dict(primary_c)
+    signal.update({
+        "version":V76_EQUITY_VERSION,"agent_name":"META","setup_type":primary_c["agent_name"],
+        "primary_agent":primary_c["agent_name"],"score":round(meta_score,1),"regime":ctx["regime"],
+        "source_key":source_key,"supporting_agents":[x[0]["agent_name"] for x in agree],
+        "conflicting_agents":[x[0]["agent_name"] for x in conflict],"agent_weights":weights_payload,
+        "meta_evidence":{k:round(v,3) for k,v in evidence.items()},
+        "reasons":[f"meta-agent {len(agree)} supporting specialist(s), regime {ctx['regime']}",f"primary {primary_c['agent_name']} score {num(primary_c['score']):.1f}"] + list(primary_c.get("reasons") or []),
+        "live_strategy_tag":f"EQUITY_META_{primary_c['agent_name']}",
+    })
+    return signal
+
+
+def _v76_store_meta(meta, v75_result):
+    if not V76_DB_READY or not meta:
+        return False
+    gate=(v75_result or {}).get("gate") or {}
+    outcome=(v75_result or {}).get("outcome") or {}
+    return bool(_v68_db_execute("""
+    INSERT INTO fh_v76_equity_meta
+    (source_key,version,symbol,session_date,direction,regime,meta_score,primary_agent,supporting_agents,conflicting_agents,weights,v75_decision,v75_reasons,executed,payload,updated_at)
+    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s::jsonb,%s,%s::jsonb,NOW())
+    ON CONFLICT(source_key) DO UPDATE SET direction=EXCLUDED.direction,regime=EXCLUDED.regime,meta_score=EXCLUDED.meta_score,
+      primary_agent=EXCLUDED.primary_agent,supporting_agents=EXCLUDED.supporting_agents,conflicting_agents=EXCLUDED.conflicting_agents,
+      weights=EXCLUDED.weights,v75_decision=EXCLUDED.v75_decision,v75_reasons=EXCLUDED.v75_reasons,
+      executed=(fh_v76_equity_meta.executed OR EXCLUDED.executed),payload=EXCLUDED.payload,updated_at=NOW()
+    RETURNING source_key
+    """,(
+        meta["source_key"],V76_EQUITY_VERSION,meta["symbol"],meta["session_date"],meta["direction"],meta["regime"],num(meta["score"]),meta["primary_agent"],
+        json.dumps(meta.get("supporting_agents") or []),json.dumps(meta.get("conflicting_agents") or []),json.dumps(meta.get("agent_weights") or {}),
+        gate.get("decision"),json.dumps(gate.get("reasons") or []),bool(outcome.get("executed")),json.dumps(_clean_json_value({"meta":meta,"v75":v75_result})),
+    ),fetch="one"))
+
+
+def _v76_open_agent_rows():
+    if not V76_DB_READY:
+        return []
+    rows=_v68_db_execute("""SELECT source_key,agent_name,symbol,direction,regime,entry,stop,risk,tp1,tp2,tp3,tracking_start,expiry_ts,last_checked,
+        tp1_hit,tp2_hit,tp3_hit,tp1_time,tp2_time,tp3_time,mfe_r,mae_r FROM fh_v76_equity_agent_shadow WHERE status='OPEN' ORDER BY tracking_start""",fetch="all") or []
+    keys=["source_key","agent_name","symbol","direction","regime","entry","stop","risk","tp1","tp2","tp3","tracking_start","expiry_ts","last_checked",
+          "tp1_hit","tp2_hit","tp3_hit","tp1_time","tp2_time","tp3_time","mfe_r","mae_r"]
+    return [dict(zip(keys,row)) for row in rows]
+
+
+def _v76_update_agent_trade(trade):
+    return _v68_db_execute("""UPDATE fh_v76_equity_agent_shadow SET last_checked=%s,status=%s,final_r=%s,mfe_r=%s,mae_r=%s,
+        tp1_hit=%s,tp2_hit=%s,tp3_hit=%s,tp1_time=%s,tp2_time=%s,tp3_time=%s,closed_time=%s,
+        settled_at=CASE WHEN %s='OPEN' THEN settled_at ELSE COALESCE(settled_at,NOW()) END WHERE source_key=%s""",(
+        trade.get("last_checked"),trade.get("status"),trade.get("final_r"),trade.get("mfe_r"),trade.get("mae_r"),
+        trade.get("tp1_hit"),trade.get("tp2_hit"),trade.get("tp3_hit"),trade.get("tp1_time"),trade.get("tp2_time"),trade.get("tp3_time"),trade.get("closed_time"),
+        trade.get("status"),trade.get("source_key")
+    ))
+
+
+def _v76_settle_agent_trade(trade):
+    df=get_candles(trade["symbol"],"Min1")
+    if df is None or len(df)==0:
+        return None
+    df=df.copy(); df["time_norm"]=df["time"].apply(normalize_candle_time)
+    relevant=df[(df["time_norm"]>num(trade.get("last_checked"))) & (df["time_norm"]>=num(trade.get("tracking_start")))]
+    latest_price=num(df.iloc[-1]["close"]); latest_seen=num(trade.get("last_checked")); event=None
+    direction=str(trade.get("direction") or "").upper(); entry=num(trade.get("entry")); risk=max(num(trade.get("risk")),1e-12)
+    mfe=num(trade.get("mfe_r")); mae=num(trade.get("mae_r"))
+    for _,candle in relevant.iterrows():
+        t=num(candle["time_norm"]); latest_seen=max(latest_seen,t); high=num(candle["high"]); low=num(candle["low"])
+        if direction=="LONG":
+            mfe=max(mfe,(high-entry)/risk); mae=min(mae,(low-entry)/risk)
+        else:
+            mfe=max(mfe,(entry-low)/risk); mae=min(mae,(entry-high)/risk)
+        stage=2 if trade.get("tp2_hit") else (1 if trade.get("tp1_hit") else 0)
+        stop_r=_v75_shadow_stop_r(trade,stage)
+        managed_stop=(entry+stop_r*risk) if direction=="LONG" else (entry-stop_r*risk)
+        stop_touched=low<=managed_stop if direction=="LONG" else high>=managed_stop
+        if not trade.get("tp1_hit"):
+            next_target=high>=num(trade.get("tp1")) if direction=="LONG" else low<=num(trade.get("tp1"))
+        elif not trade.get("tp2_hit"):
+            next_target=high>=num(trade.get("tp2")) if direction=="LONG" else low<=num(trade.get("tp2"))
+        else:
+            next_target=high>=num(trade.get("tp3")) if direction=="LONG" else low<=num(trade.get("tp3"))
+        if stop_touched and next_target:
+            trade["status"]="AMBIGUOUS"; trade["final_r"]=None; trade["closed_time"]=t; event="AMBIGUOUS"; break
+        if stop_touched:
+            trade["status"]="STOP"; trade["final_r"]=round(_v75_shadow_final_r_at_stop(trade,stage),4); trade["closed_time"]=t; event="STOP"; break
+        tp3=high>=num(trade.get("tp3")) if direction=="LONG" else low<=num(trade.get("tp3"))
+        tp2=high>=num(trade.get("tp2")) if direction=="LONG" else low<=num(trade.get("tp2"))
+        tp1=high>=num(trade.get("tp1")) if direction=="LONG" else low<=num(trade.get("tp1"))
+        if tp3:
+            trade["tp1_hit"]=trade["tp2_hit"]=trade["tp3_hit"]=True
+            if not trade.get("tp1_time"): trade["tp1_time"]=t
+            if not trade.get("tp2_time"): trade["tp2_time"]=t
+            trade["tp3_time"]=t; trade["status"]="TP3"; trade["final_r"]=2.25; trade["closed_time"]=t; event="TP3"; break
+        if tp2 and not trade.get("tp2_hit"):
+            trade["tp1_hit"]=trade["tp2_hit"]=True
+            if not trade.get("tp1_time"): trade["tp1_time"]=t
+            trade["tp2_time"]=t
+        elif tp1 and not trade.get("tp1_hit"):
+            trade["tp1_hit"]=True; trade["tp1_time"]=t
+    trade["last_checked"]=latest_seen; trade["mfe_r"]=round(mfe,4); trade["mae_r"]=round(mae,4); trade.setdefault("status","OPEN")
+    if trade.get("status")=="OPEN" and time.time()>=num(trade.get("expiry_ts")):
+        current_r=current_r_for_price(trade,latest_price)
+        trade["final_r"]=round(max(-1.0,min(2.25,_v75_shadow_current_final_r(trade,current_r))),4)
+        trade["status"]="EXPIRED"; trade["closed_time"]=time.time(); event="EXPIRED"
+    _v76_update_agent_trade(trade)
+    if event:
+        V76_WEIGHT_CACHE.clear()
+    return event
+
+
+def _v76_sync_agent_outcomes():
+    if not V76_DB_READY:
+        return 0
+    settled=0
+    for trade in _v76_open_agent_rows():
+        try:
+            event=_v76_settle_agent_trade(trade)
+            if event:
+                settled+=1
+                print(f"V7.6 agent settled {trade['agent_name']} {trade['symbol']} {trade['direction']} → {event} ({trade.get('final_r')})")
+        except Exception as error:
+            print(f"V7.6 agent settlement warning {trade.get('agent_name')} {trade.get('symbol')}: {type(error).__name__}: {error}")
+        time.sleep(0.02)
+    return settled
+
+
+def _v76_scan_equity_agents():
+    stats={"agent_signals":0,"meta_candidates":0,"would_take":0,"symbols":0}
+    if not V76_DB_READY:
+        return stats
+    tickers=_v73_fetch_equity_tickers()
+    if tickers:
+        print(f"V7.6 Equity Agents: scanning {len(tickers)} liquid stock/index future(s) — 6 AGENTS + META, SHADOW FIRST")
+    for ticker in tickers:
+        symbol=str(ticker.get("symbol") or "")
+        try:
+            ctx=_v76_market_snapshot(symbol,ticker)
+            if ctx is None:
+                continue
+            stats["symbols"]+=1
+            candidates=[]
+            for fn in V76_AGENT_FUNCTIONS:
+                try:
+                    c=fn(ctx)
+                    if c:
+                        candidates.append(c)
+                        if _v76_store_agent_shadow(c):
+                            stats["agent_signals"]+=1
+                            print(f"V7.6 AGENT {c['agent_name']}: {symbol} {c['direction']} score={c['score']:.1f} regime={ctx['regime']}")
+                except Exception as agent_error:
+                    print(f"V7.6 agent warning {fn.__name__} {symbol}: {type(agent_error).__name__}: {agent_error}")
+            meta=_v76_meta_candidate(ctx,candidates)
+            if meta:
+                stats["meta_candidates"]+=1
+                v75=_v75_process_equity_candidate(meta)
+                if ((v75 or {}).get("gate") or {}).get("eligible"):
+                    stats["would_take"]+=1
+                _v76_store_meta(meta,v75)
+                print(
+                    f"V7.6 META: {symbol} {meta['direction']} score={meta['score']:.1f} regime={meta['regime']} "
+                    f"primary={meta['primary_agent']} support={','.join(meta.get('supporting_agents') or [])} "
+                    f"→ {((v75 or {}).get('gate') or {}).get('decision','N/A')}"
+                )
+        except Exception as error:
+            print(f"V7.6 Equity Ensemble {symbol} warning: {type(error).__name__}: {error}")
+        time.sleep(0.04)
+    return stats
+
+
+def _v76_equity_agent_summary_text():
+    if not V76_DB_READY:
+        return "V7.6 Equity Agent Ensemble is waiting for Postgres."
+    rows=_v68_db_execute("""
+      SELECT agent_name,COUNT(*),COUNT(*) FILTER(WHERE final_r IS NOT NULL),
+             COALESCE(AVG(final_r) FILTER(WHERE final_r IS NOT NULL),0),
+             COALESCE(SUM(final_r) FILTER(WHERE final_r IS NOT NULL),0),
+             COUNT(*) FILTER(WHERE final_r>0),COUNT(*) FILTER(WHERE status='OPEN')
+      FROM fh_v76_equity_agent_shadow GROUP BY agent_name ORDER BY agent_name
+    """,fetch="all") or []
+    meta=_v68_db_execute("""SELECT COUNT(*),COUNT(*) FILTER(WHERE v75_decision='ALLOW'),COUNT(*) FILTER(WHERE executed) FROM fh_v76_equity_meta""",fetch="one") or (0,0,0)
+    lines=[
+        "🧠 V7.6 EQUITY AGENT ENSEMBLE",
+        f"Universe: top {V73_EQUITY_TOP_N} MEXC USDT stock/index futures | Meta threshold {V76_META_MIN_SCORE:.0f}",
+        f"Meta candidates: {int(meta[0] or 0)} | WOULD-TAKE: {int(meta[1] or 0)} | Actual live: {int(meta[2] or 0)}",
+        "",
+    ]
+    seen=set()
+    for agent,total,settled,avg_r,total_r,wins,open_n in rows:
+        seen.add(str(agent)); wr=100.0*num(wins)/max(1,num(settled))
+        lines.append(f"{agent}: {int(total)} signals | {int(settled)} settled | {wr:.1f}% win | {num(avg_r):+.2f}R avg | {num(total_r):+.2f}R | open {int(open_n)}")
+    for agent in V76_AGENT_NAMES:
+        if agent not in seen:
+            lines.append(f"{agent}: no signals yet")
+    lines.append("Weights use regime priors plus shrinkage toward each agent's settled global/symbol/regime expectancy; promotion remains manual.")
+    return "\n".join(lines)
+
 _V70_PREV_COMMAND = handle_telegram_command
 
 def handle_telegram_command(chat_id, text):
@@ -10831,6 +11543,9 @@ def handle_telegram_command(chat_id, text):
         return
     if command in {"/equitylive", "/stocklive", "/orblive"}:
         send_to_chat(chat_id, _v75_equity_live_summary_text())
+        return
+    if command in {"/agents", "/equityagents", "/ensemble", "/v76"}:
+        send_to_chat(chat_id, _v76_equity_agent_summary_text())
         return
     return _V70_PREV_COMMAND(chat_id, text)
 
@@ -11155,7 +11870,7 @@ _V70_PAPER_CREATE = create_paper_trade
 
 # Separate cadence for live-only bridge evaluations. This mirrors the normal
 # alert cooldown/score-improvement behavior without mutating paper alert state.
-V743_BRIDGE_VERSION = "7.5.0-equity-shadow-ready"
+V743_BRIDGE_VERSION = "7.6.0-equity-agent-ensemble-shadow"
 V71_LIVE_BRIDGE_STATE = {}
 
 def _v71_live_bridge_due(result):
@@ -11288,8 +12003,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.5.0-equity-shadow-ready",
+                "version": "7.6.0-equity-agent-ensemble-shadow",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
+                "equity_agent_ensemble": ("active" if V76_DB_READY else "disabled_or_unavailable"),
+                "equity_agents": list(V76_AGENT_NAMES),
+                "equity_meta_min_score": V76_META_MIN_SCORE,
                 "equity_top_n": V73_EQUITY_TOP_N,
                 "equity_live_path": ("enabled" if V75_EQUITY_LIVE_ENABLED else "shadow_first"),
                 "equity_live_risk_pct": V75_EQUITY_RISK_PCT,
