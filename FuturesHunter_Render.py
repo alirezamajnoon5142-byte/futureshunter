@@ -6877,6 +6877,16 @@ def _v68_apply_signal_side_effects(signal_key, message, result, trades, alert_st
             trade = create_paper_trade(result, trades)
             trade["v68_signal_key"] = signal_key
             save_json(TRADES_FILE, trades)
+        else:
+            # V7.4.3 live-bridge fix: paper bookkeeping must never suppress a
+            # legitimate live evaluation. The paper engine intentionally keeps
+            # only one open paper trade per symbol, but the live selector has
+            # its own risk, cooldown, position and exchange preflight gates.
+            # Evaluate the durable Core ENTRY even when an older/opposite paper
+            # trade on the same symbol is still open.
+            live_bridge = globals().get("_v71_evaluate_live_without_paper")
+            if callable(live_bridge):
+                live_bridge(result, trades, signal_key)
 
         record_alert_state(result, alert_state)
         _v68_mark_signal_side_effects(signal_key)
@@ -9647,10 +9657,35 @@ async def main():
                             else:
                                 print("⚠️ Telegram alert failed in local fallback mode.")
                     else:
-                        print(
-                            "ENTRY setup found, but duplicate/open-trade "
-                            "alert suppressed."
-                        )
+                        # Paper notification/ledger suppression must not silently
+                        # suppress V7 live evaluation. Only bridge when the block
+                        # is specifically an already-open paper trade; ordinary
+                        # alert cooldown/duplicate suppression remains unchanged.
+                        paper_blocked = has_open_trade_for_symbol(trades, best.get("symbol"))
+                        bridge_due = False
+                        bridge_due_fn = globals().get("_v71_live_bridge_due")
+                        if paper_blocked and callable(bridge_due_fn):
+                            bridge_due = bool(bridge_due_fn(best))
+
+                        if paper_blocked and bridge_due:
+                            attach_context = globals().get("_v71_attach_live_context")
+                            live_bridge = globals().get("_v71_evaluate_live_without_paper")
+                            if callable(attach_context) and callable(live_bridge):
+                                attach_context(best, trades)
+                                bridge_key = _v68_signal_key(best, now)
+                                print(
+                                    f"V7.4.3 LIVE BRIDGE: paper trade blocks {best.get('symbol')} "
+                                    "paper alert, but live candidate will still be evaluated"
+                                )
+                                live_bridge(best, trades, bridge_key)
+                                mark_bridge = globals().get("_v71_mark_live_bridge")
+                                if callable(mark_bridge):
+                                    mark_bridge(best)
+                        else:
+                            print(
+                                "ENTRY setup found, but duplicate/open-trade "
+                                "alert suppressed."
+                            )
 
                 print_stats(trades)
 
@@ -10375,21 +10410,122 @@ def handle_telegram_command(chat_id, text):
 
 _V70_PAPER_CREATE = create_paper_trade
 
+# Separate cadence for live-only bridge evaluations. This mirrors the normal
+# alert cooldown/score-improvement behavior without mutating paper alert state.
+V743_BRIDGE_VERSION = "7.4.3-live-bridgefix"
+V71_LIVE_BRIDGE_STATE = {}
+
+def _v71_live_bridge_due(result):
+    key = f"{result.get('symbol')}_{result.get('direction')}"
+    previous = V71_LIVE_BRIDGE_STATE.get(key)
+    if previous is None:
+        return True
+    age = time.time() - num(previous.get("time"))
+    if age >= ALERT_COOLDOWN:
+        return True
+    return num(result.get("best_score")) >= num(previous.get("score")) + ALERT_SCORE_IMPROVEMENT
+
+def _v71_mark_live_bridge(result):
+    key = f"{result.get('symbol')}_{result.get('direction')}"
+    V71_LIVE_BRIDGE_STATE[key] = {
+        "time": time.time(),
+        "score": num(result.get("best_score")),
+        "price": num(result.get("price")),
+    }
+
+def _v71_attach_live_context(result, trades):
+    """Attach Risk/Strategy context even when paper alert creation is blocked."""
+    if not isinstance(result.get("risk_challenger"), dict):
+        risk_shadow = _v681_evaluate_risk_challenger(result, trades)
+        risk_row_id = _v681_store_risk_decision(risk_shadow)
+        if risk_row_id:
+            risk_shadow["row_id"] = risk_row_id
+        result["risk_challenger"] = risk_shadow
+        print(
+            f"V6.8.1 RISK SHADOW: {result.get('symbol')} {result.get('direction')} "
+            f"→ {risk_shadow.get('decision')} ({num(risk_shadow.get('size_multiplier')):.1f}x)"
+            + (" — " + "; ".join(risk_shadow.get("reasons", [])[:2]) if risk_shadow.get("reasons") else "")
+        )
+    if not isinstance(result.get("strategy_ensemble"), dict):
+        strategy_shadow = _v69_evaluate_strategy_ensemble(result)
+        strategy_row_id = _v69_store_ensemble(result, strategy_shadow)
+        if strategy_row_id:
+            strategy_shadow["row_id"] = strategy_row_id
+        result["strategy_ensemble"] = strategy_shadow
+        print(
+            f"V6.9 STRATEGY SHADOW: {result.get('symbol')} {result.get('direction')} "
+            f"→ {strategy_shadow.get('consensus')} "
+            f"C/W/R {strategy_shadow.get('confirm_count', 0)}/"
+            f"{strategy_shadow.get('wait_count', 0)}/"
+            f"{strategy_shadow.get('reject_count', 0)}"
+        )
+    return result
+
+def _v71_live_stub_trade(result, source_key):
+    """Build a deterministic live-only identity when paper creation is suppressed."""
+    symbol = str(result.get("symbol") or "UNKNOWN")
+    direction = str(result.get("direction") or "UNKNOWN")
+    stable_key = str(source_key or _v68_signal_key(result))
+    digest = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:16]
+    return {
+        "signal_id": f"live_{digest}_{symbol}_{direction}",
+        "source_key": stable_key,
+        "symbol": symbol,
+        "direction": direction,
+        "score": num(result.get("best_score")),
+        "signal_time": time.time(),
+        "status": "LIVE_CANDIDATE",
+    }
+
+def _v71_execute_live_gate(result, trade, gate, bridge_mode=False):
+    """Run the live executor once and make ALLOW/SKIP outcomes auditable."""
+    if V70_LIVE is None:
+        return {"executed": False, "reason": "live module unavailable"}
+    try:
+        if gate.get("eligible"):
+            outcome = V70_LIVE.execute_signal(result, trade)
+            outcome = outcome if isinstance(outcome, dict) else {"executed": bool(outcome)}
+            print(
+                f"V7.1 LIVE SELECTOR: {result.get('symbol')} {result.get('direction')} "
+                f"ALLOW — selector={gate.get('selector_score')} "
+                f"bridge={'LIVE_ONLY' if bridge_mode else 'PAPER_CREATED'} "
+                f"executed={bool(outcome.get('executed'))} "
+                f"reason={outcome.get('reason') or 'submitted/confirmed'}"
+            )
+            return outcome
+        print(
+            f"V7.1 LIVE SELECTOR: {result.get('symbol')} {result.get('direction')} SKIP — "
+            + "; ".join(gate.get("reasons") or [])
+            + (" | bridge=LIVE_ONLY" if bridge_mode else "")
+        )
+        return {"executed": False, "reason": "; ".join(gate.get("reasons") or ["selector skip"])}
+    except Exception as error:
+        try:
+            V70_LIVE.halt(f"live hook exception: {type(error).__name__}: {error}")
+        except Exception:
+            pass
+        return {"executed": False, "reason": f"live hook exception: {type(error).__name__}: {error}"}
+
+def _v71_evaluate_live_without_paper(result, trades, source_key):
+    """Evaluate a durable Core ENTRY for live use even if paper ledger blocks it."""
+    _v71_settle_challenger(trades)
+    gate = _v71_live_candidate_gate(result, trades)
+    result["v70_live_gate"] = gate
+    trade = _v71_live_stub_trade(result, source_key)
+    _v71_store_challenger(trade, gate)
+    print(
+        f"V7.4.3 LIVE BRIDGE: {result.get('symbol')} {result.get('direction')} "
+        "evaluating despite existing paper trade on symbol"
+    )
+    return _v71_execute_live_gate(result, trade, gate, bridge_mode=True)
+
 def create_paper_trade(result, trades):
     _v71_settle_challenger(trades)
     gate=_v71_live_candidate_gate(result,trades)
     result["v70_live_gate"]=gate
     trade=_V70_PAPER_CREATE(result,trades)
     _v71_store_challenger(trade,gate)
-    if V70_LIVE is not None:
-        try:
-            if gate.get("eligible"):
-                V70_LIVE.execute_signal(result,trade)
-            else:
-                print(f"V7.1 LIVE SELECTOR: {result.get('symbol')} {result.get('direction')} SKIP — "+"; ".join(gate.get("reasons") or []))
-        except Exception as error:
-            try: V70_LIVE.halt(f"live hook exception: {type(error).__name__}: {error}")
-            except Exception: pass
+    _v71_execute_live_gate(result, trade, gate, bridge_mode=False)
     return trade
 
 # ============================================================
@@ -10402,7 +10538,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.3",
+                "version": "7.4.3-live-bridgefix",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
                 "v70_selective_gate": bool(V70_SELECTIVE_GATE),
@@ -10452,7 +10588,7 @@ if __name__ == "__main__":
     try:
         start_health_server()
         start_macro_news_thread()
-        print(f"[V7DIAG] integration hook reached; live_module_loaded={V70_LIVE is not None}", flush=True)
+        print(f"[V7DIAG] integration hook reached; main_version={globals().get('V743_BRIDGE_VERSION', 'pre-bridge')} live_module_loaded={V70_LIVE is not None}", flush=True)
         challenger_ok = _v71_init_challenger()
         print(f"[V7DIAG] V7.1 challenger init ready={challenger_ok} v68_db_ready={V68_DB_READY}", flush=True)
         if V70_LIVE is not None:
