@@ -12826,7 +12826,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.7.2-crypto-metals-optimizer-kill-switch",
+                "version": "7.8.0-adaptive-derisk-governor",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "equity_agent_ensemble": ("active" if V76_DB_READY else "disabled_or_unavailable"),
                 "equity_agents": list(V76_AGENT_NAMES),
@@ -12842,6 +12842,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 "v77_managed_exit_shadow": "25_25_50",
                 "v77_metals_context": "cross_metal_shadow",
                 "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
+                "adaptive_derisk_governor": bool(V70_LIVE is not None and getattr(V70_LIVE, "ADAPTIVE_DERISK_ENABLED", False)),
                 "v70_selective_gate": bool(V70_SELECTIVE_GATE),
                 "v70_same_symbol_cooldown_minutes": V70_SAME_SYMBOL_COOLDOWN_MINUTES,
                 "v71_selection_challenger": "active" if V71_CHALLENGER_DB_READY else "local_only",
