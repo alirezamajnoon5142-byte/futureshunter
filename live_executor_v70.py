@@ -717,6 +717,56 @@ def _partial_market_close(symbol, direction, position_id, close_vol, signal_id, 
     ok,detail=_wait_partial_close(symbol,direction,position_id,before,vol,oid)
     return (True,detail) if ok else (False,f"partial close unconfirmed; remaining={detail}")
 
+def emergency_close_symbol(symbol):
+    """Owner-triggered emergency close for exactly one actual MEXC symbol.
+
+    Exchange positions are authoritative. Other symbols are never submitted for close.
+    """
+    if not ENABLED:
+        return {"ok": False, "closed": False, "reason": "live pilot disabled"}
+    if DRY_RUN:
+        return {"ok": False, "closed": False, "reason": "dry-run write interlock active"}
+    if not ACCESS_KEY or not SECRET_KEY:
+        return {"ok": False, "closed": False, "reason": "MEXC credentials unavailable"}
+    target=str(symbol or "").strip().upper().replace("/", "_").replace("-", "_")
+    if target and "_" not in target:
+        target += "_USDT"
+    if not target:
+        return {"ok": False, "closed": False, "reason": "missing symbol"}
+    with _lock:
+        try:
+            ex=positions() or []
+            ex=[p for p in ex if isinstance(p,dict) and float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)>0]
+            matches=[p for p in ex if str(p.get("symbol") or p.get("contractCode") or "").upper()==target]
+            if not matches:
+                return {"ok": False, "closed": False, "symbol": target, "reason": "no open MEXC position for symbol"}
+            closed=[]; errors=[]; nonce=int(time.time()*1000)
+            for p in matches:
+                pid=int(p.get("positionId") or p.get("id") or 0)
+                vol=float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)
+                direction=_position_direction(p)
+                if pid<=0 or vol<=0 or direction not in {"LONG","SHORT"}:
+                    errors.append(f"unrecognized {target} position: id={pid} vol={vol} direction={direction}")
+                    continue
+                ok,detail=_partial_market_close(target,direction,pid,vol,f"KILLSYM_{pid}_{nonce}","K")
+                if ok: closed.append({"symbol":target,"direction":direction,"position_id":pid,"contracts":vol})
+                else: errors.append(f"{target} {direction}: {detail}")
+            remaining=[]
+            for _ in range(8):
+                now=positions() or []
+                remaining=[p for p in now if isinstance(p,dict) and str(p.get("symbol") or p.get("contractCode") or "").upper()==target and float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)>0]
+                if not remaining: break
+                time.sleep(0.5)
+            try: reconcile_once()
+            except Exception as e: errors.append(f"post-close reconcile: {type(e).__name__}: {e}")
+            done=not remaining
+            return {"ok": done and not errors, "closed": done, "symbol":target, "fills":closed,
+                    "remaining":[{"symbol":target,"contracts":float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)} for p in remaining],
+                    "errors":errors}
+        except Exception as e:
+            return {"ok":False,"closed":False,"symbol":target,"reason":f"{type(e).__name__}: {e}"}
+
+
 def emergency_flatten_all():
     """Owner-triggered emergency kill switch: flatten every actual MEXC position.
 

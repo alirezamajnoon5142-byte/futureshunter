@@ -12726,6 +12726,42 @@ def handle_telegram_command(chat_id, text):
     command=(parts or [""])[0].lower()
     if command in {"/optimizer","/v77","/portfolio","/paperopt","/cryptolab"}:
         send_to_chat(chat_id,_v77_optimizer_summary_text()); return
+    if command == "/close":
+        owner=_normalize_chat_id(TELEGRAM_CHAT_ID)
+        caller=_normalize_chat_id(chat_id)
+        if not owner or caller != owner:
+            send_to_chat(chat_id,"⛔ /close is restricted to the configured owner chat."); return
+        if V70_LIVE is None:
+            send_to_chat(chat_id,"⛔ Live executor unavailable; no order was sent."); return
+        if len(parts) < 2:
+            send_to_chat(chat_id,"Usage: /close SYMBOL  (example: /close HBAR_USDT)"); return
+        symbol=parts[1].upper().replace("/","_").replace("-","_")
+        if "_" not in symbol: symbol += "_USDT"
+        confirmed=len(parts) >= 3 and parts[2].upper() == "CONFIRM"
+        if not confirmed:
+            try:
+                snapshot=V70_LIVE.positions() or []
+                matches=[p for p in snapshot if isinstance(p,dict) and str(p.get("symbol") or p.get("contractCode") or "").upper()==symbol and float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)>0]
+                if not matches:
+                    send_to_chat(chat_id,f"ℹ️ No open MEXC position found for {symbol}. No order sent."); return
+                desc=", ".join(f"{str(p.get('symbol') or symbol)} {float(p.get('holdVol') or p.get('vol') or p.get('positionVol') or 0):g}" for p in matches)
+                send_to_chat(chat_id,f"⚠️ SINGLE-SYMBOL CLOSE\nTarget: {desc}\nOther symbols will be left untouched.\nNo order sent. To market-close this symbol, send exactly:\n/close {symbol} CONFIRM")
+            except Exception as e:
+                send_to_chat(chat_id,f"⛔ Could not verify MEXC position; no order sent: {type(e).__name__}: {e}")
+            return
+        send_to_chat(chat_id,f"🛑 Closing actual MEXC position for {symbol} only and verifying exchange state...")
+        result=V70_LIVE.emergency_close_symbol(symbol)
+        if result.get("closed"):
+            fills=result.get("fills") or []
+            desc=", ".join(f"{x.get('symbol')} {x.get('direction')} {x.get('contracts'):g}" for x in fills) or symbol
+            extra=("\nWarnings: "+"; ".join(result.get("errors") or [])) if result.get("errors") else ""
+            send_to_chat(chat_id,f"✅ {symbol} CLOSED — CONFIRMED BY MEXC\nClosed: {desc}\nOther symbols were not targeted.{extra}")
+        else:
+            rem=result.get("remaining") or []
+            remtxt=", ".join(f"{x.get('symbol')} {x.get('contracts'):g}" for x in rem) or "unknown"
+            why=result.get("reason") or "; ".join(result.get("errors") or []) or "unconfirmed close state"
+            send_to_chat(chat_id,f"🚨 {symbol} CLOSE NOT CONFIRMED\nRemaining: {remtxt}\nReason: {why}")
+        return
     if command == "/closeall":
         # Emergency live-trading kill switch: owner/admin only and two-step by design.
         owner=_normalize_chat_id(TELEGRAM_CHAT_ID)
