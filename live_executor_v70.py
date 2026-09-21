@@ -15,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.7.5-entry-protection-audit"
+V70_VERSION = "7.7.6-tick-tolerant-protection"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -955,31 +955,43 @@ def execute_signal(result, paper_trade=None):
 
 
 def _confirm_protection(symbol, position_id, stop, tp3):
-    """Verify the exchange TP/SL against MEXC-normalized tick values.
+    """Verify protection while tolerating MEXC's two valid price representations.
 
-    Strategy geometry can contain more precision than a contract accepts. The
-    order payload is rounded to priceUnit, so verification must compare against
-    the same normalized values or valid protection can be falsely rejected.
+    MEXC can preserve hidden precision on an attached TP/SL even when contract
+    metadata advertises a coarser priceUnit, while explicit stop-order writes are
+    tick-normalized. Accept either the supplied strategy value or its normalized
+    tick value, but only within half a contract tick.
     """
-    expected_stop=_mexc_price(symbol, stop)
-    expected_tp3=_mexc_price(symbol, tp3)
+    raw_stop=float(stop); raw_tp3=float(tp3)
+    normalized_stop=_mexc_price(symbol, raw_stop)
+    normalized_tp3=_mexc_price(symbol, raw_tp3)
+    c=contract(symbol)
+    tick=float(c.get("priceUnit") or 0)
+    if tick <= 0:
+        scale=c.get("priceScale")
+        tick=10.0 ** (-int(scale)) if scale is not None else 1e-8
+    tolerance=max(1e-10, tick*0.51)
     observed=[]
     for _ in range(4):
         try:
-            rows = open_stops(symbol)
+            rows=open_stops(symbol)
             observed=[]
             for x in rows:
-                if int(x.get("positionId") or 0) == int(position_id) and int(x.get("state") or 0) == 1:
+                if int(x.get("positionId") or 0)==int(position_id) and int(x.get("state") or 0)==1:
                     sl=float(x.get("stopLossPrice") or 0); tp=float(x.get("takeProfitPrice") or 0)
                     observed.append({"stop":sl,"tp3":tp,"id":int(x.get("id") or x.get("stopPlanOrderId") or 0)})
-                    if sl>0 and tp>0 and abs(sl-expected_stop) <= max(1e-10,abs(expected_stop)*1e-6) and abs(tp-expected_tp3) <= max(1e-10,abs(expected_tp3)*1e-6):
+                    stop_ok=sl>0 and min(abs(sl-raw_stop),abs(sl-normalized_stop)) <= tolerance
+                    tp_ok=tp>0 and min(abs(tp-raw_tp3),abs(tp-normalized_tp3)) <= tolerance
+                    if stop_ok and tp_ok:
                         return True
         except Exception as e:
             observed=[{"error":f"{type(e).__name__}: {e}"}]
         time.sleep(0.5)
     _diag(
         f"protection verify FAILED {symbol} position={position_id} "
-        f"expected_stop={expected_stop} expected_tp3={expected_tp3} observed={observed[:3]}"
+        f"raw_stop={raw_stop} normalized_stop={normalized_stop} "
+        f"raw_tp3={raw_tp3} normalized_tp3={normalized_tp3} "
+        f"tick={tick} tolerance={tolerance} observed={observed[:3]}"
     )
     return False
 
@@ -1334,7 +1346,17 @@ def reconcile_once():
     if not ENABLED: return
     with _lock:
         try:
-            halted,_=halt_status(); ex=positions(); dbrows=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts FROM fh_live_trades WHERE status='OPEN'""",fetch="all") or []
+            halted,_=halt_status(); ex=positions()
+            # Audit stale PROTECTING rows whose exchange position is already gone.
+            # This cleans up failed pre-live entries such as the SILVER protection case
+            # without changing or closing any currently open exchange position.
+            live_ids={int(x.get("positionId") or 0) for x in ex}
+            stale_protecting=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts FROM fh_live_trades WHERE status='PROTECTING' AND position_id IS NOT NULL""",fetch="all") or []
+            for stale_row in stale_protecting:
+                stale_pid=int(stale_row[3] or 0)
+                if stale_pid>0 and stale_pid not in live_ids:
+                    _settle_missing_position(stale_row)
+            dbrows=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts FROM fh_live_trades WHERE status='OPEN'""",fetch="all") or []
             exids={int(x.get("positionId") or 0):x for x in ex}; dbids={int(r[3] or 0):r for r in dbrows}
             unknown=[p for pid,p in exids.items() if pid not in dbids]
             if unknown:
@@ -1368,7 +1390,14 @@ def reconcile_once():
                         continue
                     tr=_db("SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s",(row[0],),"one")
                     if tr and not _confirm_protection(row[1],pid,float(tr[0]),float(tr[1])):
-                        _emergency_close(row[1],row[2],pid,float(p_after.get("holdVol") or row[4]),row[0]); halt(f"protection disappeared on {row[1]}; flattened")
+                        close_vol=float(p_after.get("holdVol") or p_after.get("vol") or p_after.get("positionVol") or row[4])
+                        close_ok,close_detail=_partial_market_close(row[1],row[2],pid,close_vol,row[0],"RX")
+                        if close_ok:
+                            _diag(f"RECONCILE EMERGENCY FLATTEN CONFIRMED {row[1]} position_id={pid} detail={close_detail}")
+                            halt(f"protection disappeared on {row[1]}; flattened")
+                        else:
+                            _diag(f"RECONCILE EMERGENCY FLATTEN UNCONFIRMED {row[1]} position_id={pid} detail={close_detail}")
+                            halt(f"protection disappeared on {row[1]}; emergency flatten UNCONFIRMED: {close_detail}")
                     continue
                 if not _settle_missing_position(row):
                     halt(f"exchange position disappeared but closure history is not yet auditable for {row[1]} position {pid}")
