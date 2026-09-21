@@ -15,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.7.7-entry-drift-stop-race-guard"
+V70_VERSION = "7.8.0-adaptive-derisk-governor"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -42,6 +42,24 @@ TP1_FRACTION = min(0.45, max(0.05, float(os.getenv("V70_TP1_FRACTION", "0.25")))
 TP2_FRACTION = min(0.45, max(0.05, float(os.getenv("V70_TP2_FRACTION", "0.25"))))
 BE_BUFFER_BPS = min(50.0, max(0.0, float(os.getenv("V70_BE_BUFFER_BPS", "10"))))
 TP2_LOCK_R = min(1.5, max(0.0, float(os.getenv("V70_TP2_LOCK_R", "1.0"))))
+
+# Adaptive de-risk governor. It never adds exposure or widens a stop.
+# Stage 1: after +0.50R MFE and >=0.30R giveback, reduce remaining downside to -0.40R.
+# Stage 2: after +0.75R MFE and >=0.35R giveback while still >=+0.15R,
+#          bank the existing TP1 slice (normally 25%) and ratchet the rest to BE.
+# Stage 3: after +1.00R MFE and >=0.30R giveback while still >=+0.25R,
+#          ratchet the remaining stop to +0.15R. TP2/TP3 runners remain intact.
+ADAPTIVE_DERISK_ENABLED = os.getenv("V70_ADAPTIVE_DERISK_ENABLED", "true").lower() == "true"
+ADAPTIVE_SOFT_MFE_R = min(2.0, max(0.10, float(os.getenv("V70_ADAPTIVE_SOFT_MFE_R", "0.50"))))
+ADAPTIVE_SOFT_GIVEBACK_R = min(1.5, max(0.05, float(os.getenv("V70_ADAPTIVE_SOFT_GIVEBACK_R", "0.30"))))
+ADAPTIVE_SOFT_STOP_R = min(0.0, max(-0.90, float(os.getenv("V70_ADAPTIVE_SOFT_STOP_R", "-0.40"))))
+ADAPTIVE_BANK_MFE_R = min(3.0, max(ADAPTIVE_SOFT_MFE_R, float(os.getenv("V70_ADAPTIVE_BANK_MFE_R", "0.75"))))
+ADAPTIVE_BANK_GIVEBACK_R = min(1.5, max(0.05, float(os.getenv("V70_ADAPTIVE_BANK_GIVEBACK_R", "0.35"))))
+ADAPTIVE_BANK_MIN_CURRENT_R = min(1.0, max(0.0, float(os.getenv("V70_ADAPTIVE_BANK_MIN_CURRENT_R", "0.15"))))
+ADAPTIVE_LOCK_MFE_R = min(4.0, max(ADAPTIVE_BANK_MFE_R, float(os.getenv("V70_ADAPTIVE_LOCK_MFE_R", "1.00"))))
+ADAPTIVE_LOCK_GIVEBACK_R = min(1.5, max(0.05, float(os.getenv("V70_ADAPTIVE_LOCK_GIVEBACK_R", "0.30"))))
+ADAPTIVE_LOCK_MIN_CURRENT_R = min(2.0, max(0.0, float(os.getenv("V70_ADAPTIVE_LOCK_MIN_CURRENT_R", "0.25"))))
+ADAPTIVE_LOCK_R = min(0.75, max(0.0, float(os.getenv("V70_ADAPTIVE_LOCK_R", "0.15"))))
 
 _lock = threading.RLock()
 _halted_memory = False
@@ -77,6 +95,16 @@ def diagnostic_state():
         "tp2_fraction": TP2_FRACTION,
         "be_buffer_bps": BE_BUFFER_BPS,
         "tp2_lock_r": TP2_LOCK_R,
+        "adaptive_derisk_enabled": ADAPTIVE_DERISK_ENABLED,
+        "adaptive_soft_mfe_r": ADAPTIVE_SOFT_MFE_R,
+        "adaptive_soft_giveback_r": ADAPTIVE_SOFT_GIVEBACK_R,
+        "adaptive_soft_stop_r": ADAPTIVE_SOFT_STOP_R,
+        "adaptive_bank_mfe_r": ADAPTIVE_BANK_MFE_R,
+        "adaptive_bank_giveback_r": ADAPTIVE_BANK_GIVEBACK_R,
+        "adaptive_bank_min_current_r": ADAPTIVE_BANK_MIN_CURRENT_R,
+        "adaptive_lock_mfe_r": ADAPTIVE_LOCK_MFE_R,
+        "adaptive_lock_giveback_r": ADAPTIVE_LOCK_GIVEBACK_R,
+        "adaptive_lock_r": ADAPTIVE_LOCK_R,
     }
 
 
@@ -153,6 +181,9 @@ def init_db():
       initial_stop_price DOUBLE PRECISION, managed_stop_price DOUBLE PRECISION,
       tp1_vol DOUBLE PRECISION, tp2_vol DOUBLE PRECISION, tp1_done BOOLEAN NOT NULL DEFAULT FALSE, tp2_done BOOLEAN NOT NULL DEFAULT FALSE,
       tp1_time TIMESTAMPTZ, tp2_time TIMESTAMPTZ, management_stage TEXT NOT NULL DEFAULT 'INITIAL',
+      peak_favorable_r DOUBLE PRECISION NOT NULL DEFAULT 0,
+      adaptive_derisk_stage TEXT NOT NULL DEFAULT 'NONE',
+      adaptive_derisk_time TIMESTAMPTZ,
       actual_entry DOUBLE PRECISION, actual_exit DOUBLE PRECISION, slippage_usdt DOUBLE PRECISION,
       slippage_bps DOUBLE PRECISION, entry_fee DOUBLE PRECISION DEFAULT 0, exit_fee DOUBLE PRECISION DEFAULT 0,
       funding DOUBLE PRECISION DEFAULT 0, gross_pnl DOUBLE PRECISION, net_pnl DOUBLE PRECISION,
@@ -172,6 +203,9 @@ def init_db():
         "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp1_time TIMESTAMPTZ",
         "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS tp2_time TIMESTAMPTZ",
         "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS management_stage TEXT NOT NULL DEFAULT 'INITIAL'",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS peak_favorable_r DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS adaptive_derisk_stage TEXT NOT NULL DEFAULT 'NONE'",
+        "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS adaptive_derisk_time TIMESTAMPTZ",
         "ALTER TABLE fh_live_trades ADD COLUMN IF NOT EXISTS expiry_ts TIMESTAMPTZ",
     ):
         _db(ddl)
@@ -1238,6 +1272,126 @@ def _change_position_protection(symbol, position_id, new_stop, tp3):
         return True, stop_id
     return False, "updated TP/SL not confirmed"
 
+def _trade_r(direction, price, entry, risk):
+    if entry <= 0 or risk <= 0 or price <= 0:
+        return 0.0
+    sign=1.0 if str(direction).upper()=="LONG" else -1.0
+    return sign*(float(price)-float(entry))/float(risk)
+
+def _price_at_r(direction, entry, risk, r_value):
+    sign=1.0 if str(direction).upper()=="LONG" else -1.0
+    return float(entry)+sign*float(r_value)*float(risk)
+
+def _stop_is_tighter(direction, current_stop, candidate_stop):
+    current=float(current_stop or 0); candidate=float(candidate_stop or 0)
+    if candidate <= 0:
+        return False
+    if current <= 0:
+        return True
+    return candidate > current + 1e-12 if str(direction).upper()=="LONG" else candidate < current - 1e-12
+
+def _adaptive_derisk(row, targets, px, tp1_vol):
+    """Protect earned excursion without converting the strategy into a scalper.
+
+    Returns True when an action was taken (or a safety failure was handled), so
+    the caller waits until the next reconciliation pass before doing anything else.
+    The governor can only reduce size or tighten protection; it never adds exposure
+    and never widens a stop.
+    """
+    if not ADAPTIVE_DERISK_ENABLED:
+        return False
+    signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop,initial_stop,tp1,tp2,tp3,tp1_vol_db,tp2_vol,tp1_done,tp2_done,management_stage,*extra=row
+    stored_peak=float(extra[1] or 0.0) if len(extra)>1 else 0.0
+    adaptive_stage=str(extra[2] or "NONE").upper() if len(extra)>2 else "NONE"
+    current_r=_trade_r(direction,px,targets["entry"],targets["risk"])
+    peak_r=max(stored_peak,current_r)
+    if peak_r > stored_peak + 1e-9:
+        _db("UPDATE fh_live_trades SET peak_favorable_r=%s,updated_at=NOW() WHERE signal_id=%s",(peak_r,signal_id))
+    giveback=max(0.0,peak_r-current_r)
+    current_stop=float(managed_stop or initial_stop or 0)
+
+    # Stage 1: the trade has proven itself but is giving back. Keep the whole
+    # position, merely compress remaining downside from -1R toward -0.40R.
+    if (not tp1_done and adaptive_stage=="NONE"
+            and peak_r >= ADAPTIVE_SOFT_MFE_R
+            and giveback >= ADAPTIVE_SOFT_GIVEBACK_R):
+        candidate=_price_at_r(direction,targets["entry"],targets["risk"],ADAPTIVE_SOFT_STOP_R)
+        if _stop_is_tighter(direction,current_stop,candidate):
+            ok,detail=_change_position_protection(symbol,position_id,candidate,targets["tp3"])
+            if not ok:
+                pnow=_active_position(symbol,position_id)
+                if pnow:
+                    _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
+                halt(f"adaptive soft de-risk ratchet was not confirmed on {symbol}: {detail}; remaining position flattened")
+                return True
+            _db("""UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,
+                   adaptive_derisk_stage='SOFT_RISK_REDUCED',adaptive_derisk_time=NOW(),
+                   updated_at=NOW() WHERE signal_id=%s""",(candidate,candidate,signal_id))
+            _diag(f"ADAPTIVE DERISK SOFT {symbol} peak={peak_r:.2f}R current={current_r:.2f}R giveback={giveback:.2f}R stop={candidate:.12g}")
+            _msg(f"🛡️ V7.8 ADAPTIVE DE-RISK\n{symbol} {direction} | MFE {peak_r:.2f}R → now {current_r:.2f}R\nNo size cut. Remaining stop tightened to {ADAPTIVE_SOFT_STOP_R:+.2f}R ({candidate:.10g}).")
+            return True
+
+    # Stage 2: meaningful MFE + meaningful giveback while the trade is still
+    # profitable. Bank only the existing TP1 slice; preserve the other ~75%.
+    if (not tp1_done
+            and peak_r >= ADAPTIVE_BANK_MFE_R
+            and giveback >= ADAPTIVE_BANK_GIVEBACK_R
+            and current_r >= ADAPTIVE_BANK_MIN_CURRENT_R):
+        close_vol=float(tp1_vol or tp1_vol_db or 0)
+        if close_vol > 0:
+            ok,detail=_partial_market_close(symbol,direction,position_id,close_vol,signal_id,"AD1")
+            if not ok:
+                if "position no longer open" in str(detail).lower() or "code=2009" in str(detail).lower():
+                    return True
+                halt(f"adaptive 25% bank failed/unconfirmed on {symbol}: {detail}")
+                return True
+            _db("""UPDATE fh_live_trades SET tp1_done=TRUE,tp1_time=NOW(),
+                   management_stage='ADAPTIVE_P1_FILLED',
+                   adaptive_derisk_stage='BANKED_25',adaptive_derisk_time=NOW(),
+                   updated_at=NOW() WHERE signal_id=%s""",(signal_id,))
+            pnow=_active_position(symbol,position_id)
+            if not pnow:
+                return True
+            ok2,detail2=_change_position_protection(symbol,position_id,targets["be"],targets["tp3"])
+            if not ok2:
+                pnow=_active_position(symbol,position_id)
+                if pnow:
+                    _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
+                halt(f"adaptive 25% bank filled on {symbol} but breakeven ratchet was not confirmed: {detail2}; remaining position flattened")
+                return True
+            _db("""UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,
+                   management_stage='TP1_LOCKED',updated_at=NOW()
+                   WHERE signal_id=%s""",(targets["be"],targets["be"],signal_id))
+            _diag(f"ADAPTIVE DERISK BANK25 {symbol} peak={peak_r:.2f}R current={current_r:.2f}R giveback={giveback:.2f}R vol={close_vol:g}")
+            _msg(f"💵 V7.8 ADAPTIVE 25% BANK\n{symbol} {direction} | MFE {peak_r:.2f}R → now {current_r:.2f}R\nClosed {close_vol:g} contracts; ~75% runner preserved. Remaining stop → breakeven zone {targets['be']:.10g}; TP2/TP3 stay live.")
+            return True
+
+    # Stage 3: after a >=1R excursion, a material pullback should not be allowed
+    # to turn the remainder into a loser. Lock a modest positive R, but only
+    # while current price is still comfortably above the proposed stop.
+    if (tp1_done
+            and adaptive_stage!="LOCKED_POSITIVE"
+            and peak_r >= ADAPTIVE_LOCK_MFE_R
+            and giveback >= ADAPTIVE_LOCK_GIVEBACK_R
+            and current_r >= ADAPTIVE_LOCK_MIN_CURRENT_R):
+        candidate=_price_at_r(direction,targets["entry"],targets["risk"],ADAPTIVE_LOCK_R)
+        if _stop_is_tighter(direction,current_stop,candidate):
+            ok,detail=_change_position_protection(symbol,position_id,candidate,targets["tp3"])
+            if not ok:
+                pnow=_active_position(symbol,position_id)
+                if pnow:
+                    _emergency_close(symbol,direction,position_id,float(pnow.get("holdVol") or 0),signal_id)
+                halt(f"adaptive positive-R ratchet was not confirmed on {symbol}: {detail}; remaining position flattened")
+                return True
+            _db("""UPDATE fh_live_trades SET stop_price=%s,managed_stop_price=%s,
+                   adaptive_derisk_stage='LOCKED_POSITIVE',adaptive_derisk_time=NOW(),
+                   updated_at=NOW() WHERE signal_id=%s""",(candidate,candidate,signal_id))
+            _diag(f"ADAPTIVE DERISK LOCK {symbol} peak={peak_r:.2f}R current={current_r:.2f}R giveback={giveback:.2f}R stop={candidate:.12g}")
+            _msg(f"🔒 V7.8 POSITIVE-R LOCK\n{symbol} {direction} | MFE {peak_r:.2f}R → now {current_r:.2f}R\nRunner preserved; remaining stop tightened to +{ADAPTIVE_LOCK_R:.2f}R ({candidate:.10g}).")
+            return True
+    return False
+
+
 def _management_targets(row):
     # row layout is documented in reconcile_once below. Backfill older rows defensively.
     direction=row[2]; actual_entry=float(row[7] or row[6] or 0); initial_stop=float(row[11] or row[10] or 0)
@@ -1276,6 +1430,8 @@ def _manage_open_trade(row, exchange_pos):
         tp1_vol,tp2_vol,_=split
         _db("UPDATE fh_live_trades SET tp1_vol=%s,tp2_vol=%s,updated_at=NOW() WHERE signal_id=%s",(tp1_vol,tp2_vol,signal_id))
     px=_fair_price(symbol)
+    if _adaptive_derisk(row,targets,px,tp1_vol):
+        return
     if not tp1_done and _target_reached(direction,px,targets["tp1"]):
         ok,detail=_partial_market_close(symbol,direction,position_id,float(tp1_vol),signal_id,"P1")
         if not ok:
@@ -1415,12 +1571,12 @@ def reconcile_once():
             # This cleans up failed pre-live entries such as the SILVER protection case
             # without changing or closing any currently open exchange position.
             live_ids={int(x.get("positionId") or 0) for x in ex}
-            stale_protecting=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts FROM fh_live_trades WHERE status='PROTECTING' AND position_id IS NOT NULL""",fetch="all") or []
+            stale_protecting=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts,peak_favorable_r,adaptive_derisk_stage FROM fh_live_trades WHERE status='PROTECTING' AND position_id IS NOT NULL""",fetch="all") or []
             for stale_row in stale_protecting:
                 stale_pid=int(stale_row[3] or 0)
                 if stale_pid>0 and stale_pid not in live_ids:
                     _settle_missing_position(stale_row)
-            dbrows=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts FROM fh_live_trades WHERE status='OPEN'""",fetch="all") or []
+            dbrows=_db("""SELECT signal_id,symbol,direction,position_id,contracts,contract_size,paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,tp1_done,tp2_done,management_stage,expiry_ts,peak_favorable_r,adaptive_derisk_stage FROM fh_live_trades WHERE status='OPEN'""",fetch="all") or []
             exids={int(x.get("positionId") or 0):x for x in ex}; dbids={int(r[3] or 0):r for r in dbrows}
             unknown=[p for pid,p in exids.items() if pid not in dbids]
             if unknown:
@@ -1577,7 +1733,8 @@ def live_position_text():
 
         dbrows = _db("""SELECT signal_id,symbol,direction,status,actual_entry,contracts,leverage,
                                stop_price,tp1_price,tp2_price,tp3_price,protection_confirmed,opened_at,
-                               tp1_done,tp2_done,management_stage,tp1_vol,tp2_vol
+                               tp1_done,tp2_done,management_stage,tp1_vol,tp2_vol,
+                               peak_favorable_r,adaptive_derisk_stage
                         FROM fh_live_trades WHERE status IN ('SUBMITTING','ENTRY_SENT','PROTECTING','OPEN')
                         ORDER BY updated_at DESC LIMIT 5""", fetch="all") or []
 
@@ -1600,8 +1757,8 @@ def live_position_text():
             lines.append("Ledger active rows:")
             for r in dbrows:
                 # psycopg rows are tuples in this module
-                sig,sym,direction,status,entry,contracts,lev,stop,tp1,tp2,tp3,protected,opened,p1,p2,stage,v1,v2 = r
-                lines.append(f"• {sym} {direction} | {status} | entry={entry or '?'} | contracts={contracts or '?'} | {lev or '?'}x | STOP={stop or '?'} | TP1={tp1 or '?'} ({'DONE' if p1 else v1 or '?'}) | TP2={tp2 or '?'} ({'DONE' if p2 else v2 or '?'}) | TP3={tp3 or '?'} | stage={stage or '?'} | protected={'YES' if protected else 'NO'}")
+                sig,sym,direction,status,entry,contracts,lev,stop,tp1,tp2,tp3,protected,opened,p1,p2,stage,v1,v2,peak_r,ad_stage = r
+                lines.append(f"• {sym} {direction} | {status} | entry={entry or '?'} | contracts={contracts or '?'} | {lev or '?'}x | STOP={stop or '?'} | TP1={tp1 or '?'} ({'DONE' if p1 else v1 or '?'}) | TP2={tp2 or '?'} ({'DONE' if p2 else v2 or '?'}) | TP3={tp3 or '?'} | stage={stage or '?'} | MFE={float(peak_r or 0):.2f}R | derisk={ad_stage or 'NONE'} | protected={'YES' if protected else 'NO'}")
         else:
             lines.append("Ledger active rows: 0")
 
