@@ -12826,7 +12826,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.8.0-adaptive-derisk-governor",
+                "version": "7.8.1-oid-safe-adaptive-recovery",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "equity_agent_ensemble": ("active" if V76_DB_READY else "disabled_or_unavailable"),
                 "equity_agents": list(V76_AGENT_NAMES),
