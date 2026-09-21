@@ -689,14 +689,14 @@ def _three_way_split(contracts, step, min_vol):
     return None
 
 def _oid(signal_id, suffix="E"):
-    """Deterministic MEXC externalOid capped at the exchange's 32-char limit."""
-    prefix=f"fh70_{str(suffix or 'E').lower()}_"
-    budget=max(8, 32-len(prefix))
-    digest=hashlib.sha1(f"{signal_id}|{suffix}".encode()).hexdigest()[:budget]
-    oid=f"{prefix}{digest}"
-    if len(oid) > 32:
-        oid=oid[:32]
-    return oid
+    """Deterministic MEXC externalOid capped at 32 chars without changing legacy IDs."""
+    raw_suffix=str(suffix or "E").lower()
+    safe_suffix="".join(ch for ch in raw_suffix if ch.isalnum())[:6] or "e"
+    prefix=f"fh70_{safe_suffix}_"
+    # Legacy E/P1/etc. used 24 hex chars; preserve those exactly whenever they fit.
+    digest_len=max(1,min(24,32-len(prefix)))
+    digest=hashlib.sha1(f"{signal_id}|{suffix}".encode()).hexdigest()[:digest_len]
+    return f"{prefix}{digest}"
 
 
 def _daily_net_loss():
