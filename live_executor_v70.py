@@ -15,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.7.4-stale-protection-recovery"
+V70_VERSION = "7.7.5-entry-protection-audit"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -377,6 +377,108 @@ def _clear_flattened_protection_halt_after_success(exchange_positions, dbrows):
         f"{failed_symbol} protection failure is fully contained; the failed position "
         "is flat/audited and every remaining live position has verified exchange protection. "
         "Live gate restored."
+    )
+    return True
+
+
+def _clear_failed_entry_protection_halt_after_success(exchange_positions, dbrows):
+    """Recover only a contained entry-protection failure after a fresh audit.
+
+    The failed symbol must be flat, its transient ledger row must be auditable as
+    CLOSED, every remaining exchange position must be ledger-owned/protected, and
+    account breakers must remain healthy. An unconfirmed flatten never auto-clears.
+    """
+    global _halted_memory, _halt_reason
+    halted, reason = halt_status()
+    r = str(reason or "")
+    if not halted or "emergency flatten UNCONFIRMED" in r:
+        return False
+    import re
+    m = re.match(
+        r"^protective stop/TP3 could not be confirmed for ([A-Z0-9_]+); position flattened$",
+        r.strip(),
+        re.I,
+    )
+    if not m:
+        return False
+    failed_symbol=m.group(1).upper()
+
+    live_positions=[
+        p for p in (exchange_positions or [])
+        if float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)>0
+    ]
+    live_symbols={
+        str(p.get("symbol") or p.get("contractCode") or "").upper()
+        for p in live_positions
+    }
+    if failed_symbol in live_symbols:
+        return False
+
+    pending=_db(
+        """SELECT signal_id,symbol,direction,position_id,contracts,contract_size,
+                  paper_entry,actual_entry,stop_pct,opened_at,managed_stop_price,
+                  initial_stop_price,tp1_price,tp2_price,tp3_price,tp1_vol,tp2_vol,
+                  tp1_done,tp2_done,management_stage,expiry_ts
+           FROM fh_live_trades
+           WHERE UPPER(symbol)=UPPER(%s)
+             AND status IN ('SUBMITTING','ENTRY_SENT','PROTECTING')
+           ORDER BY updated_at DESC""",
+        (failed_symbol,),
+        "all",
+    ) or []
+    for rw in pending:
+        pid=int(rw[3] or 0)
+        if pid <= 0 or not _settle_missing_position(rw):
+            return False
+
+    still_pending=_db(
+        """SELECT COUNT(*) FROM fh_live_trades
+           WHERE UPPER(symbol)=UPPER(%s)
+             AND status IN ('SUBMITTING','ENTRY_SENT','PROTECTING','OPEN')""",
+        (failed_symbol,),
+        "one",
+    ) or (0,)
+    if int(still_pending[0] or 0) != 0:
+        return False
+
+    by_pid={int(rw[3] or 0):rw for rw in (dbrows or [])}
+    for p in live_positions:
+        pid=int(p.get("positionId") or p.get("id") or 0)
+        rw=by_pid.get(pid)
+        if not rw:
+            return False
+        tr=_db(
+            "SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s",
+            (rw[0],),
+            "one",
+        )
+        if not tr or not _confirm_protection(rw[1],pid,float(tr[0]),float(tr[1])):
+            return False
+
+    current_asset=asset()
+    limits=_dynamic_limits(current_asset)
+    if limits["equity"] < limits["equity_kill"]:
+        halt(f"equity kill-switch: {limits['equity']:.4f} < {limits['equity_kill']:.2f} USDT")
+        return False
+    daily_loss=_daily_net_loss()
+    if daily_loss >= limits["daily_loss_limit"]:
+        halt(f"daily loss breaker reached: {daily_loss:.4f} USDT")
+        return False
+
+    _halted_memory=False
+    _halt_reason=""
+    _state_set(
+        "v70_halt",
+        {"halted":False,"reason":"","recovered_from":r[:500],"ts":time.time()},
+    )
+    _diag(
+        f"auto-cleared contained entry-protection HALT after {failed_symbol} "
+        "was flat/audited and all remaining protection verified"
+    )
+    _msg(
+        f"✅ FUTURESHUNTER V7 LIVE RECOVERED\n"
+        f"{failed_symbol} never reached protected-live state. Its emergency close "
+        "is audited, the symbol is flat, and all remaining live positions are protected."
     )
     return True
 
@@ -763,9 +865,15 @@ def execute_signal(result, paper_trade=None):
             ledger_payload["expiryTs"] = expiry_ts.isoformat()
         _db("""INSERT INTO fh_live_trades(signal_id,symbol,direction,status,external_oid,paper_entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop_price,tp1_price,tp2_price,tp3_price,initial_stop_price,managed_stop_price,tp1_vol,tp2_vol,stop_pct,management_stage,expiry_ts,payload) VALUES(%s,%s,%s,'SUBMITTING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INITIAL',%s,%s)""",
             (signal_id,symbol,direction,oid,entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop,tp1,tp2,tp3,stop,stop,tp1_vol,tp2_vol,stop_pct,expiry_ts,Jsonb(ledger_payload) if Jsonb else json.dumps(ledger_payload)))
+        _diag(
+            f"LIVE ENTRY SUBMITTING {symbol} {direction} signal={signal_id} "
+            f"entry={entry}->{entry_api} contracts={contracts}->{contracts_api} "
+            f"stop={stop}->{stop_api} tp3={tp3}->{tp3_api}"
+        )
         try:
             created = _signed("POST", "/api/v1/private/order/create", payload)
             order_id = str(created.get("orderId"))
+            _diag(f"LIVE ENTRY ACCEPTED {symbol} signal={signal_id} order_id={order_id}")
             _db("UPDATE fh_live_trades SET status='ENTRY_SENT',entry_order_id=%s,updated_at=NOW() WHERE signal_id=%s", (order_id,signal_id))
             deadline = time.time()+FILL_TIMEOUT; order=None
             while time.time() < deadline:
@@ -782,18 +890,55 @@ def execute_signal(result, paper_trade=None):
             fill = float(order.get("dealAvgPrice") or 0); position_id = int(order.get("positionId") or 0)
             if fill <= 0 or position_id <= 0:
                 halt(f"filled order missing fill/position id for {symbol}"); return {"executed": False, "reason": "bad fill response"}
+            _diag(
+                f"LIVE ENTRY FILLED {symbol} {direction} signal={signal_id} "
+                f"position_id={position_id} fill={fill} contracts={contracts_api}"
+            )
+            _msg(
+                f"🟠 V7 LIVE ENTRY FILLED — PROTECTION PENDING\n"
+                f"{symbol} {direction}\nFill: {fill} | Position ID: {position_id}\n"
+                f"Verifying stop {stop_api} and TP3 {tp3_api} before declaring the trade live."
+            )
             fee = abs(float(order.get("totalFee") or 0) or (float(order.get("takerFee") or 0)+float(order.get("makerFee") or 0)))
             slip = (fill-entry) * contracts * contract_size * (1 if direction=="LONG" else -1)
             slip_bps = ((fill-entry)/entry*10000.0) * (1 if direction=="LONG" else -1)
             _db("""UPDATE fh_live_trades SET status='PROTECTING',position_id=%s,actual_entry=%s,entry_fee=%s,slippage_usdt=%s,slippage_bps=%s,opened_at=NOW(),updated_at=NOW() WHERE signal_id=%s""", (position_id,fill,fee,slip,slip_bps,signal_id))
-            if not _confirm_protection(symbol, position_id, stop, tp3):
+            protected=_confirm_protection(symbol, position_id, stop_api, tp3_api)
+            if not protected:
                 # Attached TP/SL may take a moment to materialize; place explicit position TP/SL once.
-                _signed("POST", "/api/v1/private/stoporder/place", {"lossTrend":2,"profitTrend":2,"positionId":position_id,"vol":_mexc_vol(symbol, contracts),"stopLossPrice":_mexc_price(symbol, stop),"takeProfitPrice":_mexc_price(symbol, tp3),"priceProtect":0,"profitLossVolType":"SAME","volType":2,"takeProfitType":0,"takeProfitOrderPrice":0,"stopLossType":0,"stopLossOrderPrice":0})
+                _diag(
+                    f"LIVE PROTECTION ATTACHED CHECK MISS {symbol} position_id={position_id}; "
+                    f"placing explicit stop={stop_api} tp3={tp3_api}"
+                )
+                _signed("POST", "/api/v1/private/stoporder/place", {"lossTrend":2,"profitTrend":2,"positionId":position_id,"vol":contracts_api,"stopLossPrice":stop_api,"takeProfitPrice":tp3_api,"priceProtect":0,"profitLossVolType":"SAME","volType":2,"takeProfitType":0,"takeProfitOrderPrice":0,"stopLossType":0,"stopLossOrderPrice":0})
                 time.sleep(1.0)
-            if not _confirm_protection(symbol, position_id, stop, tp3):
-                _emergency_close(symbol, direction, position_id, contracts, signal_id)
-                halt(f"protective stop/TP3 could not be confirmed for {symbol}; position flattened")
-                return {"executed": False, "reason": "protection failed; flattened"}
+                protected=_confirm_protection(symbol, position_id, stop_api, tp3_api)
+            if not protected:
+                _diag(
+                    f"LIVE PROTECTION FAILED {symbol} position_id={position_id}; "
+                    "starting confirmed emergency flatten"
+                )
+                pnow=_active_position(symbol, position_id)
+                if pnow:
+                    close_vol=float(pnow.get("holdVol") or pnow.get("vol") or pnow.get("positionVol") or contracts)
+                    close_ok,close_detail=_partial_market_close(symbol,direction,position_id,close_vol,signal_id,"PX")
+                else:
+                    close_ok,close_detail=True,"position already absent"
+                if close_ok:
+                    _diag(f"LIVE EMERGENCY FLATTEN CONFIRMED {symbol} position_id={position_id} detail={close_detail}")
+                    reason=f"protective stop/TP3 could not be confirmed for {symbol}; position flattened"
+                    _db("UPDATE fh_live_trades SET protection_confirmed=FALSE,halt_reason=%s,updated_at=NOW() WHERE signal_id=%s",(reason,signal_id))
+                    halt(reason)
+                    return {"executed": False, "reason": "protection failed; flatten confirmed"}
+                reason=f"protective stop/TP3 could not be confirmed for {symbol}; emergency flatten UNCONFIRMED: {close_detail}"
+                _diag(f"LIVE EMERGENCY FLATTEN UNCONFIRMED {symbol} position_id={position_id} detail={close_detail}")
+                _db("UPDATE fh_live_trades SET protection_confirmed=FALSE,halt_reason=%s,updated_at=NOW() WHERE signal_id=%s",(reason,signal_id))
+                halt(reason)
+                return {"executed": False, "reason": "protection failed; flatten unconfirmed"}
+            _diag(
+                f"LIVE PROTECTION CONFIRMED {symbol} position_id={position_id} "
+                f"stop={stop_api} tp3={tp3_api}"
+            )
             _db("UPDATE fh_live_trades SET status='OPEN',protection_confirmed=TRUE,updated_at=NOW() WHERE signal_id=%s", (signal_id,))
             _msg(f"🔴 V7.0 LIVE PILOT OPEN\n{symbol} {direction}\nFill: {fill}\nNotional: {actual_notional:.2f} USDT | Risk: {actual_risk:.3f} USDT ({effective_risk_pct*100:.2f}% cap) | {leverage}x isolated\nStop: {stop} | TP1: {tp1} ({tp1_vol:g}) | TP2: {tp2} ({tp2_vol:g}) | TP3: {tp3} ({tp3_vol:g})\nManager: {'25/25/50 preferred' if MULTI_TP_ENABLED else 'disabled'} | Protection: CONFIRMED")
             return {"executed": True, "signal_id": signal_id, "fill": fill, "position_id": position_id}
@@ -810,15 +955,32 @@ def execute_signal(result, paper_trade=None):
 
 
 def _confirm_protection(symbol, position_id, stop, tp3):
+    """Verify the exchange TP/SL against MEXC-normalized tick values.
+
+    Strategy geometry can contain more precision than a contract accepts. The
+    order payload is rounded to priceUnit, so verification must compare against
+    the same normalized values or valid protection can be falsely rejected.
+    """
+    expected_stop=_mexc_price(symbol, stop)
+    expected_tp3=_mexc_price(symbol, tp3)
+    observed=[]
     for _ in range(4):
         try:
             rows = open_stops(symbol)
+            observed=[]
             for x in rows:
                 if int(x.get("positionId") or 0) == int(position_id) and int(x.get("state") or 0) == 1:
                     sl=float(x.get("stopLossPrice") or 0); tp=float(x.get("takeProfitPrice") or 0)
-                    if sl>0 and tp>0 and abs(sl-stop) <= max(1e-10,abs(stop)*1e-6) and abs(tp-tp3) <= max(1e-10,abs(tp3)*1e-6): return True
-        except Exception: pass
+                    observed.append({"stop":sl,"tp3":tp,"id":int(x.get("id") or x.get("stopPlanOrderId") or 0)})
+                    if sl>0 and tp>0 and abs(sl-expected_stop) <= max(1e-10,abs(expected_stop)*1e-6) and abs(tp-expected_tp3) <= max(1e-10,abs(expected_tp3)*1e-6):
+                        return True
+        except Exception as e:
+            observed=[{"error":f"{type(e).__name__}: {e}"}]
         time.sleep(0.5)
+    _diag(
+        f"protection verify FAILED {symbol} position={position_id} "
+        f"expected_stop={expected_stop} expected_tp3={expected_tp3} observed={observed[:3]}"
+    )
     return False
 
 
@@ -1220,6 +1382,7 @@ def reconcile_once():
             _clear_closed_position_race_halt_after_success()
             _clear_verified_ratchet_halt_after_success(ex, dbrows)
             _clear_flattened_protection_halt_after_success(ex, dbrows)
+            _clear_failed_entry_protection_halt_after_success(ex, dbrows)
         except Exception as e:
             halt(f"reconciliation failure: {type(e).__name__}: {e}")
 
