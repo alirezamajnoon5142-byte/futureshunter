@@ -695,15 +695,47 @@ def execute_signal(result, paper_trade=None):
             return {"executed": False, "reason": str(e)}
 
 
+def _price_unit(symbol):
+    """Return MEXC's authoritative price tick for this contract; never guess decimals."""
+    c = contract(symbol)
+    raw = c.get("priceUnit")
+    if raw is None:
+        raise RuntimeError(f"contract metadata missing priceUnit for {symbol}")
+    unit = float(raw)
+    if unit <= 0:
+        raise RuntimeError(f"invalid priceUnit={raw!r} for {symbol}")
+    return unit
+
+def _quantize_price(symbol, value):
+    """Snap a price to the live contract priceUnit using decimal arithmetic."""
+    from decimal import Decimal, ROUND_HALF_UP
+    unit = Decimal(str(_price_unit(symbol)))
+    value_d = Decimal(str(value))
+    ticks = (value_d / unit).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(ticks * unit)
+
 def _confirm_protection(symbol, position_id, stop, tp3):
+    # Compare exchange protection on the contract's actual price grid. This is
+    # critical for low-priced contracts such as HBAR; decimal-count guesses can
+    # reject a perfectly valid MEXC stop and unnecessarily halt the live gate.
+    try:
+        expected_stop = _quantize_price(symbol, stop)
+        expected_tp3 = _quantize_price(symbol, tp3)
+        unit = _price_unit(symbol)
+    except Exception as e:
+        _diag(f"protection precision metadata failure for {symbol}: {type(e).__name__}: {e}")
+        return False
+    tolerance = max(1e-12, unit * 0.51)
     for _ in range(4):
         try:
             rows = open_stops(symbol)
             for x in rows:
                 if int(x.get("positionId") or 0) == int(position_id) and int(x.get("state") or 0) == 1:
                     sl=float(x.get("stopLossPrice") or 0); tp=float(x.get("takeProfitPrice") or 0)
-                    if sl>0 and tp>0 and abs(sl-stop) <= max(1e-10,abs(stop)*1e-6) and abs(tp-tp3) <= max(1e-10,abs(tp3)*1e-6): return True
-        except Exception: pass
+                    if sl>0 and tp>0 and abs(sl-expected_stop) <= tolerance and abs(tp-expected_tp3) <= tolerance:
+                        return True
+        except Exception:
+            pass
         time.sleep(0.5)
     return False
 
@@ -877,8 +909,16 @@ def _change_position_protection(symbol, position_id, new_stop, tp3):
         _diag(f"protection ratchet observed unfamiliar profitLossVolType={mode} on {symbol}; attempting verified price update")
     elif mode == "SEPARATE":
         _diag(f"protection ratchet accepted MEXC SEPARATE mode on {symbol} position {position_id}; verification required")
-    _signed("POST", "/api/v1/private/stoporder/change_plan_price", {"stopPlanOrderId":stop_id,"stopLossPrice":new_stop,"takeProfitPrice":tp3})
-    if _confirm_protection(symbol, position_id, new_stop, tp3):
+    # MEXC validates prices against each contract's priceUnit. Quantize from
+    # live metadata instead of assuming a decimal count (e.g. for HBAR).
+    try:
+        q_stop = _quantize_price(symbol, new_stop)
+        q_tp3 = _quantize_price(symbol, tp3)
+    except Exception as e:
+        return False, f"price precision metadata unavailable: {type(e).__name__}: {e}"
+    _diag(f"protection ratchet precision {symbol}: requested_stop={new_stop} -> {q_stop}, tp3={tp3} -> {q_tp3}, priceUnit={_price_unit(symbol)}")
+    _signed("POST", "/api/v1/private/stoporder/change_plan_price", {"stopPlanOrderId":stop_id,"stopLossPrice":q_stop,"takeProfitPrice":q_tp3})
+    if _confirm_protection(symbol, position_id, q_stop, q_tp3):
         return True, stop_id
     return False, "updated TP/SL not confirmed"
 
