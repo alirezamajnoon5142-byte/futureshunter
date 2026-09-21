@@ -10312,7 +10312,7 @@ except Exception as _v70_import_error:
 # The dedicated equity path is built now, but live execution is OFF by default.
 # This lets several NY cash sessions accumulate auditable "would take / would skip"
 # outcomes before the operator explicitly enables stock-futures live trading.
-V75_EQUITY_VERSION = "7.5.0-equity-live-shadow-ready"
+V75_EQUITY_VERSION = "7.5.1-equity-shadow-result-alerts"
 V75_EQUITY_LIVE_ENABLED = os.getenv("V75_EQUITY_LIVE_ENABLED", "false").lower() == "true"
 V75_EQUITY_RISK_PCT = min(0.005, max(0.001, float(os.getenv("V75_EQUITY_RISK_PCT", "0.005"))))
 V75_EQUITY_MIN_SCORE = float(os.getenv("V75_EQUITY_MIN_SCORE", "80"))
@@ -10738,10 +10738,76 @@ def _v75_update_shadow_trade(trade):
     ))
 
 
+def _v75_notify_shadow_result(trade, notice):
+    """Best-effort Telegram lifecycle reporting; never affects shadow settlement."""
+    if not V75_EQUITY_NOTIFY or not notice:
+        return False
+    symbol=str(trade.get("symbol") or "")
+    direction=str(trade.get("direction") or "").upper()
+    entry=num(trade.get("entry")); tp1=num(trade.get("tp1")); tp2=num(trade.get("tp2")); tp3=num(trade.get("tp3"))
+    final_r=trade.get("final_r")
+    tp1_hit=bool(trade.get("tp1_hit")); tp2_hit=bool(trade.get("tp2_hit"))
+    if notice == "TP1":
+        message=(
+            f"🟢 V7.5 EQUITY SHADOW TP1\n\n"
+            f"{symbol} {direction}\n"
+            f"Entry {entry:.6g} | TP1 {tp1:.6g}\n"
+            f"Model: 25% banked at +1R; remaining 75% stop → breakeven buffer.\n"
+            f"Next: TP2 {tp2:.6g} | TP3 {tp3:.6g}"
+        )
+    elif notice == "TP2":
+        message=(
+            f"🟢 V7.5 EQUITY SHADOW TP2\n\n"
+            f"{symbol} {direction}\n"
+            f"Entry {entry:.6g} | TP2 {tp2:.6g}\n"
+            f"Model: 50% cumulative banked; remaining 50% stop → +1R.\n"
+            f"Final target: TP3 {tp3:.6g}"
+        )
+    elif notice == "TP3":
+        message=(
+            f"✅ V7.5 EQUITY WOULD-TAKE CLOSED — TP3\n\n"
+            f"{symbol} {direction}\n"
+            f"TP1 {tp1:.6g} ✅ | TP2 {tp2:.6g} ✅ | TP3 {tp3:.6g} ✅\n"
+            f"Final model result: {num(final_r):+.2f}R"
+        )
+    elif notice == "STOP":
+        stage="after TP2" if tp2_hit else ("after TP1" if tp1_hit else "before TP1")
+        message=(
+            f"🔴 V7.5 EQUITY WOULD-TAKE CLOSED — STOP\n\n"
+            f"{symbol} {direction} | {stage}\n"
+            f"Final model result: {num(final_r):+.2f}R"
+        )
+    elif notice == "EXPIRED":
+        message=(
+            f"⚪ V7.5 EQUITY WOULD-TAKE CLOSED — SESSION EXPIRY\n\n"
+            f"{symbol} {direction}\n"
+            f"TP1 {'✅' if tp1_hit else '—'} | TP2 {'✅' if tp2_hit else '—'} | TP3 {'✅' if trade.get('tp3_hit') else '—'}\n"
+            f"Final model result at expiry: {num(final_r):+.2f}R"
+        )
+    elif notice == "AMBIGUOUS":
+        message=(
+            f"⚠️ V7.5 EQUITY SHADOW — AMBIGUOUS\n\n"
+            f"{symbol} {direction}\n"
+            f"Stop and next target were both inside the same 1-minute candle.\n"
+            f"Excluded from expectancy; no win/loss result assigned."
+        )
+    else:
+        return False
+    try:
+        sent=send_telegram(message)
+        if not sent:
+            print(f"V7.5 Equity result notification not delivered: {symbol} {notice}")
+        return bool(sent)
+    except Exception as error:
+        print(f"V7.5 Equity result notification warning {symbol} {notice}: {type(error).__name__}: {error}")
+        return False
+
+
 def _v75_settle_one_shadow(trade):
     df=get_candles(trade["symbol"],"Min1")
     if df is None or len(df)==0:
         return None
+    was_tp1=bool(trade.get("tp1_hit")); was_tp2=bool(trade.get("tp2_hit"))
     df=df.copy(); df["time_norm"]=df["time"].apply(normalize_candle_time)
     relevant=df[(df["time_norm"]>num(trade.get("last_checked"))) & (df["time_norm"]>=num(trade.get("tracking_start")))]
     latest_price=num(df.iloc[-1]["close"]); latest_seen=num(trade.get("last_checked")); event=None
@@ -10788,6 +10854,15 @@ def _v75_settle_one_shadow(trade):
         trade["final_r"]=round(max(-1.0,min(2.25,_v75_shadow_current_final_r(trade,current_r))),4)
         trade["status"]="EXPIRED"; trade["closed_time"]=time.time(); event="EXPIRED"
     _v75_update_shadow_trade(trade)
+
+    # Persist first, notify second. A Telegram failure can never alter trade state.
+    notice=event
+    if notice is None and (not was_tp2) and bool(trade.get("tp2_hit")):
+        notice="TP2"
+    elif notice is None and (not was_tp1) and bool(trade.get("tp1_hit")):
+        notice="TP1"
+    if notice:
+        _v75_notify_shadow_result(trade,notice)
     return event
 
 
