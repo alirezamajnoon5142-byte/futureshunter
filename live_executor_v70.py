@@ -1314,7 +1314,8 @@ def _adaptive_derisk(row, targets, px, tp1_vol):
     # position, merely compress remaining downside from -1R toward -0.40R.
     if (not tp1_done and adaptive_stage=="NONE"
             and peak_r >= ADAPTIVE_SOFT_MFE_R
-            and giveback >= ADAPTIVE_SOFT_GIVEBACK_R):
+            and giveback >= ADAPTIVE_SOFT_GIVEBACK_R
+            and current_r >= ADAPTIVE_SOFT_STOP_R + 0.10):
         candidate=_price_at_r(direction,targets["entry"],targets["risk"],ADAPTIVE_SOFT_STOP_R)
         if _stop_is_tighter(direction,current_stop,candidate):
             ok,detail=_change_position_protection(symbol,position_id,candidate,targets["tp3"])
