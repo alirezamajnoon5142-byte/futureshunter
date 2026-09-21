@@ -12862,10 +12862,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _emergency_authorized(self):
+        # Accept either standard Bearer auth or the dedicated header used by
+        # the iOS Shortcuts emergency controller. Keep the shared secret
+        # server-side and compare exact values only.
         if not EMERGENCY_CLOSE_SECRET:
             return False
-        auth = str(self.headers.get("Authorization") or "")
-        return auth == f"Bearer {EMERGENCY_CLOSE_SECRET}"
+        auth = str(self.headers.get("Authorization") or "").strip()
+        shortcut_secret = str(self.headers.get("X-Emergency-Secret") or "").strip()
+        return (
+            auth == f"Bearer {EMERGENCY_CLOSE_SECRET}"
+            or shortcut_secret == EMERGENCY_CLOSE_SECRET
+        )
 
     def do_POST(self):
         # Private backup control path for emergency symbol closes.
