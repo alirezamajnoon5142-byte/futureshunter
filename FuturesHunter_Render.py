@@ -11579,6 +11579,8 @@ V71_REGIME_GATE = os.getenv("V71_REGIME_GATE", "true").lower() == "true"
 V71_LOSS_CLUSTER_GATE = os.getenv("V71_LOSS_CLUSTER_GATE", "true").lower() == "true"
 V71_LOSS_CLUSTER_MINUTES = int(os.getenv("V71_LOSS_CLUSTER_MINUTES", "180"))
 V71_LOSS_CLUSTER_COUNT = int(os.getenv("V71_LOSS_CLUSTER_COUNT", "3"))
+V71_LIVE_CORRELATION_GATE = os.getenv("V71_LIVE_CORRELATION_GATE", "true").lower() == "true"
+V71_MAX_SAME_BUCKET_DIRECTION = min(3, max(1, int(os.getenv("V71_MAX_SAME_BUCKET_DIRECTION", "1"))))
 V71_COST_GATE = os.getenv("V71_COST_GATE", "true").lower() == "true"
 V71_MAX_COST_FRACTION_R = float(os.getenv("V71_MAX_COST_FRACTION_R", "0.35"))
 V71_EST_TAKER_FEE_BPS = float(os.getenv("V71_EST_TAKER_FEE_BPS", "5.0"))
@@ -11803,6 +11805,16 @@ def _v71_live_candidate_gate(result, trades):
     ]
     if rd == "BLOCK": reasons.append("Risk Lab BLOCK")
     if rd == "BLOCK" and sc in {"WAIT","AVOID"}: reasons.append(f"Risk BLOCK + Strategy {sc}")
+    if (
+        V71_LIVE_CORRELATION_GATE
+        and risk.get("asset_bucket") == "CRYPTO"
+        and int(risk.get("open_count") or 0) >= V71_MAX_SAME_BUCKET_DIRECTION
+    ):
+        reasons.append(
+            f"live correlation guard: {int(risk.get('open_count') or 0)} "
+            f"CRYPTO {result.get('direction')} position(s) already open "
+            f"(max {V71_MAX_SAME_BUCKET_DIRECTION})"
+        )
     if V71_REGIME_GATE and (risk.get("asset_bucket") == "CRYPTO") and bool(risk.get("btc_weak")) and bool(risk.get("macro_conflict")):
         reasons.append("crypto regime conflict: weak BTC + macro conflict")
     same_symbol_losses = _v71_live_recent_losses(live_snapshot, result, V70_SAME_SYMBOL_COOLDOWN_MINUTES, same_symbol=True)

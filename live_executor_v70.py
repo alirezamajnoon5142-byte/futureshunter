@@ -15,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.7.6-tick-tolerant-protection"
+V70_VERSION = "7.7.7-entry-drift-stop-race-guard"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -32,6 +32,7 @@ MAX_LEVERAGE = min(2, int(os.getenv("V70_MAX_LEVERAGE", "2")))
 MAX_POSITIONS = min(3, max(1, int(os.getenv("V70_MAX_POSITIONS", "3"))))
 RECONCILE_SECONDS = max(5, int(os.getenv("V70_RECONCILE_SECONDS", "10")))
 FILL_TIMEOUT = max(3, int(os.getenv("V70_FILL_TIMEOUT", "15")))
+MAX_ENTRY_DRIFT_R = min(1.0, max(0.0, float(os.getenv("V70_MAX_ENTRY_DRIFT_R", "0.20"))))
 EXPIRY_HOURS = float(os.getenv("V70_EXPIRY_HOURS", "24"))
 RECV_WINDOW = min(30, max(5, int(os.getenv("V70_RECV_WINDOW", "10"))))
 
@@ -70,6 +71,7 @@ def diagnostic_state():
         "max_notional_cap": MAX_NOTIONAL_CAP,
         "max_leverage": MAX_LEVERAGE,
         "max_positions": MAX_POSITIONS,
+        "max_entry_drift_r": MAX_ENTRY_DRIFT_R,
         "multi_tp_enabled": MULTI_TP_ENABLED,
         "tp1_fraction": TP1_FRACTION,
         "tp2_fraction": TP2_FRACTION,
@@ -309,7 +311,12 @@ def _clear_flattened_protection_halt_after_success(exchange_positions, dbrows):
     if not halted:
         return False
     import re
-    m = re.match(r"^protection disappeared on ([A-Z0-9_]+); flattened$", r.strip(), re.I)
+    m = re.match(
+        r"^protection disappeared on ([A-Z0-9_]+); "
+        r"(?:flattened|emergency flatten UNCONFIRMED: position no longer open)$",
+        r.strip(),
+        re.I,
+    )
     if not m:
         return False
     failed_symbol = m.group(1).upper()
@@ -748,6 +755,17 @@ def _signal_risk_pct(result):
     return min(RISK_PCT, max(0.0001, requested))
 
 
+def _unfavorable_entry_drift_r(direction, reference_entry, observed_price, stop):
+    """Positive R means price moved against execution quality before/at fill."""
+    reference_entry=float(reference_entry or 0); observed_price=float(observed_price or 0); stop=float(stop or 0)
+    risk=abs(reference_entry-stop)
+    if reference_entry <= 0 or observed_price <= 0 or risk <= 0:
+        return 0.0
+    if str(direction).upper() == "LONG":
+        return (observed_price-reference_entry)/risk
+    return (reference_entry-observed_price)/risk
+
+
 def preview_signal(result):
     """Read-only sizing/preflight preview for a candidate. No MEXC write request."""
     if not ENABLED:
@@ -828,6 +846,20 @@ def execute_signal(result, paper_trade=None):
             return {"executed": False, "reason": "multi-TP requires valid TP1/TP2 from Core risk plan"}
         stop_pct = abs(entry-stop)/entry*100.0
         if stop_pct <= 0: return {"executed": False, "reason": "invalid stop distance"}
+        # Final pre-submit execution-quality guard. A stale Core signal must not be
+        # chased simply because its score remains high.
+        live_entry_px = _fair_price(symbol)
+        pre_submit_drift_r = _unfavorable_entry_drift_r(direction, entry, live_entry_px, stop)
+        if pre_submit_drift_r > MAX_ENTRY_DRIFT_R:
+            _diag(
+                f"LIVE ENTRY DRIFT BLOCK {symbol} {direction} reference={entry:.12g} "
+                f"live={live_entry_px:.12g} drift={pre_submit_drift_r:.2f}R "
+                f"limit={MAX_ENTRY_DRIFT_R:.2f}R"
+            )
+            return {
+                "executed": False,
+                "reason": f"entry chase {pre_submit_drift_r:.2f}R > {MAX_ENTRY_DRIFT_R:.2f}R"
+            }
         limits = state["limits"]
         effective_risk_pct = _signal_risk_pct(result)
         risk_usdt = float(limits["equity"]) * effective_risk_pct
@@ -861,6 +893,8 @@ def execute_signal(result, paper_trade=None):
         ledger_payload = dict(payload)
         ledger_payload["effectiveRiskPct"] = effective_risk_pct
         ledger_payload["strategyTag"] = str(result.get("live_strategy_tag") or "CORE")
+        ledger_payload["preSubmitPrice"] = live_entry_px
+        ledger_payload["preSubmitDriftR"] = pre_submit_drift_r
         if expiry_ts is not None:
             ledger_payload["expiryTs"] = expiry_ts.isoformat()
         _db("""INSERT INTO fh_live_trades(signal_id,symbol,direction,status,external_oid,paper_entry,requested_notional,actual_notional,contracts,contract_size,leverage,stop_price,tp1_price,tp2_price,tp3_price,initial_stop_price,managed_stop_price,tp1_vol,tp2_vol,stop_pct,management_stage,expiry_ts,payload) VALUES(%s,%s,%s,'SUBMITTING',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INITIAL',%s,%s)""",
@@ -903,6 +937,36 @@ def execute_signal(result, paper_trade=None):
             slip = (fill-entry) * contracts * contract_size * (1 if direction=="LONG" else -1)
             slip_bps = ((fill-entry)/entry*10000.0) * (1 if direction=="LONG" else -1)
             _db("""UPDATE fh_live_trades SET status='PROTECTING',position_id=%s,actual_entry=%s,entry_fee=%s,slippage_usdt=%s,slippage_bps=%s,opened_at=NOW(),updated_at=NOW() WHERE signal_id=%s""", (position_id,fill,fee,slip,slip_bps,signal_id))
+            # Market orders can still receive an unexpectedly poor fill after the
+            # pre-submit check. Fail closed on execution quality before managing
+            # the position as a normal live trade.
+            fill_drift_r = _unfavorable_entry_drift_r(direction, entry, fill, stop)
+            if fill_drift_r > MAX_ENTRY_DRIFT_R:
+                _diag(
+                    f"LIVE FILL DRIFT EXIT {symbol} {direction} reference={entry:.12g} "
+                    f"fill={fill:.12g} drift={fill_drift_r:.2f}R "
+                    f"limit={MAX_ENTRY_DRIFT_R:.2f}R"
+                )
+                pnow=_active_position(symbol, position_id)
+                if pnow:
+                    close_vol=float(pnow.get("holdVol") or pnow.get("vol") or pnow.get("positionVol") or contracts)
+                    close_ok,close_detail=_partial_market_close(symbol,direction,position_id,close_vol,signal_id,"FD")
+                else:
+                    close_ok,close_detail=True,"position already absent"
+                if close_ok:
+                    _diag(
+                        f"LIVE FILL DRIFT EXIT CONFIRMED {symbol} position_id={position_id} "
+                        f"detail={close_detail}"
+                    )
+                    return {
+                        "executed": False,
+                        "reason": f"bad live fill {fill_drift_r:.2f}R > {MAX_ENTRY_DRIFT_R:.2f}R; flattened"
+                    }
+                halt(
+                    f"bad live fill on {symbol} ({fill_drift_r:.2f}R) and emergency flatten "
+                    f"could not be confirmed: {close_detail}"
+                )
+                return {"executed": False, "reason": "bad fill; emergency flatten unconfirmed"}
             protected=_confirm_protection(symbol, position_id, stop_api, tp3_api)
             if not protected:
                 # Attached TP/SL may take a moment to materialize; place explicit position TP/SL once.
@@ -1390,12 +1454,51 @@ def reconcile_once():
                         continue
                     tr=_db("SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s",(row[0],),"one")
                     if tr and not _confirm_protection(row[1],pid,float(tr[0]),float(tr[1])):
-                        close_vol=float(p_after.get("holdVol") or p_after.get("vol") or p_after.get("positionVol") or row[4])
+                        # A legitimate exchange-side stop/TP can close the position
+                        # while protection verification is polling. Re-read position
+                        # state before declaring that protection disappeared.
+                        p_now=_active_position(row[1],pid)
+                        if not p_now:
+                            settled=False
+                            for _ in range(6):
+                                if _settle_missing_position(row):
+                                    settled=True
+                                    break
+                                time.sleep(0.5)
+                            if settled:
+                                _diag(
+                                    f"RECONCILE NORMAL CLOSE RACE AUDITED {row[1]} "
+                                    f"position_id={pid}; no emergency flatten needed"
+                                )
+                                continue
+                            halt(
+                                f"position disappeared during protection verification on {row[1]} "
+                                f"position {pid}; closure history not yet auditable"
+                            )
+                            return
+                        close_vol=float(p_now.get("holdVol") or p_now.get("vol") or p_now.get("positionVol") or row[4])
                         close_ok,close_detail=_partial_market_close(row[1],row[2],pid,close_vol,row[0],"RX")
                         if close_ok:
                             _diag(f"RECONCILE EMERGENCY FLATTEN CONFIRMED {row[1]} position_id={pid} detail={close_detail}")
                             halt(f"protection disappeared on {row[1]}; flattened")
                         else:
+                            # One final position read distinguishes a real failed
+                            # flatten from the harmless race where the stop completed
+                            # between our checks.
+                            p_final=_active_position(row[1],pid)
+                            if not p_final:
+                                settled=False
+                                for _ in range(6):
+                                    if _settle_missing_position(row):
+                                        settled=True
+                                        break
+                                    time.sleep(0.5)
+                                if settled:
+                                    _diag(
+                                        f"RECONCILE NORMAL CLOSE RACE AUDITED {row[1]} "
+                                        f"position_id={pid} after flatten check; no HALT"
+                                    )
+                                    continue
                             _diag(f"RECONCILE EMERGENCY FLATTEN UNCONFIRMED {row[1]} position_id={pid} detail={close_detail}")
                             halt(f"protection disappeared on {row[1]}; emergency flatten UNCONFIRMED: {close_detail}")
                     continue
