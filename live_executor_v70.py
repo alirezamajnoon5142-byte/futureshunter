@@ -287,8 +287,13 @@ def _clear_verified_ratchet_halt_after_success(exchange_positions, dbrows):
         rw = by_pid.get(pid)
         if not rw:
             return False
-        tr = _db("SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s", (rw[0],), "one")
-        if not tr or not _confirm_protection(rw[1], pid, float(tr[0]), float(tr[1])):
+        # Verify against the CURRENT managed stop, not the original entry stop.
+        # After TP1/TP2 a healthy position can legitimately have its stop ratcheted
+        # to BE/+R; checking stop_price here would keep a stale ratchet HALT latched.
+        tr = _db("SELECT COALESCE(managed_stop_price,stop_price),tp3_price FROM fh_live_trades WHERE signal_id=%s", (rw[0],), "one")
+        if not tr or tr[0] is None or tr[1] is None:
+            return False
+        if not _confirm_protection(rw[1], pid, float(tr[0]), float(tr[1])):
             return False
     _halted_memory = False
     _halt_reason = ""
