@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+EMERGENCY_CLOSE_SECRET = os.getenv("EMERGENCY_CLOSE_SECRET", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # admin / original subscriber
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://futureshunter-v66.onrender.com")
 
@@ -193,6 +194,13 @@ def save_subscribers(subscribers):
 SUBSCRIBERS = load_subscribers()
 
 
+def _safe_error(error):
+    value = str(error)
+    if TELEGRAM_BOT_TOKEN:
+        value = value.replace(str(TELEGRAM_BOT_TOKEN), "<REDACTED>")
+    return value
+
+
 def send_to_chat(chat_id, message):
     if not telegram_ready():
         print("Telegram bot token missing.")
@@ -217,7 +225,7 @@ def send_to_chat(chat_id, message):
         return bool(response.json().get("ok"))
 
     except Exception as error:
-        print(f"Telegram send error ({chat_id}): {error}")
+        print(f"Telegram send error ({chat_id}): {_safe_error(error)}")
         return False
 
 
@@ -380,7 +388,7 @@ def telegram_command_loop():
     try:
         _telegram_api("deleteWebhook", {"drop_pending_updates": False}, timeout=15)
     except Exception as error:
-        print(f"Telegram webhook cleanup warning: {error}")
+        print(f"Telegram webhook cleanup warning: {_safe_error(error)}")
 
     offset = None
 
@@ -403,7 +411,7 @@ def telegram_command_loop():
                     handle_telegram_command(chat_id, text)
 
         except Exception as error:
-            print(f"Telegram command loop error: {error}")
+            print(f"Telegram command loop error: {_safe_error(error)}")
             time.sleep(5)
 
 
@@ -12843,6 +12851,68 @@ class _HealthHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _json_response(self, status, payload):
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _emergency_authorized(self):
+        if not EMERGENCY_CLOSE_SECRET:
+            return False
+        auth = str(self.headers.get("Authorization") or "")
+        return auth == f"Bearer {EMERGENCY_CLOSE_SECRET}"
+
+    def do_POST(self):
+        # Private backup control path for emergency symbol closes.
+        # No MEXC credentials are accepted over HTTP; they remain server-side.
+        if self.path.rstrip("/") != "/emergency/close":
+            self._json_response(404, {"ok": False, "error": "not_found"})
+            return
+        if not self._emergency_authorized():
+            self._json_response(403, {"ok": False, "error": "forbidden"})
+            return
+        if V70_LIVE is None:
+            self._json_response(503, {"ok": False, "error": "live_executor_unavailable"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > 4096:
+                self._json_response(400, {"ok": False, "error": "invalid_body"})
+                return
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            symbol = str(payload.get("symbol") or "").strip().upper().replace("/", "_").replace("-", "_")
+            if symbol and "_" not in symbol:
+                symbol += "_USDT"
+            if not symbol or not symbol.endswith("_USDT"):
+                self._json_response(400, {"ok": False, "error": "invalid_symbol"})
+                return
+            confirm = str(payload.get("confirm") or "").strip().upper()
+            snapshot = V70_LIVE.positions() or []
+            matches = [p for p in snapshot if isinstance(p, dict)
+                       and str(p.get("symbol") or p.get("contractCode") or "").upper() == symbol
+                       and float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0) > 0]
+            view = [{"symbol": symbol,
+                     "contracts": float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0),
+                     "direction": V70_LIVE._position_direction(p)} for p in matches]
+            if confirm != "CONFIRM":
+                self._json_response(200, {"ok": True, "mode": "READ_ONLY", "symbol": symbol,
+                                          "positions": view, "order_sent": False,
+                                          "instruction": "Repeat with confirm=CONFIRM to market-close this symbol only."})
+                return
+            if not matches:
+                self._json_response(409, {"ok": False, "symbol": symbol, "closed": False,
+                                          "order_sent": False, "error": "no_open_position"})
+                return
+            result = V70_LIVE.emergency_close_symbol(symbol)
+            status = 200 if result.get("closed") else 409
+            self._json_response(status, result)
+        except Exception as error:
+            self._json_response(500, {"ok": False, "error": type(error).__name__, "detail": _safe_error(error)})
 
     def log_message(self, format, *args):
         # Keep Render logs focused on scanner output.
