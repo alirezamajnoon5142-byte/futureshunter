@@ -12958,6 +12958,25 @@ if __name__ == "__main__":
             V70_LIVE.configure(notify=send_telegram)
             startup_ok = V70_LIVE.startup_reconcile()
             print(f"[V7DIAG] startup_reconcile returned={startup_ok}", flush=True)
+
+            # Owner-requested one-shot close: HYPE_USDT only. Durable key prevents
+            # this action from ever repeating on a later restart.
+            _manual_close_key = "owner_close_HYPE_USDT_20260921_01"
+            try:
+                _manual_close_done = V70_LIVE._state_get(_manual_close_key)
+            except Exception:
+                _manual_close_done = None
+            if not _manual_close_done:
+                _manual_close_result = V70_LIVE.emergency_close_symbol("HYPE_USDT")
+                print(f"[V7DIAG] owner one-shot HYPE_USDT close result={_manual_close_result}", flush=True)
+                if (
+                    _manual_close_result.get("closed")
+                    or _manual_close_result.get("reason") == "no open MEXC position for symbol"
+                ):
+                    V70_LIVE._state_set(
+                        _manual_close_key,
+                        {"done": True, "result": _manual_close_result, "ts": time.time()},
+                    )
             if getattr(V70_LIVE, "DRY_RUN", False):
                 dry_ok = V70_LIVE.run_zero_order_dry_run()
                 print(f"[V7DIAG] zero_order_dry_run returned={dry_ok}", flush=True)
