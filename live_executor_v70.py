@@ -15,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.7.3-mexc-precision"
+V70_VERSION = "7.7.4-stale-protection-recovery"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -297,6 +297,89 @@ def _clear_verified_ratchet_halt_after_success(exchange_positions, dbrows):
     _diag(f"auto-cleared verified TP ratchet HALT after {failed_symbol} was flat and all remaining live protection verified")
     _msg(f"✅ FUTURESHUNTER V7 LIVE RECOVERED\n{failed_symbol} ratchet failure is fully contained; failed position is flat and every remaining live position has verified exchange protection. Live gate restored.")
     return True
+
+def _clear_flattened_protection_halt_after_success(exchange_positions, dbrows):
+    """Clear a stale 'protection disappeared; flattened' halt only after the
+    failed symbol is flat/audited and every remaining owned position has
+    independently verified exchange protection. Hard breakers stay fail-closed.
+    """
+    global _halted_memory, _halt_reason
+    halted, reason = halt_status()
+    r = str(reason or "")
+    if not halted:
+        return False
+    import re
+    m = re.match(r"^protection disappeared on ([A-Z0-9_]+); flattened$", r.strip(), re.I)
+    if not m:
+        return False
+    failed_symbol = m.group(1).upper()
+
+    live_positions = [
+        p for p in (exchange_positions or [])
+        if float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0) > 0
+    ]
+    live_symbols = {
+        str(p.get("symbol") or p.get("contractCode") or "").upper()
+        for p in live_positions
+    }
+    if failed_symbol in live_symbols:
+        return False
+
+    failed_open = _db(
+        "SELECT COUNT(*) FROM fh_live_trades WHERE status='OPEN' AND UPPER(symbol)=UPPER(%s)",
+        (failed_symbol,),
+        "one",
+    ) or (0,)
+    if int(failed_open[0] or 0) != 0:
+        return False
+
+    by_pid = {int(rw[3] or 0): rw for rw in (dbrows or [])}
+    for p in live_positions:
+        pid = int(p.get("positionId") or p.get("id") or 0)
+        rw = by_pid.get(pid)
+        if not rw:
+            return False
+        tr = _db(
+            "SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s",
+            (rw[0],),
+            "one",
+        )
+        if not tr or not _confirm_protection(rw[1], pid, float(tr[0]), float(tr[1])):
+            return False
+
+    current_asset = asset()
+    limits = _dynamic_limits(current_asset)
+    if limits["equity"] < limits["equity_kill"]:
+        halt(f"equity kill-switch: {limits['equity']:.4f} < {limits['equity_kill']:.2f} USDT")
+        return False
+    daily_loss = _daily_net_loss()
+    if daily_loss >= limits["daily_loss_limit"]:
+        halt(f"daily loss breaker reached: {daily_loss:.4f} USDT")
+        return False
+
+    _halted_memory = False
+    _halt_reason = ""
+    _state_set(
+        "v70_halt",
+        {
+            "halted": False,
+            "reason": "",
+            "recovered_from": r[:500],
+            "ts": time.time(),
+        },
+    )
+    _diag(
+        f"auto-cleared stale protection HALT after {failed_symbol} was flat, "
+        "ledger-audited, and all remaining live protection verified"
+    )
+    _msg(
+        f"✅ FUTURESHUNTER V7 LIVE RECOVERED\n"
+        f"{failed_symbol} protection failure is fully contained; the failed position "
+        "is flat/audited and every remaining live position has verified exchange protection. "
+        "Live gate restored."
+    )
+    return True
+
 
 def asset(): return _signed("GET", "/api/v1/private/account/asset/USDT")
 def positions(symbol=None): return _signed("GET", "/api/v1/private/position/open_positions", {"symbol": symbol}) or []
@@ -1136,6 +1219,7 @@ def reconcile_once():
             _clear_transient_reconcile_halt_after_success()
             _clear_closed_position_race_halt_after_success()
             _clear_verified_ratchet_halt_after_success(ex, dbrows)
+            _clear_flattened_protection_halt_after_success(ex, dbrows)
         except Exception as e:
             halt(f"reconciliation failure: {type(e).__name__}: {e}")
 
