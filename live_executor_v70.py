@@ -15,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.8.0-adaptive-derisk-governor"
+V70_VERSION = "7.8.1-oid-safe-adaptive-recovery"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -422,6 +422,88 @@ def _clear_flattened_protection_halt_after_success(exchange_positions, dbrows):
     return True
 
 
+def _clear_adaptive_oid_halt_after_success(exchange_positions, dbrows):
+    """Recover only the known MEXC externalOid-length rejection on adaptive banking.
+
+    The rejected order was never accepted by MEXC. Recovery is permitted only
+    after a fresh reconciliation proves the affected symbol is still ledger-owned
+    (or already safely partially managed by the fixed code) and its current
+    exchange-side stop/TP3 protection verifies. Breakers must also remain healthy.
+    """
+    global _halted_memory, _halt_reason
+    halted, reason=halt_status()
+    r=str(reason or "")
+    rl=r.lower()
+    if not halted:
+        return False
+    if not (
+        rl.startswith("adaptive 25% bank failed/unconfirmed on ")
+        and "external order id too long" in rl
+        and "code=2030" in rl
+    ):
+        return False
+    import re
+    m=re.match(r"^adaptive 25% bank failed/unconfirmed on ([A-Z0-9_]+):", r.strip(), re.I)
+    if not m:
+        return False
+    failed_symbol=m.group(1).upper()
+
+    live_positions=[
+        p for p in (exchange_positions or [])
+        if float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)>0
+    ]
+    by_pid={int(rw[3] or 0):rw for rw in (dbrows or [])}
+    owned=None
+    for p in live_positions:
+        if str(p.get("symbol") or p.get("contractCode") or "").upper()!=failed_symbol:
+            continue
+        pid=int(p.get("positionId") or p.get("id") or 0)
+        rw=by_pid.get(pid)
+        if rw:
+            owned=(p,rw)
+            break
+    if not owned:
+        return False
+
+    p,rw=owned
+    pid=int(p.get("positionId") or p.get("id") or 0)
+    tr=_db(
+        "SELECT stop_price,tp3_price,protection_confirmed FROM fh_live_trades WHERE signal_id=%s",
+        (rw[0],),"one"
+    )
+    if not tr or not bool(tr[2]):
+        return False
+    if not _confirm_protection(rw[1],pid,float(tr[0]),float(tr[1])):
+        return False
+
+    current_asset=asset()
+    limits=_dynamic_limits(current_asset)
+    if limits["equity"] < limits["equity_kill"]:
+        halt(f"equity kill-switch: {limits['equity']:.4f} < {limits['equity_kill']:.2f} USDT")
+        return False
+    daily_loss=_daily_net_loss()
+    if daily_loss >= limits["daily_loss_limit"]:
+        halt(f"daily loss breaker reached: {daily_loss:.4f} USDT")
+        return False
+
+    _halted_memory=False
+    _halt_reason=""
+    _state_set("v70_halt",{
+        "halted":False,"reason":"","recovered_from":r[:500],"ts":time.time()
+    })
+    _diag(
+        f"auto-cleared adaptive externalOid HALT after {failed_symbol} remained "
+        "ledger-owned and current protection verified"
+    )
+    _msg(
+        f"✅ FUTURESHUNTER V7.8.1 LIVE RECOVERED\n"
+        f"{failed_symbol} adaptive bank was rejected before order acceptance because "
+        "the external order ID exceeded MEXC's limit. The ID generator is now length-safe; "
+        "the live position remains owned and protected."
+    )
+    return True
+
+
 def _clear_failed_entry_protection_halt_after_success(exchange_positions, dbrows):
     """Recover only a contained entry-protection failure after a fresh audit.
 
@@ -607,8 +689,14 @@ def _three_way_split(contracts, step, min_vol):
     return None
 
 def _oid(signal_id, suffix="E"):
-    digest = hashlib.sha1(f"{signal_id}|{suffix}".encode()).hexdigest()[:24]
-    return f"fh70_{suffix.lower()}_{digest}"
+    """Deterministic MEXC externalOid capped at the exchange's 32-char limit."""
+    prefix=f"fh70_{str(suffix or 'E').lower()}_"
+    budget=max(8, 32-len(prefix))
+    digest=hashlib.sha1(f"{signal_id}|{suffix}".encode()).hexdigest()[:budget]
+    oid=f"{prefix}{digest}"
+    if len(oid) > 32:
+        oid=oid[:32]
+    return oid
 
 
 def _daily_net_loss():
@@ -1672,6 +1760,7 @@ def reconcile_once():
             _clear_verified_ratchet_halt_after_success(ex, dbrows)
             _clear_flattened_protection_halt_after_success(ex, dbrows)
             _clear_failed_entry_protection_halt_after_success(ex, dbrows)
+            _clear_adaptive_oid_halt_after_success(ex, dbrows)
         except Exception as e:
             halt(f"reconciliation failure: {type(e).__name__}: {e}")
 
