@@ -12722,9 +12722,41 @@ def _v71_evaluate_live_without_paper(result, trades, source_key):
 _V77_PREV_COMMAND = handle_telegram_command
 
 def handle_telegram_command(chat_id, text):
-    command=((text or "").strip().split() or [""])[0].lower()
+    parts=(text or "").strip().split()
+    command=(parts or [""])[0].lower()
     if command in {"/optimizer","/v77","/portfolio","/paperopt","/cryptolab"}:
         send_to_chat(chat_id,_v77_optimizer_summary_text()); return
+    if command == "/closeall":
+        # Emergency live-trading kill switch: owner/admin only and two-step by design.
+        owner=_normalize_chat_id(TELEGRAM_CHAT_ID)
+        caller=_normalize_chat_id(chat_id)
+        if not owner or caller != owner:
+            send_to_chat(chat_id,"⛔ /closeall is restricted to the configured owner chat."); return
+        if V70_LIVE is None:
+            send_to_chat(chat_id,"⛔ Live executor unavailable; no order was sent."); return
+        confirmed=len(parts) >= 2 and parts[1].upper() == "CONFIRM"
+        if not confirmed:
+            try:
+                snapshot=V70_LIVE.positions() or []
+                snapshot=[p for p in snapshot if isinstance(p,dict) and float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)>0]
+                names=", ".join(str(p.get("symbol") or "?") for p in snapshot) or "none"
+                send_to_chat(chat_id,f"⚠️ EMERGENCY FLATTEN\nMEXC open positions: {len(snapshot)} ({names})\nNo order sent. To market-close ALL live positions, send exactly:\n/closeall CONFIRM")
+            except Exception as e:
+                send_to_chat(chat_id,f"⛔ Could not verify MEXC positions; no order sent: {type(e).__name__}: {e}")
+            return
+        send_to_chat(chat_id,"🛑 Emergency flatten requested. Closing actual MEXC positions and verifying exchange state...")
+        result=V70_LIVE.emergency_flatten_all()
+        if result.get("flat"):
+            closed=result.get("closed") or []
+            desc=", ".join(f"{x.get('symbol')} {x.get('direction')} {x.get('contracts'):g}" for x in closed) or "already flat"
+            extra=("\nWarnings: "+"; ".join(result.get("errors") or [])) if result.get("errors") else ""
+            send_to_chat(chat_id,f"✅ FLAT CONFIRMED BY MEXC\nClosed: {desc}\nExchange open positions: 0{extra}")
+        else:
+            rem=result.get("remaining") or []
+            remtxt=", ".join(f"{x.get('symbol')} {x.get('contracts'):g}" for x in rem) or "unknown"
+            why=result.get("reason") or "; ".join(result.get("errors") or []) or "unconfirmed close state"
+            send_to_chat(chat_id,f"🚨 NOT FLAT — DO NOT ASSUME POSITIONS ARE CLOSED\nRemaining: {remtxt}\nReason: {why}")
+        return
     return _V77_PREV_COMMAND(chat_id,text)
 
 
@@ -12738,7 +12770,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.7.1-crypto-metals-optimizer-shadow",
+                "version": "7.7.2-crypto-metals-optimizer-kill-switch",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "equity_agent_ensemble": ("active" if V76_DB_READY else "disabled_or_unavailable"),
                 "equity_agents": list(V76_AGENT_NAMES),

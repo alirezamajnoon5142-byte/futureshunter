@@ -14,7 +14,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.7.1-optimizer-shadow-compatible"
+V70_VERSION = "7.7.2-kill-switch"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -28,7 +28,7 @@ DAILY_LOSS_PCT = min(0.03, max(0.0001, float(os.getenv("V70_DAILY_LOSS_PCT", "0.
 EQUITY_KILL_DRAWDOWN_PCT = min(0.90, max(0.01, float(os.getenv("V70_EQUITY_KILL_PCT", "0.10"))))
 MAX_NOTIONAL_CAP = float(os.getenv("V70_MAX_NOTIONAL_CAP", str(PILOT_START_BALANCE)))
 MAX_LEVERAGE = min(2, int(os.getenv("V70_MAX_LEVERAGE", "2")))
-MAX_POSITIONS = min(2, max(1, int(os.getenv("V70_MAX_POSITIONS", "2"))))
+MAX_POSITIONS = min(3, max(1, int(os.getenv("V70_MAX_POSITIONS", "3"))))
 RECONCILE_SECONDS = max(5, int(os.getenv("V70_RECONCILE_SECONDS", "10")))
 FILL_TIMEOUT = max(3, int(os.getenv("V70_FILL_TIMEOUT", "15")))
 EXPIRY_HOURS = float(os.getenv("V70_EXPIRY_HOURS", "24"))
@@ -716,6 +716,60 @@ def _partial_market_close(symbol, direction, position_id, close_vol, signal_id, 
         return (True,detail) if ok else (False,f"submit/confirm failed: {type(e).__name__}: {e}")
     ok,detail=_wait_partial_close(symbol,direction,position_id,before,vol,oid)
     return (True,detail) if ok else (False,f"partial close unconfirmed; remaining={detail}")
+
+def emergency_flatten_all():
+    """Owner-triggered emergency kill switch: flatten every actual MEXC position.
+
+    This is deliberately separate from strategy/statistics logic. It does not
+    create signals or paper trades. Exchange positions are authoritative and
+    every close is confirmed before the function can report FLAT.
+    """
+    if not ENABLED:
+        return {"ok": False, "flat": False, "reason": "live pilot disabled"}
+    if DRY_RUN:
+        return {"ok": False, "flat": False, "reason": "dry-run write interlock active"}
+    if not ACCESS_KEY or not SECRET_KEY:
+        return {"ok": False, "flat": False, "reason": "MEXC credentials unavailable"}
+    with _lock:
+        try:
+            ex = positions() or []
+            ex = [p for p in ex if isinstance(p, dict) and float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0) > 0]
+            if not ex:
+                try: reconcile_once()
+                except Exception: pass
+                return {"ok": True, "flat": True, "closed": [], "reason": "already flat"}
+            closed=[]; errors=[]
+            nonce=int(time.time()*1000)
+            for p in ex:
+                symbol=str(p.get("symbol") or p.get("contractCode") or "")
+                pid=int(p.get("positionId") or p.get("id") or 0)
+                vol=float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)
+                direction=_position_direction(p)
+                if not symbol or pid <= 0 or vol <= 0 or direction not in {"LONG","SHORT"}:
+                    errors.append(f"unrecognized position: symbol={symbol or '?'} id={pid} vol={vol} direction={direction}")
+                    continue
+                kill_id=f"KILL_{pid}_{nonce}"
+                ok,detail=_partial_market_close(symbol,direction,pid,vol,kill_id,"K")
+                if ok:
+                    closed.append({"symbol":symbol,"direction":direction,"position_id":pid,"contracts":vol})
+                else:
+                    errors.append(f"{symbol} {direction}: {detail}")
+            # Exchange is the only authority for declaring success.
+            remaining=[]
+            for _ in range(8):
+                remaining=positions() or []
+                remaining=[p for p in remaining if isinstance(p,dict) and float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0)>0]
+                if not remaining: break
+                time.sleep(0.5)
+            try: reconcile_once()
+            except Exception as e: errors.append(f"post-close reconcile: {type(e).__name__}: {e}")
+            flat=not remaining
+            return {"ok": flat and not errors, "flat": flat, "closed": closed,
+                    "remaining": [{"symbol":str(p.get("symbol") or "?"),"contracts":float(p.get("holdVol") or 0)} for p in remaining],
+                    "errors": errors}
+        except Exception as e:
+            return {"ok": False, "flat": False, "reason": f"{type(e).__name__}: {e}"}
+
 
 def _change_position_protection(symbol, position_id, new_stop, tp3):
     """Ratchet the existing exchange-side entire-position TP/SL without removing protection."""
