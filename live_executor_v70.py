@@ -260,6 +260,43 @@ def _clear_closed_position_race_halt_after_success():
         return False
 
 
+
+def _clear_verified_ratchet_halt_after_success(exchange_positions, dbrows):
+    """Clear only the historical TP ratchet halt once its failed position is flat
+    and every still-open owned position has independently verified protection.
+    """
+    global _halted_memory, _halt_reason
+    halted, reason = halt_status()
+    r = str(reason or "")
+    rl = r.lower()
+    if not halted or "stop ratchet was not confirmed" not in rl or "remaining position flattened" not in rl:
+        return False
+    import re
+    m = re.search(r"filled on ([A-Z0-9_]+)", r, re.I)
+    failed_symbol = (m.group(1).upper() if m else "")
+    live_symbols = {str(p.get("symbol") or p.get("contractCode") or "").upper() for p in (exchange_positions or []) if float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0) > 0}
+    if not failed_symbol or failed_symbol in live_symbols:
+        return False
+    # Every remaining exchange position must be owned by the ledger and its
+    # current managed stop + TP3 must be verifiably present on MEXC.
+    by_pid = {int(rw[3] or 0): rw for rw in (dbrows or [])}
+    for p in (exchange_positions or []):
+        if float(p.get("holdVol") or p.get("vol") or p.get("positionVol") or 0) <= 0:
+            continue
+        pid = int(p.get("positionId") or p.get("id") or 0)
+        rw = by_pid.get(pid)
+        if not rw:
+            return False
+        tr = _db("SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s", (rw[0],), "one")
+        if not tr or not _confirm_protection(rw[1], pid, float(tr[0]), float(tr[1])):
+            return False
+    _halted_memory = False
+    _halt_reason = ""
+    _state_set("v70_halt", {"halted": False, "reason": "", "recovered_from": r[:500], "ts": time.time()})
+    _diag(f"auto-cleared verified TP ratchet HALT after {failed_symbol} was flat and all remaining live protection verified")
+    _msg(f"✅ FUTURESHUNTER V7 LIVE RECOVERED\n{failed_symbol} ratchet failure is fully contained; failed position is flat and every remaining live position has verified exchange protection. Live gate restored.")
+    return True
+
 def asset(): return _signed("GET", "/api/v1/private/account/asset/USDT")
 def positions(symbol=None): return _signed("GET", "/api/v1/private/position/open_positions", {"symbol": symbol}) or []
 
@@ -830,10 +867,16 @@ def _change_position_protection(symbol, position_id, new_stop, tp3):
     stop_id=int(x.get("id") or x.get("stopPlanOrderId") or 0)
     if stop_id <= 0:
         return False, "active TP/SL has no stopPlanOrderId"
-    # SAME is MEXC's combined/entire-position TP/SL mode used by this executor.
+    # MEXC can report an attached whole-position TP/SL as SAME initially and
+    # SEPARATE after a partial position reduction. The change_plan_price API is
+    # keyed by stopPlanOrderId and does not require profitLossVolType. Do not
+    # reject a live protective order merely because MEXC changed this metadata;
+    # safety is established by verifying the requested SL/TP prices afterwards.
     mode=str(x.get("profitLossVolType") or "").upper()
-    if mode and mode != "SAME":
-        return False, f"unexpected TP/SL volume mode {mode}"
+    if mode not in {"", "SAME", "SEPARATE"}:
+        _diag(f"protection ratchet observed unfamiliar profitLossVolType={mode} on {symbol}; attempting verified price update")
+    elif mode == "SEPARATE":
+        _diag(f"protection ratchet accepted MEXC SEPARATE mode on {symbol} position {position_id}; verification required")
     _signed("POST", "/api/v1/private/stoporder/change_plan_price", {"stopPlanOrderId":stop_id,"stopLossPrice":new_stop,"takeProfitPrice":tp3})
     if _confirm_protection(symbol, position_id, new_stop, tp3):
         return True, stop_id
@@ -1057,6 +1100,7 @@ def reconcile_once():
             # protection, equity kill, daily breaker, etc. remain durable.
             _clear_transient_reconcile_halt_after_success()
             _clear_closed_position_race_halt_after_success()
+            _clear_verified_ratchet_halt_after_success(ex, dbrows)
         except Exception as e:
             halt(f"reconciliation failure: {type(e).__name__}: {e}")
 
