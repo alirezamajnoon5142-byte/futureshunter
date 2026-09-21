@@ -3,6 +3,7 @@
 Disabled by default. It never needs Telegram secrets and never logs API secrets.
 """
 import os, time, json, hmac, hashlib, math, threading
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 import requests
@@ -14,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.7.2-kill-switch"
+V70_VERSION = "7.7.3-mexc-precision"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -287,13 +288,8 @@ def _clear_verified_ratchet_halt_after_success(exchange_positions, dbrows):
         rw = by_pid.get(pid)
         if not rw:
             return False
-        # Verify against the CURRENT managed stop, not the original entry stop.
-        # After TP1/TP2 a healthy position can legitimately have its stop ratcheted
-        # to BE/+R; checking stop_price here would keep a stale ratchet HALT latched.
-        tr = _db("SELECT COALESCE(managed_stop_price,stop_price),tp3_price FROM fh_live_trades WHERE signal_id=%s", (rw[0],), "one")
-        if not tr or tr[0] is None or tr[1] is None:
-            return False
-        if not _confirm_protection(rw[1], pid, float(tr[0]), float(tr[1])):
+        tr = _db("SELECT stop_price,tp3_price FROM fh_live_trades WHERE signal_id=%s", (rw[0],), "one")
+        if not tr or not _confirm_protection(rw[1], pid, float(tr[0]), float(tr[1])):
             return False
     _halted_memory = False
     _halt_reason = ""
@@ -343,6 +339,35 @@ def _active_protection(symbol, position_id):
 def _floor_step(value, step):
     if step <= 0: return value
     return math.floor((value + 1e-12) / step) * step
+
+def _decimal_places(step):
+    d=Decimal(str(step)).normalize()
+    return max(0, -d.as_tuple().exponent)
+
+def _mexc_step_value(value, step, rounding=ROUND_HALF_UP):
+    """Return an API-safe numeric value aligned exactly to a MEXC tick/volume step."""
+    d=Decimal(str(value)); q=Decimal(str(step))
+    if q <= 0:
+        return float(d)
+    units=(d/q).to_integral_value(rounding=rounding)
+    out=units*q
+    places=_decimal_places(q)
+    # Round again to the tick's decimal width so binary float noise cannot add precision.
+    out=out.quantize(Decimal(1).scaleb(-places)) if places else out.quantize(Decimal(1))
+    return int(out) if places == 0 else float(format(out, f'.{places}f'))
+
+def _mexc_price(symbol, value):
+    c=contract(symbol)
+    unit=float(c.get("priceUnit") or 0)
+    if unit <= 0:
+        scale=c.get("priceScale")
+        unit=10.0 ** (-int(scale)) if scale is not None else 1e-8
+    return _mexc_step_value(value, unit, ROUND_HALF_UP)
+
+def _mexc_vol(symbol, value):
+    c=contract(symbol)
+    step=float(c.get("volUnit") or 1)
+    return _mexc_step_value(value, step, ROUND_DOWN)
 
 def _three_way_split(contracts, step, min_vol):
     """Prefer 25%/25%/50%; fall back to thirds if exchange granularity requires it."""
@@ -646,7 +671,8 @@ def execute_signal(result, paper_trade=None):
                 expiry_ts = datetime.fromtimestamp(raw_expiry, tz=timezone.utc)
         except Exception:
             expiry_ts = None
-        payload = {"symbol":symbol,"price":entry,"vol":contracts,"leverage":leverage,"side":1 if direction=="LONG" else 3,"type":5,"openType":1,"externalOid":oid,"stopLossPrice":stop,"takeProfitPrice":tp3,"lossTrend":2,"profitTrend":2,"positionMode":1}
+        entry_api=_mexc_price(symbol, entry); stop_api=_mexc_price(symbol, stop); tp3_api=_mexc_price(symbol, tp3); contracts_api=_mexc_vol(symbol, contracts)
+        payload = {"symbol":symbol,"price":entry_api,"vol":contracts_api,"leverage":leverage,"side":1 if direction=="LONG" else 3,"type":5,"openType":1,"externalOid":oid,"stopLossPrice":stop_api,"takeProfitPrice":tp3_api,"lossTrend":2,"profitTrend":2,"positionMode":1}
         ledger_payload = dict(payload)
         ledger_payload["effectiveRiskPct"] = effective_risk_pct
         ledger_payload["strategyTag"] = str(result.get("live_strategy_tag") or "CORE")
@@ -679,7 +705,7 @@ def execute_signal(result, paper_trade=None):
             _db("""UPDATE fh_live_trades SET status='PROTECTING',position_id=%s,actual_entry=%s,entry_fee=%s,slippage_usdt=%s,slippage_bps=%s,opened_at=NOW(),updated_at=NOW() WHERE signal_id=%s""", (position_id,fill,fee,slip,slip_bps,signal_id))
             if not _confirm_protection(symbol, position_id, stop, tp3):
                 # Attached TP/SL may take a moment to materialize; place explicit position TP/SL once.
-                _signed("POST", "/api/v1/private/stoporder/place", {"lossTrend":2,"profitTrend":2,"positionId":position_id,"vol":contracts,"stopLossPrice":stop,"takeProfitPrice":tp3,"priceProtect":0,"profitLossVolType":"SAME","volType":2,"takeProfitType":0,"takeProfitOrderPrice":0,"stopLossType":0,"stopLossOrderPrice":0})
+                _signed("POST", "/api/v1/private/stoporder/place", {"lossTrend":2,"profitTrend":2,"positionId":position_id,"vol":_mexc_vol(symbol, contracts),"stopLossPrice":_mexc_price(symbol, stop),"takeProfitPrice":_mexc_price(symbol, tp3),"priceProtect":0,"profitLossVolType":"SAME","volType":2,"takeProfitType":0,"takeProfitOrderPrice":0,"stopLossType":0,"stopLossOrderPrice":0})
                 time.sleep(1.0)
             if not _confirm_protection(symbol, position_id, stop, tp3):
                 _emergency_close(symbol, direction, position_id, contracts, signal_id)
@@ -700,53 +726,21 @@ def execute_signal(result, paper_trade=None):
             return {"executed": False, "reason": str(e)}
 
 
-def _price_unit(symbol):
-    """Return MEXC's authoritative price tick for this contract; never guess decimals."""
-    c = contract(symbol)
-    raw = c.get("priceUnit")
-    if raw is None:
-        raise RuntimeError(f"contract metadata missing priceUnit for {symbol}")
-    unit = float(raw)
-    if unit <= 0:
-        raise RuntimeError(f"invalid priceUnit={raw!r} for {symbol}")
-    return unit
-
-def _quantize_price(symbol, value):
-    """Snap a price to the live contract priceUnit using decimal arithmetic."""
-    from decimal import Decimal, ROUND_HALF_UP
-    unit = Decimal(str(_price_unit(symbol)))
-    value_d = Decimal(str(value))
-    ticks = (value_d / unit).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return float(ticks * unit)
-
 def _confirm_protection(symbol, position_id, stop, tp3):
-    # Compare exchange protection on the contract's actual price grid. This is
-    # critical for low-priced contracts such as HBAR; decimal-count guesses can
-    # reject a perfectly valid MEXC stop and unnecessarily halt the live gate.
-    try:
-        expected_stop = _quantize_price(symbol, stop)
-        expected_tp3 = _quantize_price(symbol, tp3)
-        unit = _price_unit(symbol)
-    except Exception as e:
-        _diag(f"protection precision metadata failure for {symbol}: {type(e).__name__}: {e}")
-        return False
-    tolerance = max(1e-12, unit * 0.51)
     for _ in range(4):
         try:
             rows = open_stops(symbol)
             for x in rows:
                 if int(x.get("positionId") or 0) == int(position_id) and int(x.get("state") or 0) == 1:
                     sl=float(x.get("stopLossPrice") or 0); tp=float(x.get("takeProfitPrice") or 0)
-                    if sl>0 and tp>0 and abs(sl-expected_stop) <= tolerance and abs(tp-expected_tp3) <= tolerance:
-                        return True
-        except Exception:
-            pass
+                    if sl>0 and tp>0 and abs(sl-stop) <= max(1e-10,abs(stop)*1e-6) and abs(tp-tp3) <= max(1e-10,abs(tp3)*1e-6): return True
+        except Exception: pass
         time.sleep(0.5)
     return False
 
 
 def _emergency_close(symbol, direction, position_id, contracts, signal_id):
-    payload={"symbol":symbol,"price":0,"vol":contracts,"side":4 if direction=="LONG" else 2,"type":5,"openType":1,"externalOid":_oid(signal_id,"X"),"positionId":position_id,"positionMode":1}
+    payload={"symbol":symbol,"price":0,"vol":_mexc_vol(symbol, contracts),"side":4 if direction=="LONG" else 2,"type":5,"openType":1,"externalOid":_oid(signal_id,"X"),"positionId":position_id,"positionMode":1}
     return _signed("POST", "/api/v1/private/order/create", payload)
 
 
@@ -781,6 +775,7 @@ def _partial_market_close(symbol, direction, position_id, close_vol, signal_id, 
     if vol <= 0:
         return False, "no closable volume"
     oid=_oid(signal_id, stage)
+    vol=_mexc_vol(symbol, vol)
     payload={"symbol":symbol,"price":0,"vol":vol,"side":4 if direction=="LONG" else 2,"type":5,"openType":1,"externalOid":oid,"positionId":position_id,"positionMode":1}
     try:
         _signed("POST", "/api/v1/private/order/create", payload)
@@ -914,16 +909,11 @@ def _change_position_protection(symbol, position_id, new_stop, tp3):
         _diag(f"protection ratchet observed unfamiliar profitLossVolType={mode} on {symbol}; attempting verified price update")
     elif mode == "SEPARATE":
         _diag(f"protection ratchet accepted MEXC SEPARATE mode on {symbol} position {position_id}; verification required")
-    # MEXC validates prices against each contract's priceUnit. Quantize from
-    # live metadata instead of assuming a decimal count (e.g. for HBAR).
-    try:
-        q_stop = _quantize_price(symbol, new_stop)
-        q_tp3 = _quantize_price(symbol, tp3)
-    except Exception as e:
-        return False, f"price precision metadata unavailable: {type(e).__name__}: {e}"
-    _diag(f"protection ratchet precision {symbol}: requested_stop={new_stop} -> {q_stop}, tp3={tp3} -> {q_tp3}, priceUnit={_price_unit(symbol)}")
-    _signed("POST", "/api/v1/private/stoporder/change_plan_price", {"stopPlanOrderId":stop_id,"stopLossPrice":q_stop,"takeProfitPrice":q_tp3})
-    if _confirm_protection(symbol, position_id, q_stop, q_tp3):
+    new_stop_api=_mexc_price(symbol, new_stop)
+    tp3_api=_mexc_price(symbol, tp3)
+    _diag(f"MEXC precision normalized {symbol} ratchet stop {new_stop:.12g}->{new_stop_api} tp3 {tp3:.12g}->{tp3_api}")
+    _signed("POST", "/api/v1/private/stoporder/change_plan_price", {"stopPlanOrderId":stop_id,"stopLossPrice":new_stop_api,"takeProfitPrice":tp3_api})
+    if _confirm_protection(symbol, position_id, new_stop_api, tp3_api):
         return True, stop_id
     return False, "updated TP/SL not confirmed"
 
