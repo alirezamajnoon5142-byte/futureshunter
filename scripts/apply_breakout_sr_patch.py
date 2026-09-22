@@ -57,16 +57,7 @@ helpers = '''def _v71_sr_candle_stats(closed, offset=-1):
 
 
 def _v71_sr_breakout_evidence(direction, zone, df15, df1, entry, tolerance):
-    """Decide whether a major opposing zone has been freshly broken and held.
-
-    Evidence is deliberately strict and uses CLOSED candles only. Confirmations:
-      * decisive 1h close beyond the far edge with directional body + volume; or
-      * two consecutive 15m closes beyond the far edge with participation; or
-      * a 15m breakout followed by a closed retest/hold; or
-      * an exceptional single 15m expansion candle with much stronger volume.
-    Live price must still hold at least the breakout half of the zone. A wick or
-    a failed move back through the zone center cannot consume structure.
-    """
+    """Confirm a fresh break/hold of a major zone using CLOSED candles only."""
     if not V71_SR_BREAKOUT_AWARE or df15 is None or df1 is None:
         return {"confirmed":False,"reason":"breakout-aware S/R disabled/unavailable"}
     closed15=df15.iloc[:-1]
@@ -93,6 +84,8 @@ def _v71_sr_breakout_evidence(direction, zone, df15, df1, entry, tolerance):
         live_hold=entry >= center
         retest_touch=num(latest15.get("low")) <= edge + retest_band
         retest_close=num(latest15.get("close")) > edge
+        two_close_location=num(latest15.get("close_location")) >= 0.58
+        retest_location=num(latest15.get("close_location")) >= 0.55
     else:
         edge=low
         beyond=lambda c: num(c.get("close")) < edge - margin
@@ -101,22 +94,21 @@ def _v71_sr_breakout_evidence(direction, zone, df15, df1, entry, tolerance):
         live_hold=entry <= center
         retest_touch=num(latest15.get("high")) >= edge - retest_band
         retest_close=num(latest15.get("close")) < edge
+        two_close_location=num(latest15.get("close_location")) <= 0.42
+        retest_location=num(latest15.get("close_location")) <= 0.45
 
-    decisive_1h=(
+    decisive_1h=bool(
         beyond(latest1) and quality1(latest1)
         and num(latest1.get("rv")) >= V71_SR_BREAKOUT_1H_RV
     )
-    two_15m=(
-        beyond(prev15) and beyond(latest15)
-        and num(latest15.get("close_location")) >= 0.58 if direction == "LONG" else
-        beyond(prev15) and beyond(latest15) and num(latest15.get("close_location")) <= 0.42
+    two_15m=bool(
+        beyond(prev15) and beyond(latest15) and two_close_location
+        and max(num(prev15.get("rv")),num(latest15.get("rv"))) >= V71_SR_BREAKOUT_15M_RV
     )
-    two_15m=bool(two_15m and max(num(prev15.get("rv")),num(latest15.get("rv"))) >= V71_SR_BREAKOUT_15M_RV)
     retest_hold=bool(
         beyond(prev15) and quality15(prev15,0.25,0.60 if direction == "LONG" else 0.40)
         and num(prev15.get("rv")) >= V71_SR_BREAKOUT_15M_RV
-        and retest_touch and retest_close
-        and (num(latest15.get("close_location")) >= 0.55 if direction == "LONG" else num(latest15.get("close_location")) <= 0.45)
+        and retest_touch and retest_close and retest_location
     )
     exceptional_15m=bool(
         beyond(latest15) and quality15(latest15,0.45,0.72 if direction == "LONG" else 0.28)
@@ -142,7 +134,6 @@ def _v71_structural_room(result):
     """Map major 1h/4h S/R zones and express nearest opposing structure in R."""
 '''
 replace_once(helper_anchor, helpers, "breakout helper insertion")
-
 
 old_fetch = '''        try:
             df1=get_candles(symbol,"Min60")
@@ -246,62 +237,60 @@ new_return = '''        "ok":True,
 '''
 replace_once(old_return, new_return, "S/R breakout return payload")
 
-old_gate = '''        room=num(sr.get("nearest_room_r"))
-        nearest=sr.get("nearest_zone") or {}
-        if nearest:
-            notes.append(
-                f"nearest {'resistance' if result.get('direction')=='LONG' else 'support'} "
-                f"{num(nearest.get('low')):.8g}-{num(nearest.get('high')):.8g} "
-                f"strength={num(nearest.get('strength')):.1f} room={room:.2f}R"
-            )
-        if room < V71_SR_HARD_BLOCK_R:
+old_gate = '''            room=num(sr.get("nearest_room_r"))
+            nearest=sr.get("nearest_zone") or {}
+            if nearest:
+                notes.append(
+                    f"nearest {'resistance' if result.get('direction')=='LONG' else 'support'} "
+                    f"{num(nearest.get('low')):.8g}-{num(nearest.get('high')):.8g} "
+                    f"strength={num(nearest.get('strength')):.1f} room={room:.2f}R"
+                )
+            if room < V71_SR_HARD_BLOCK_R:
 '''
-new_gate = '''        room=num(sr.get("nearest_room_r"))
-        nearest=sr.get("nearest_zone") or {}
-        raw_nearest=sr.get("raw_nearest_zone") or {}
-        breakout_zones=sr.get("breakout_confirmed_zones") or []
-        core_score=num(result.get("best_score"))
-        strong_strategy=sc == "STRONG_CONFIRM"
-        breakout_override=bool(
-            V71_SR_BREAKOUT_AWARE and breakout_zones
-            and core_score >= V71_SR_CAUTION_MIN_CORE and strong_strategy
-        )
-        if breakout_zones and breakout_override:
-            consumed=breakout_zones[0]
-            evidence=consumed.get("breakout") or {}
-            notes.append(
-                f"breakout-aware S/R: consumed "
-                f"{'resistance' if result.get('direction')=='LONG' else 'support'} "
-                f"{num(consumed.get('low')):.8g}-{num(consumed.get('high')):.8g} "
-                f"via {','.join(evidence.get('modes') or ['CONFIRMED'])}; checking next zone"
+new_gate = '''            room=num(sr.get("nearest_room_r"))
+            nearest=sr.get("nearest_zone") or {}
+            raw_nearest=sr.get("raw_nearest_zone") or {}
+            breakout_zones=sr.get("breakout_confirmed_zones") or []
+            core_score=num(result.get("best_score"))
+            strong_strategy=sc == "STRONG_CONFIRM"
+            breakout_override=bool(
+                V71_SR_BREAKOUT_AWARE and breakout_zones
+                and core_score >= V71_SR_CAUTION_MIN_CORE and strong_strategy
             )
-        elif breakout_zones:
-            # Market evidence alone cannot bypass structure. Require the same elite
-            # signal quality used by the existing crowded-path exception.
-            nearest=raw_nearest
-            room=num(raw_nearest.get("room_r")) if raw_nearest else 99.0
-            notes.append(
-                f"breakout evidence present but no structural override: Core {core_score:.1f}, Strategy {sc}"
-            )
-        if nearest:
-            notes.append(
-                f"nearest {'resistance' if result.get('direction')=='LONG' else 'support'} "
-                f"{num(nearest.get('low')):.8g}-{num(nearest.get('high')):.8g} "
-                f"strength={num(nearest.get('strength')):.1f} room={room:.2f}R"
-            )
-        if room < V71_SR_HARD_BLOCK_R:
+            if breakout_zones and breakout_override:
+                consumed=breakout_zones[0]
+                evidence=consumed.get("breakout") or {}
+                notes.append(
+                    f"breakout-aware S/R: consumed "
+                    f"{'resistance' if result.get('direction')=='LONG' else 'support'} "
+                    f"{num(consumed.get('low')):.8g}-{num(consumed.get('high')):.8g} "
+                    f"via {','.join(evidence.get('modes') or ['CONFIRMED'])}; checking next zone"
+                )
+            elif breakout_zones:
+                # Market evidence alone cannot bypass structure. Require the same elite
+                # signal quality used by the existing crowded-path exception.
+                nearest=raw_nearest
+                room=num(raw_nearest.get("room_r")) if raw_nearest else 99.0
+                notes.append(
+                    f"breakout evidence present but no structural override: Core {core_score:.1f}, Strategy {sc}"
+                )
+            if nearest:
+                notes.append(
+                    f"nearest {'resistance' if result.get('direction')=='LONG' else 'support'} "
+                    f"{num(nearest.get('low')):.8g}-{num(nearest.get('high')):.8g} "
+                    f"strength={num(nearest.get('strength')):.1f} room={room:.2f}R"
+                )
+            if room < V71_SR_HARD_BLOCK_R:
 '''
 replace_once(old_gate, new_gate, "S/R gate breakout override")
 
-# Remove the duplicate local core/strategy assignment from the caution branch;
-# it is now computed once above for both hard-block and breakout-aware paths.
-old_caution = '''        elif room < V71_SR_CAUTION_R:
-            core_score=num(result.get("best_score"))
-            strong_strategy=sc == "STRONG_CONFIRM"
-            if core_score < V71_SR_CAUTION_MIN_CORE or not strong_strategy:
+old_caution = '''            elif room < V71_SR_CAUTION_R:
+                core_score=num(result.get("best_score"))
+                strong_strategy=sc == "STRONG_CONFIRM"
+                if core_score < V71_SR_CAUTION_MIN_CORE or not strong_strategy:
 '''
-new_caution = '''        elif room < V71_SR_CAUTION_R:
-            if core_score < V71_SR_CAUTION_MIN_CORE or not strong_strategy:
+new_caution = '''            elif room < V71_SR_CAUTION_R:
+                if core_score < V71_SR_CAUTION_MIN_CORE or not strong_strategy:
 '''
 replace_once(old_caution, new_caution, "S/R caution cleanup")
 
