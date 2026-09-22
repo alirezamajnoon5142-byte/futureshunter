@@ -1,0 +1,48 @@
+name: Apply V7.8.3 edge-hold refinement
+
+on:
+  push:
+    branches:
+      - fix/v7-8-3-edge-hold-20260922
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/v7-8-3-edge-hold-20260922
+          fetch-depth: 0
+      - name: Apply edge-hold refinement
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('FuturesHunter_Render.py')
+          s=p.read_text()
+          pairs=[
+              ('        live_hold=entry >= center\n','        live_hold=entry >= edge - retest_band\n'),
+              ('        live_hold=entry <= center\n','        live_hold=entry <= edge + retest_band\n'),
+          ]
+          for old,new in pairs:
+              if s.count(old) != 1:
+                  raise SystemExit(f'anchor count {s.count(old)} for {old!r}')
+              s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          python -m py_compile FuturesHunter_Render.py
+          grep -q 'live_hold=entry >= edge - retest_band' FuturesHunter_Render.py
+          grep -q 'live_hold=entry <= edge + retest_band' FuturesHunter_Render.py
+      - name: Commit refinement
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add FuturesHunter_Render.py
+          git commit -m 'Tighten breakout hold to broken zone edge'
+          git push origin HEAD:fix/v7-8-3-edge-hold-20260922
