@@ -9,3 +9,4 @@ except ModuleNotFoundError:
     pass
 else:
     from v786_range_overlay import *  # noqa: F401,F403
+    import v786_range_hardening  # noqa: F401
