@@ -1,8 +1,9 @@
-"""FuturesHunter V7.8.4 capital-efficiency runtime overlay.
+"""FuturesHunter V7.8.5 capital-efficiency + fake-breakout runtime overlay.
 
 Loaded through PYTHONPATH=. before FuturesHunter_Render.py imports live_executor_v70.
-The overlay is deliberately future-entry focused: it does not alter existing
-exchange protection, current position size, stored TP/SL prices, or risk pct.
+The overlay preserves V7.8.4 capital-efficiency behavior and adds a conservative
+breakout-integrity assessment for future live entries. It does not alter any
+existing exchange position, stop, TP, size, or realized trade state.
 """
 import builtins
 import os
@@ -18,6 +19,22 @@ ELITE_MIN_SELECTOR = float(os.getenv("V784_ELITE_MIN_SELECTOR", "100"))
 ELITE_MAX_COST_R = float(os.getenv("V784_ELITE_MAX_COST_R", "0.15"))
 ELITE_MIN_CORE = float(os.getenv("V784_ELITE_MIN_CORE", "80"))
 ELITE_MAX_DRIFT_R = min(0.25, max(0.20, float(os.getenv("V784_ELITE_MAX_DRIFT_R", "0.25"))))
+
+# V7.8.5 fake-breakout guard. Default is SHADOW so a merge alone cannot silently
+# change live entry behavior. Promote with V785_FAKE_BREAKOUT_MODE=block only
+# after reviewing shadow classifications against research outcomes.
+FAKE_BREAKOUT_GUARD = os.getenv("V785_FAKE_BREAKOUT_GUARD", "true").lower() == "true"
+FAKE_BREAKOUT_MODE = os.getenv("V785_FAKE_BREAKOUT_MODE", "shadow").strip().lower()
+FAKE_BREAKOUT_BLOCK_SCORE = max(3, int(os.getenv("V785_FAKE_BREAKOUT_BLOCK_SCORE", "5")))
+FAKE_BREAKOUT_MIN_DEPTH_ATR = max(0.02, float(os.getenv("V785_FAKE_BREAKOUT_MIN_DEPTH_ATR", "0.10")))
+FAKE_BREAKOUT_STRONG_DEPTH_ATR = max(
+    FAKE_BREAKOUT_MIN_DEPTH_ATR,
+    float(os.getenv("V785_FAKE_BREAKOUT_STRONG_DEPTH_ATR", "0.18")),
+)
+FAKE_BREAKOUT_MIN_RAW = float(os.getenv("V785_FAKE_BREAKOUT_MIN_RAW", "64"))
+FAKE_BREAKOUT_MIN_MARGIN = float(os.getenv("V785_FAKE_BREAKOUT_MIN_MARGIN", "4.0"))
+FAKE_BREAKOUT_MIN_OI = float(os.getenv("V785_FAKE_BREAKOUT_MIN_OI", "10"))
+FAKE_BREAKOUT_MIN_RV = float(os.getenv("V785_FAKE_BREAKOUT_MIN_RV", "0.90"))
 
 
 class _TruthyZero(float):
@@ -86,9 +103,143 @@ def _elite_candidate(result):
     }
 
 
+def _breakout_depth(tf, direction):
+    """Return ATR penetration beyond the previous 20-bar boundary, or None."""
+    if not isinstance(tf, dict):
+        return None
+    atr = _f(tf.get("atr"))
+    close = _f(tf.get("close"))
+    if atr <= 0 or close <= 0:
+        return None
+    if direction == "LONG":
+        level = _f(tf.get("high20_prev"))
+        if level > 0 and close > level:
+            return (close - level) / atr
+    elif direction == "SHORT":
+        level = _f(tf.get("low20_prev"))
+        if level > 0 and close < level:
+            return (level - close) / atr
+    return None
+
+
+def _fake_breakout_assessment(result):
+    """Classify fragile BREAKOUT entries without pretending to predict certainty.
+
+    A high risk score means several independent signs say the break is easy to
+    reclaim: shallow penetration, weak close, one-timeframe-only confirmation,
+    thin raw-score margin, weak participation, or non-confirming strategy/OI.
+    """
+    meta = {
+        "active": False,
+        "risk_score": 0,
+        "risk_level": "NONE",
+        "reasons": [],
+        "block": False,
+    }
+    if not FAKE_BREAKOUT_GUARD or not isinstance(result, dict):
+        return meta
+    if str(result.get("regime") or "").upper() != "BREAKOUT":
+        return meta
+    direction = str(result.get("direction") or "").upper()
+    if direction not in {"LONG", "SHORT"}:
+        return meta
+
+    meta["active"] = True
+    tf5 = result.get("5m") or {}
+    tf15 = result.get("15m") or {}
+    depths = []
+    direct = []
+    for label, tf in (("5m", tf5), ("15m", tf15)):
+        depth = _breakout_depth(tf, direction)
+        if depth is not None:
+            depths.append(depth)
+            direct.append(label)
+
+    max_depth = max(depths) if depths else 0.0
+    meta["direct_timeframes"] = direct
+    meta["max_depth_atr"] = round(max_depth, 4)
+
+    risk = 0
+    reasons = []
+
+    if not direct:
+        risk += 3
+        reasons.append("BREAKOUT regime but neither 5m nor 15m close is beyond the 20-bar boundary")
+    elif len(direct) == 1:
+        risk += 1
+        reasons.append(f"break confirmed on only one timeframe ({direct[0]})")
+
+    if max_depth < FAKE_BREAKOUT_MIN_DEPTH_ATR:
+        risk += 2
+        reasons.append(f"shallow penetration {max_depth:.2f} ATR < {FAKE_BREAKOUT_MIN_DEPTH_ATR:.2f}")
+    elif max_depth < FAKE_BREAKOUT_STRONG_DEPTH_ATR:
+        risk += 1
+        reasons.append(f"modest penetration {max_depth:.2f} ATR")
+
+    cl5 = _f(tf5.get("close_location"), 0.5)
+    cl15 = _f(tf15.get("close_location"), 0.5)
+    if direction == "LONG":
+        decisive5 = cl5 >= 0.60
+        decisive15 = cl15 >= 0.60
+    else:
+        decisive5 = cl5 <= 0.40
+        decisive15 = cl15 <= 0.40
+    if not decisive5 and not decisive15:
+        risk += 2
+        reasons.append(f"weak directional close locations 5m={cl5:.2f}, 15m={cl15:.2f}")
+    elif not (decisive5 and decisive15):
+        risk += 1
+        reasons.append("only one timeframe closed decisively in breakout direction")
+
+    rv5 = _f(tf5.get("rv"))
+    rv15 = _f(tf15.get("rv"))
+    vol_trend = _f(tf15.get("volume_trend"))
+    if max(rv5, rv15) < FAKE_BREAKOUT_MIN_RV and vol_trend < 5:
+        risk += 1
+        reasons.append(f"weak participation rv5={rv5:.2f} rv15={rv15:.2f} volume_trend={vol_trend:.1f}")
+
+    raw = _f(result.get("raw_score"))
+    if raw < FAKE_BREAKOUT_MIN_RAW:
+        risk += 1
+        reasons.append(f"raw factor score {raw:.0f} < {FAKE_BREAKOUT_MIN_RAW:.0f}")
+
+    best = _f(result.get("best_score"))
+    threshold = _f(result.get("entry_threshold"), 68.0)
+    margin = best - threshold
+    meta["entry_margin"] = round(margin, 2)
+    if margin < FAKE_BREAKOUT_MIN_MARGIN:
+        risk += 1
+        reasons.append(f"thin ENTRY margin {margin:.1f} < {FAKE_BREAKOUT_MIN_MARGIN:.1f}")
+
+    oi = _f(result.get("oi_score"))
+    if oi < FAKE_BREAKOUT_MIN_OI:
+        risk += 1
+        reasons.append(f"OI confirmation {oi:.0f}/15 < {FAKE_BREAKOUT_MIN_OI:.0f}/15")
+
+    strategy = result.get("strategy_ensemble") or {}
+    consensus = str(strategy.get("consensus") or "").upper()
+    meta["strategy_consensus"] = consensus or "UNKNOWN"
+    if consensus and consensus not in {"CONFIRM", "STRONG_CONFIRM"}:
+        risk += 2
+        reasons.append(f"strategy ensemble is {consensus}, not CONFIRM")
+
+    meta["risk_score"] = int(risk)
+    meta["reasons"] = reasons
+    if risk >= FAKE_BREAKOUT_BLOCK_SCORE:
+        meta["risk_level"] = "HIGH"
+    elif risk >= max(3, FAKE_BREAKOUT_BLOCK_SCORE - 2):
+        meta["risk_level"] = "MEDIUM"
+    else:
+        meta["risk_level"] = "LOW"
+    meta["block"] = bool(
+        FAKE_BREAKOUT_MODE == "block" and risk >= FAKE_BREAKOUT_BLOCK_SCORE
+    )
+    return meta
+
+
 def _apply(mod):
     global _PATCHED
-    if _PATCHED or getattr(mod, "_V784_CAPITAL_EFFICIENCY_PATCHED", False):
+    if _PATCHED or getattr(mod, "_V785_BREAKOUT_GUARD_PATCHED", False):
         return
     required = ["_risk_limits", "_three_way_split", "_partial_market_close", "_manage_open_trade", "_adaptive_derisk", "execute_signal"]
     if any(not hasattr(mod, name) for name in required):
@@ -106,8 +257,6 @@ def _apply(mod):
         risk_usdt, max_notional, equity_kill = original_risk_limits(equity)
         eq = max(0.0, _f(equity))
         if COMPOUND_NOTIONAL and eq > 0:
-            # Still capped at 1.0x current equity; this increases capacity only
-            # as realized equity grows. Risk per trade stays controlled by RISK_PCT.
             max_notional = eq
         return risk_usdt, max_notional, equity_kill
 
@@ -136,17 +285,12 @@ def _apply(mod):
         return None
 
     def partial_market_close(symbol, direction, position_id, close_vol, signal_id, stage):
-        # Two-slice fallback has no TP2 size reduction. TP2 is a protection
-        # milestone only: the existing manager will ratchet the runner to +1R.
         if TINY_TWO_SLICE and str(stage or "").upper() == "P2" and abs(_f(close_vol)) <= 1e-12:
             mod._diag(f"CAPITAL EFFICIENCY TWO_SLICE TP2 {symbol}: no size close; ratchet-only milestone")
             return True, "two-slice TP2 ratchet-only"
         return original_partial_close(symbol, direction, position_id, close_vol, signal_id, stage)
 
     def adaptive_derisk(row, targets, px, tp1_vol):
-        # On a two-slice micro-position TP1 is ~50%, so do not let the +0.75R
-        # adaptive bank prematurely sell half. Stage 1 risk compression remains;
-        # normal TP1 and later positive-R locks still work unchanged.
         if _is_tiny_two_slice_row(mod, row) and not bool(row[17]):
             old_bank = mod.ADAPTIVE_BANK_MFE_R
             try:
@@ -157,9 +301,6 @@ def _apply(mod):
         return original_adaptive(row, targets, px, tp1_vol)
 
     def manage_open_trade(row, exchange_pos):
-        # Persist tp2_vol=0 for honest accounting, but pass a truthy numeric zero
-        # to the legacy manager so it does not mistake intentional two-slice mode
-        # for an uninitialized split after every restart/reconcile pass.
         if _is_tiny_two_slice_row(mod, row):
             proxy = list(row)
             proxy[16] = _TruthyZero()
@@ -167,12 +308,33 @@ def _apply(mod):
         return original_manage_open_trade(row, exchange_pos)
 
     def execute_signal(result, paper_trade=None):
+        fb = _fake_breakout_assessment(result)
+        if fb.get("active"):
+            try:
+                result["v785_fake_breakout"] = fb
+            except Exception:
+                pass
+            mod._diag(
+                "FAKE BREAKOUT GUARD "
+                f"{result.get('symbol')} {result.get('direction')} "
+                f"risk={fb.get('risk_score')} level={fb.get('risk_level')} "
+                f"depth={_f(fb.get('max_depth_atr')):.2f}ATR "
+                f"margin={_f(fb.get('entry_margin')):.1f} "
+                f"mode={FAKE_BREAKOUT_MODE}"
+            )
+            if fb.get("block"):
+                reason = "; ".join((fb.get("reasons") or [])[:3]) or "fragile breakout"
+                mod._diag(
+                    f"FAKE BREAKOUT BLOCK {result.get('symbol')} {result.get('direction')} — {reason}"
+                )
+                return {
+                    "executed": False,
+                    "reason": f"fake-breakout guard risk {fb.get('risk_score')} >= {FAKE_BREAKOUT_BLOCK_SCORE}: {reason}",
+                }
+
         elite, meta = _elite_candidate(result)
         if not elite:
             return original_execute(result, paper_trade)
-        # The executor already uses an RLock. Hold it while temporarily raising
-        # the drift ceiling so both pre-submit and post-fill guards use the same
-        # elite limit, then restore the baseline immediately.
         with mod._lock:
             old_limit = mod.MAX_ENTRY_DRIFT_R
             try:
@@ -190,13 +352,17 @@ def _apply(mod):
     def diagnostic_state():
         state = original_diagnostic()
         state.update({
-            "version": "7.8.4-capital-efficiency-overlay",
+            "version": "7.8.5-fake-breakout-guard",
             "capital_efficiency_overlay": True,
             "compound_notional": COMPOUND_NOTIONAL,
             "tiny_two_slice": TINY_TWO_SLICE,
             "elite_chase": ELITE_CHASE,
             "elite_max_drift_r": ELITE_MAX_DRIFT_R,
             "baseline_max_entry_drift_r": mod.MAX_ENTRY_DRIFT_R,
+            "fake_breakout_guard": FAKE_BREAKOUT_GUARD,
+            "fake_breakout_mode": FAKE_BREAKOUT_MODE,
+            "fake_breakout_block_score": FAKE_BREAKOUT_BLOCK_SCORE,
+            "fake_breakout_min_depth_atr": FAKE_BREAKOUT_MIN_DEPTH_ATR,
         })
         return state
 
@@ -207,13 +373,13 @@ def _apply(mod):
     mod._manage_open_trade = manage_open_trade
     mod.execute_signal = execute_signal
     mod.diagnostic_state = diagnostic_state
-    mod.V70_VERSION = "7.8.4-capital-efficiency-overlay"
-    mod._V784_CAPITAL_EFFICIENCY_PATCHED = True
+    mod.V70_VERSION = "7.8.5-fake-breakout-guard"
+    mod._V785_BREAKOUT_GUARD_PATCHED = True
     _PATCHED = True
     try:
         mod._diag(
-            "V7.8.4 capital-efficiency overlay active: "
-            "1x-equity compounding cap, tiny 50/runner fallback, elite 0.25R chase"
+            "V7.8.5 overlay active: V7.8.4 capital efficiency + "
+            f"fake-breakout guard mode={FAKE_BREAKOUT_MODE} block_score={FAKE_BREAKOUT_BLOCK_SCORE}"
         )
     except Exception:
         pass
@@ -225,10 +391,9 @@ def _import(name, globals=None, locals=None, fromlist=(), level=0):
         target = sys.modules.get("live_executor_v70")
         if target is not None:
             _apply(target)
-            # Narrow hook: once the target is patched, restore normal imports.
             builtins.__import__ = _ORIGINAL_IMPORT
     return module
 
 
 builtins.__import__ = _import
-print("[V7DIAG] V7.8.4 capital-efficiency overlay armed", flush=True)
+print("[V7DIAG] V7.8.5 fake-breakout overlay armed", flush=True)
