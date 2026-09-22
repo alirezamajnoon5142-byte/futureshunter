@@ -1,4 +1,4 @@
-"""FuturesHunter V7.9.0 runtime bootstrap.
+"""FuturesHunter V7.9.1 runtime bootstrap.
 
 During Render's dependency-install phase third-party packages may not exist yet.
 Skip the runtime overlays in that phase; they load normally when the service starts.
@@ -14,3 +14,4 @@ else:
     import v787_metals_range_economics  # noqa: F401
     import v789_thesis_failure_guard  # noqa: F401
     import v790_range_observer  # noqa: F401
+    import v791_challenger_rotation  # noqa: F401
