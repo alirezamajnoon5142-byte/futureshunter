@@ -1,0 +1,46 @@
+name: Apply V7.8.3 Breakout S/R Patch
+
+on:
+  push:
+    branches:
+      - fix/v7-8-3-breakout-aware-sr-20260922
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/v7-8-3-breakout-aware-sr-20260922
+          fetch-depth: 0
+
+      - name: Apply deterministic patch
+        run: python scripts/apply_breakout_sr_patch.py
+
+      - name: Compile-check FuturesHunter
+        run: python -m py_compile FuturesHunter_Render.py
+
+      - name: Verify breakout-aware anchors
+        run: |
+          grep -q 'V71_SR_BREAKOUT_AWARE' FuturesHunter_Render.py
+          grep -q 'def _v71_sr_breakout_evidence' FuturesHunter_Render.py
+          grep -q '7.8.3-breakout-aware-sr' FuturesHunter_Render.py
+
+      - name: Commit patched engine
+        run: |
+          if git diff --quiet -- FuturesHunter_Render.py; then
+            echo 'No engine changes needed.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add FuturesHunter_Render.py
+          git commit -m 'Apply V7.8.3 breakout-aware structural gate'
+          git push origin HEAD:fix/v7-8-3-breakout-aware-sr-20260922
