@@ -90,14 +90,14 @@ def _apply(mod):
     global _PATCHED
     if _PATCHED or getattr(mod, "_V784_CAPITAL_EFFICIENCY_PATCHED", False):
         return
-    required = ["_risk_limits", "_three_way_split", "_partial_market_close", "_manage_row", "_adaptive_derisk", "execute_signal"]
+    required = ["_risk_limits", "_three_way_split", "_partial_market_close", "_manage_open_trade", "_adaptive_derisk", "execute_signal"]
     if any(not hasattr(mod, name) for name in required):
         return
 
     original_risk_limits = mod._risk_limits
     original_split = mod._three_way_split
     original_partial_close = mod._partial_market_close
-    original_manage_row = mod._manage_row
+    original_manage_open_trade = mod._manage_open_trade
     original_adaptive = mod._adaptive_derisk
     original_execute = mod.execute_signal
     original_diagnostic = mod.diagnostic_state
@@ -156,15 +156,15 @@ def _apply(mod):
                 mod.ADAPTIVE_BANK_MFE_R = old_bank
         return original_adaptive(row, targets, px, tp1_vol)
 
-    def manage_row(row):
+    def manage_open_trade(row, exchange_pos):
         # Persist tp2_vol=0 for honest accounting, but pass a truthy numeric zero
         # to the legacy manager so it does not mistake intentional two-slice mode
         # for an uninitialized split after every restart/reconcile pass.
         if _is_tiny_two_slice_row(mod, row):
             proxy = list(row)
             proxy[16] = _TruthyZero()
-            return original_manage_row(tuple(proxy))
-        return original_manage_row(row)
+            return original_manage_open_trade(tuple(proxy), exchange_pos)
+        return original_manage_open_trade(row, exchange_pos)
 
     def execute_signal(result, paper_trade=None):
         elite, meta = _elite_candidate(result)
@@ -204,7 +204,7 @@ def _apply(mod):
     mod._three_way_split = three_way_split
     mod._partial_market_close = partial_market_close
     mod._adaptive_derisk = adaptive_derisk
-    mod._manage_row = manage_row
+    mod._manage_open_trade = manage_open_trade
     mod.execute_signal = execute_signal
     mod.diagnostic_state = diagnostic_state
     mod.V70_VERSION = "7.8.4-capital-efficiency-overlay"
