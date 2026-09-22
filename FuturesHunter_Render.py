@@ -11857,7 +11857,7 @@ def _v71_sr_breakout_evidence(direction, zone, df15, df1, entry, tolerance):
         beyond=lambda c: num(c.get("close")) > edge + margin
         quality15=lambda c,body=0.30,loc=0.62: num(c.get("body")) >= body and num(c.get("close_location")) >= loc
         quality1=lambda c: num(c.get("body")) >= 0.25 and num(c.get("close_location")) >= 0.62
-        live_hold=entry >= center
+        live_hold=entry >= edge - retest_band
         retest_touch=num(latest15.get("low")) <= edge + retest_band
         retest_close=num(latest15.get("close")) > edge
         two_close_location=num(latest15.get("close_location")) >= 0.58
@@ -11867,7 +11867,7 @@ def _v71_sr_breakout_evidence(direction, zone, df15, df1, entry, tolerance):
         beyond=lambda c: num(c.get("close")) < edge - margin
         quality15=lambda c,body=0.30,loc=0.38: num(c.get("body")) <= -body and num(c.get("close_location")) <= loc
         quality1=lambda c: num(c.get("body")) <= -0.25 and num(c.get("close_location")) <= 0.38
-        live_hold=entry <= center
+        live_hold=entry <= edge + retest_band
         retest_touch=num(latest15.get("high")) >= edge - retest_band
         retest_close=num(latest15.get("close")) < edge
         two_close_location=num(latest15.get("close_location")) <= 0.42
