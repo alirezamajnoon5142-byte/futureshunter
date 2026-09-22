@@ -15,3 +15,4 @@ else:
     import v789_thesis_failure_guard  # noqa: F401
     import v790_range_observer  # noqa: F401
     import v791_challenger_rotation  # noqa: F401
+    import v791_missed_audit_paper_bridge  # noqa: F401
