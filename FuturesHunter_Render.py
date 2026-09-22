@@ -11661,6 +11661,23 @@ V71_MAX_COST_FRACTION_R = float(os.getenv("V71_MAX_COST_FRACTION_R", "0.35"))
 V71_EST_TAKER_FEE_BPS = float(os.getenv("V71_EST_TAKER_FEE_BPS", "5.0"))
 V71_EST_SLIPPAGE_BPS = float(os.getenv("V71_EST_SLIPPAGE_BPS", "4.0"))
 V71_STRUCTURAL_RESET_SCORE_DELTA = float(os.getenv("V71_STRUCTURAL_RESET_SCORE_DELTA", "8.0"))
+
+# V7.8.2 structural support/resistance live-entry reality check.
+# This gate NEVER mutates an already-open live trade and NEVER changes the
+# control-paper target geometry. It only decides whether a future live mirror
+# has enough clean structural room to justify its mechanical R ladder.
+V71_SR_GATE = os.getenv("V71_SR_GATE", "true").lower() == "true"
+V71_SR_CACHE_SECONDS = max(30, int(os.getenv("V71_SR_CACHE_SECONDS", "180")))
+V71_SR_PIVOT_RADIUS = max(1, int(os.getenv("V71_SR_PIVOT_RADIUS", "2")))
+V71_SR_LOOKBACK_1H = max(48, int(os.getenv("V71_SR_LOOKBACK_1H", "120")))
+V71_SR_LOOKBACK_4H = max(36, int(os.getenv("V71_SR_LOOKBACK_4H", "90")))
+V71_SR_ZONE_ATR_MULT = max(0.10, float(os.getenv("V71_SR_ZONE_ATR_MULT", "0.35")))
+V71_SR_MIN_ZONE_STRENGTH = max(2.0, float(os.getenv("V71_SR_MIN_ZONE_STRENGTH", "3.0")))
+V71_SR_HARD_BLOCK_R = max(0.10, float(os.getenv("V71_SR_HARD_BLOCK_R", "0.50")))
+V71_SR_CAUTION_R = max(V71_SR_HARD_BLOCK_R, float(os.getenv("V71_SR_CAUTION_R", "1.25")))
+V71_SR_CAUTION_MIN_CORE = float(os.getenv("V71_SR_CAUTION_MIN_CORE", "90.0"))
+V71_SR_CONTEXT_CACHE = {}
+
 # V7.2 adaptive quality gate: when the recent tape/regime is degraded, demand a
 # stronger Core score plus Strategy confirmation. V6.9.1 paper control is untouched.
 V72_ADAPTIVE_GATE = os.getenv("V72_ADAPTIVE_GATE", "true").lower() == "true"
@@ -11708,6 +11725,159 @@ def _v71_bucket_stop_cluster(trades, result):
         if num(t.get("closed_time")) < cutoff: continue
         if _v681_asset_bucket(t.get("symbol")) == bucket: hits.append(t.get("symbol"))
     return len(hits), hits
+
+def _v71_sr_atr(df, lookback=14):
+    if df is None or len(df) < 3:
+        return 0.0
+    closed=df.iloc[:-1].copy()
+    if len(closed) < 3:
+        return 0.0
+    high=closed["high"].astype(float)
+    low=closed["low"].astype(float)
+    close=closed["close"].astype(float)
+    prev=close.shift(1)
+    tr=pd.concat([(high-low),(high-prev).abs(),(low-prev).abs()],axis=1).max(axis=1)
+    vals=tr.dropna().tail(max(3,int(lookback)))
+    return float(vals.mean()) if len(vals) else 0.0
+
+
+def _v71_sr_pivots(df, source, weight, lookback):
+    """Closed-candle local swing pivots only; no look-ahead into the live candle."""
+    if df is None or len(df) < (2*V71_SR_PIVOT_RADIUS + 8):
+        return []
+    closed=df.iloc[:-1].tail(max(20,int(lookback))).reset_index(drop=True)
+    radius=V71_SR_PIVOT_RADIUS
+    out=[]
+    for i in range(radius, len(closed)-radius):
+        window=closed.iloc[i-radius:i+radius+1]
+        hi=num(closed.iloc[i]["high"]); lo=num(closed.iloc[i]["low"])
+        ts=normalize_candle_time(closed.iloc[i]["time"])
+        if hi > 0 and hi >= num(window["high"].max()):
+            out.append({"kind":"R","price":hi,"weight":float(weight),"source":source,"time":ts})
+        if lo > 0 and lo <= num(window["low"].min()):
+            out.append({"kind":"S","price":lo,"weight":float(weight),"source":source,"time":ts})
+    return out
+
+
+def _v71_sr_cluster(points, tolerance):
+    if not points or tolerance <= 0:
+        return []
+    zones=[]
+    for point in sorted(points,key=lambda x:num(x.get("price"))):
+        px=num(point.get("price"))
+        match=None
+        for zone in zones:
+            if abs(px-num(zone.get("center"))) <= tolerance:
+                match=zone
+                break
+        if match is None:
+            match={
+                "center":px,"min":px,"max":px,"strength":0.0,"touches":0,
+                "sources":set(),"weighted_sum":0.0,"weight_sum":0.0,
+                "last_time":0.0,
+            }
+            zones.append(match)
+        w=max(0.1,num(point.get("weight")))
+        match["strength"] += w
+        match["touches"] += 1
+        match["sources"].add(str(point.get("source") or ""))
+        match["weighted_sum"] += px*w
+        match["weight_sum"] += w
+        match["center"] = match["weighted_sum"]/max(match["weight_sum"],1e-9)
+        match["min"] = min(num(match["min"]),px)
+        match["max"] = max(num(match["max"]),px)
+        match["last_time"] = max(num(match["last_time"]),num(point.get("time")))
+    clean=[]
+    for zone in zones:
+        if num(zone.get("strength")) < V71_SR_MIN_ZONE_STRENGTH:
+            continue
+        pad=0.20*tolerance
+        clean.append({
+            "center":num(zone["center"]),
+            "low":num(zone["min"])-pad,
+            "high":num(zone["max"])+pad,
+            "strength":round(num(zone["strength"]),2),
+            "touches":int(zone["touches"]),
+            "sources":sorted(zone["sources"]),
+            "last_time":num(zone["last_time"]),
+        })
+    return clean
+
+
+def _v71_structural_room(result):
+    """Map major 1h/4h S/R zones and express nearest opposing structure in R."""
+    symbol=str(result.get("symbol") or "")
+    direction=str(result.get("direction") or "").upper()
+    plan=result.get("risk_plan") or {}
+    entry=num(result.get("price")); stop=num(plan.get("stop"))
+    risk=abs(entry-stop)
+    if not symbol or direction not in {"LONG","SHORT"} or entry <= 0 or risk <= 0:
+        return {"ok":False,"reason":"invalid S/R geometry"}
+
+    now=time.time()
+    cached=V71_SR_CONTEXT_CACHE.get(symbol)
+    context=None
+    if cached and now-num(cached.get("ts")) <= V71_SR_CACHE_SECONDS:
+        context=cached.get("context")
+    if context is None:
+        try:
+            df1=get_candles(symbol,"Min60")
+            time.sleep(0.05)
+            df4=get_candles(symbol,"Hour4")
+            if df1 is None or df4 is None or len(df1) < 60 or len(df4) < 45:
+                return {"ok":False,"reason":"insufficient 1h/4h structure history"}
+            atr1=_v71_sr_atr(df1)
+            if atr1 <= 0:
+                return {"ok":False,"reason":"invalid 1h ATR for S/R"}
+            tolerance=max(V71_SR_ZONE_ATR_MULT*atr1, entry*0.0015)
+            piv1=_v71_sr_pivots(df1,"1h",1.0,V71_SR_LOOKBACK_1H)
+            piv4=_v71_sr_pivots(df4,"4h",2.0,V71_SR_LOOKBACK_4H)
+            supports=_v71_sr_cluster([p for p in piv1+piv4 if p.get("kind")=="S"],tolerance)
+            resistances=_v71_sr_cluster([p for p in piv1+piv4 if p.get("kind")=="R"],tolerance)
+            context={"atr1h":atr1,"tolerance":tolerance,"supports":supports,"resistances":resistances}
+            V71_SR_CONTEXT_CACHE[symbol]={"ts":now,"context":context}
+        except Exception as error:
+            return {"ok":False,"reason":f"S/R context error: {type(error).__name__}: {error}"}
+
+    zones=context["resistances"] if direction=="LONG" else context["supports"]
+    opposing=[]
+    for z in zones:
+        low=num(z.get("low")); high=num(z.get("high"))
+        if direction=="LONG":
+            if high <= entry:
+                continue
+            distance=max(0.0,low-entry)
+        else:
+            if low >= entry:
+                continue
+            distance=max(0.0,entry-high)
+        zr=distance/risk
+        item=dict(z); item["distance"]=distance; item["room_r"]=zr
+        opposing.append(item)
+    opposing.sort(key=lambda z:num(z.get("room_r")))
+    nearest=opposing[0] if opposing else None
+
+    tp1=num(plan.get("tp1")); tp2=num(plan.get("tp2")); tp3=num(plan.get("tp3"))
+    def before_target(zone,target):
+        if zone is None or target <= 0:
+            return False
+        if direction=="LONG":
+            return num(zone.get("low")) <= target
+        return num(zone.get("high")) >= target
+
+    return {
+        "ok":True,
+        "nearest_zone":nearest,
+        "nearest_room_r":num(nearest.get("room_r")) if nearest else 99.0,
+        "nearest_strength":num(nearest.get("strength")) if nearest else 0.0,
+        "tp1_requires_break":before_target(nearest,tp1),
+        "tp2_requires_break":before_target(nearest,tp2),
+        "tp3_requires_break":before_target(nearest,tp3),
+        "major_opposing_zones":opposing[:5],
+        "atr1h":num(context.get("atr1h")),
+        "zone_tolerance":num(context.get("tolerance")),
+    }
+
 
 def _v71_estimated_cost_r(result):
     plan=result.get("risk_plan") or {}; entry=max(num(result.get("price")),1e-12)
@@ -11907,6 +12077,42 @@ def _v71_live_candidate_gate(result, trades):
     cost_r=_v71_estimated_cost_r(result)
     if V71_COST_GATE and cost_r > V71_MAX_COST_FRACTION_R:
         reasons.append(f"estimated execution drag {cost_r:.2f}R > {V71_MAX_COST_FRACTION_R:.2f}R")
+
+    sr={"ok":True,"nearest_room_r":99.0}
+    if V71_SR_GATE:
+        sr=_v71_structural_room(result)
+        result["support_resistance"]=sr
+        if not sr.get("ok"):
+            reasons.append(f"support/resistance context unavailable: {sr.get('reason') or 'unknown'}")
+        else:
+            room=num(sr.get("nearest_room_r"))
+            nearest=sr.get("nearest_zone") or {}
+            if nearest:
+                notes.append(
+                    f"nearest {'resistance' if result.get('direction')=='LONG' else 'support'} "
+                    f"{num(nearest.get('low')):.8g}-{num(nearest.get('high')):.8g} "
+                    f"strength={num(nearest.get('strength')):.1f} room={room:.2f}R"
+                )
+            if room < V71_SR_HARD_BLOCK_R:
+                reasons.append(
+                    f"major {'resistance' if result.get('direction')=='LONG' else 'support'} "
+                    f"only {room:.2f}R away (< {V71_SR_HARD_BLOCK_R:.2f}R clean-room minimum)"
+                )
+            elif room < V71_SR_CAUTION_R:
+                core_score=num(result.get("best_score"))
+                strong_strategy=sc == "STRONG_CONFIRM"
+                if core_score < V71_SR_CAUTION_MIN_CORE or not strong_strategy:
+                    reasons.append(
+                        f"crowded structural path: nearest major "
+                        f"{'resistance' if result.get('direction')=='LONG' else 'support'} "
+                        f"at {room:.2f}R; require Core >= {V71_SR_CAUTION_MIN_CORE:.0f} "
+                        f"+ STRONG_CONFIRM to trade through it"
+                    )
+                else:
+                    notes.append(
+                        f"elite breakout exception: {room:.2f}R structural room, "
+                        f"Core {core_score:.1f} + STRONG_CONFIRM"
+                    )
     selector_score=_v71_selector_score(result,cost_r,cluster_count)
     degraded = bool(
         cluster_count > 0
@@ -11928,7 +12134,8 @@ def _v71_live_candidate_gate(result, trades):
             "notes":notes,"risk_decision":rd,"strategy_consensus":sc,"btc_weak":bool(risk.get("btc_weak")),
             "macro_conflict":bool(risk.get("macro_conflict")),"recent_stop_count":cluster_count,
             "recent_stop_symbols":cluster_symbols,"estimated_cost_r":round(cost_r,4),"selector_score":selector_score,
-            "evaluated_ts":time.time(),"version":"7.4.4-live-risk","live_exposure_count":risk.get("open_count",0),"live_exposure_symbols":risk.get("open_symbols",[]),"exposure_source":risk.get("exposure_source")}
+            "support_resistance":sr,
+            "evaluated_ts":time.time(),"version":"7.8.2-structural-sr-gate","live_exposure_count":risk.get("open_count",0),"live_exposure_symbols":risk.get("open_symbols",[]),"exposure_source":risk.get("exposure_source")}
 
 def _v71_store_challenger(trade, gate):
     if not V71_CHALLENGER_DB_READY or not trade: return
@@ -12901,7 +13108,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "service": "FuturesHunter",
-                "version": "7.8.1-oid-safe-adaptive-recovery",
+                "version": "7.8.2-structural-sr-gate",
                 "equity_shadow_lab": ("active" if V73_EQUITY_DB_READY else "disabled_or_unavailable"),
                 "equity_agent_ensemble": ("active" if V76_DB_READY else "disabled_or_unavailable"),
                 "equity_agents": list(V76_AGENT_NAMES),
@@ -12918,6 +13125,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 "v77_metals_context": "cross_metal_shadow",
                 "live_pilot": ("enabled" if (V70_LIVE is not None and V70_LIVE.ENABLED) else "disabled"),
                 "adaptive_derisk_governor": bool(V70_LIVE is not None and getattr(V70_LIVE, "ADAPTIVE_DERISK_ENABLED", False)),
+                "structural_sr_gate": bool(V71_SR_GATE),
+                "structural_sr_hard_block_r": V71_SR_HARD_BLOCK_R,
+                "structural_sr_caution_r": V71_SR_CAUTION_R,
                 "v70_selective_gate": bool(V70_SELECTIVE_GATE),
                 "v70_same_symbol_cooldown_minutes": V70_SAME_SYMBOL_COOLDOWN_MINUTES,
                 "v71_selection_challenger": "active" if V71_CHALLENGER_DB_READY else "local_only",
