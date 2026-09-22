@@ -4,19 +4,13 @@ Production-only additions for RANGE_SCALPER:
 - current MEXC API taker-fee aware economics (8 bps/side by default),
 - spread + two-sided slippage + adverse funding settlement cost,
 - minimum positive net edge before a range can execute,
-- trading-session guard for exchange-traded base metals with daily suspensions.
+- current 24/7 metal-universe compatibility (exchange circuit breakers still fail closed).
 
 Core trend/breakout logic and existing positions are untouched.
 """
 import math
 import os
 import time
-from datetime import datetime, timezone
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover
-    ZoneInfo = None
-
 import v786_range_overlay as base
 import v786_range_hardening as hard
 
@@ -33,7 +27,7 @@ MAX_FUNDING_COST_BPS = max(5.0, float(os.getenv("V787_MAX_FUNDING_COST_BPS", "10
 
 KNOWN_FUNDING_CYCLE_HOURS = {"COPPER_USDT": 4.0}
 DEFAULT_FUNDING_CYCLE_HOURS = 8.0
-SESSION_BASE_METALS = {"ALUMINUM_USDT", "ZINC_USDT", "NICKEL_USDT"}
+SESSION_BASE_METALS = set()  # Verified 24/7 for ALUMINUM/ZINC/NICKEL/LEAD as of Jun 2026.
 
 
 def _row_for_symbol(data, symbol):
@@ -178,43 +172,23 @@ def _v787_economic_edge_ok(result):
 
 
 def _session_open(symbol, now_ts=None):
-    symbol = str(symbol or "").upper()
-    if symbol not in SESSION_BASE_METALS:
-        return True
-    now_utc = datetime.fromtimestamp(now_ts or time.time(), tz=timezone.utc)
-    if now_utc.weekday() >= 5:
-        return False
-
-    summer = True
-    if ZoneInfo is not None:
-        try:
-            ny = now_utc.astimezone(ZoneInfo("America/New_York"))
-            summer = bool(ny.dst() and ny.dst().total_seconds())
-        except Exception:
-            pass
-
-    minute = now_utc.hour * 60 + now_utc.minute
-    close_min = (17 * 60 + 30) if summer else (18 * 60 + 30)
-    if symbol == "NICKEL_USDT":
-        open_min = 30 if summer else 90
-    else:
-        open_min = 90 if summer else 150
-    return open_min <= minute < close_min
+    # Current verified metal universe is 24/7 unless MEXC triggers a circuit breaker.
+    # Execution remains fail-closed at the exchange if a contract is temporarily halted.
+    return True
 
 
 def _v787_range_candidate(symbol):
     if not _session_open(symbol):
         return None
-    result = PREVIOUS_RANGE_CANDIDATE(symbol)
-    if result is None:
-        return None
-    return result if _v787_economic_edge_ok(result) else None
+    # PREVIOUS_RANGE_CANDIDATE resolves hard._economic_edge_ok dynamically, so
+    # it has already passed the V7.8.7 net-edge/funding check.
+    return PREVIOUS_RANGE_CANDIDATE(symbol)
 
 
 hard._economic_edge_ok = _v787_economic_edge_ok
 base._range_candidate = _v787_range_candidate
 
 print(
-    "[V7DIAG] V7.8.7 METALS RANGE ECONOMICS armed: 16bps API round-trip fee + spread + slippage + adverse funding; session-aware",
+    "[V7DIAG] V7.8.7 METALS RANGE ECONOMICS armed: 16bps API round-trip fee + spread + slippage + adverse funding; 24/7 metals universe",
     flush=True,
 )
