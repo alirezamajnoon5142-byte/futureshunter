@@ -1,4 +1,4 @@
-"""FuturesHunter V7.9.4 runtime bootstrap.
+"""FuturesHunter V8.0 runtime bootstrap.
 
 During Render's dependency-install phase third-party packages may not exist yet.
 Skip the runtime overlays in that phase; they load normally when the service starts.
@@ -19,3 +19,4 @@ else:
     import v792_second_crypto_slot  # noqa: F401
     import v793_range_fee_aware_manager  # noqa: F401
     import v794_trust_breakout  # noqa: F401
+    import v800_research_brain  # noqa: F401
