@@ -1,4 +1,4 @@
-"""FuturesHunter V7.9.3 runtime bootstrap.
+"""FuturesHunter V7.9.4 runtime bootstrap.
 
 During Render's dependency-install phase third-party packages may not exist yet.
 Skip the runtime overlays in that phase; they load normally when the service starts.
