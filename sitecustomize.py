@@ -19,4 +19,5 @@ else:
     import v792_second_crypto_slot  # noqa: F401
     import v793_range_fee_aware_manager  # noqa: F401
     import v794_trust_breakout  # noqa: F401
+    import v795_spx_retrace_watch  # noqa: F401
     import v800_research_brain  # noqa: F401
