@@ -18,3 +18,4 @@ else:
     import v791_missed_audit_paper_bridge  # noqa: F401
     import v792_second_crypto_slot  # noqa: F401
     import v793_range_fee_aware_manager  # noqa: F401
+    import v794_trust_breakout  # noqa: F401
