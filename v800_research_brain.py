@@ -1,4 +1,4 @@
-"""FuturesHunter V8.0 Research Brain — SHADOW ONLY.
+"""FuturesHunter V8.0.1 Research Brain — SHADOW ONLY.
 
 Purpose:
 - observe the FINAL live-selector decision after all V7 overlays,
@@ -183,7 +183,7 @@ def _brain_snapshot(result, gate):
     lv = _risk_levels(result)
     p = _research_probability(result, gate)
     return {
-        "version": "8.0.0-shadow-research-brain",
+        "version": "8.0.1-shadow-research-brain",
         "shadow_only": True,
         "symbol": str((result or {}).get("symbol") or ""),
         "direction": _norm((result or {}).get("direction")),
@@ -284,6 +284,94 @@ def _ensure_schema():
     except Exception as exc:
         live._diag(f"V8.0 schema retry: {type(exc).__name__}: {exc}")
         return False
+
+
+def _backfill_legacy_rows():
+    """Backfill pre-V8 challenger decisions from durable V7 + research-scan data.
+
+    This is research-only. The reconstructed snapshot is explicitly marked
+    backfilled and never feeds the live gate.
+    """
+    rows = live._db(
+        """SELECT c.source_key,c.evaluated_time,c.symbol,c.direction,c.decision,
+                  c.core_score,c.risk_decision,c.strategy_consensus,c.btc_weak,c.macro_conflict,
+                  c.estimated_cost_r,c.selector_score,COALESCE(c.audit_skip_class,'OTHER'),
+                  c.reasons,c.payload,
+                  s.signal_state,s.selected_regime,s.raw_score,s.weighted_score,s.oi_score,s.price
+           FROM fh_v71_challenger c
+           LEFT JOIN fh_v80_brain b ON b.source_key=c.source_key
+           LEFT JOIN LATERAL (
+               SELECT signal_state,selected_regime,raw_score,weighted_score,oi_score,price
+               FROM fh_research_scans s
+               WHERE s.symbol=c.symbol
+                 AND (s.selected_direction=c.direction OR s.selected_direction IS NULL)
+                 AND s.scan_time BETWEEN c.evaluated_time-INTERVAL '12 minutes'
+                                     AND c.evaluated_time+INTERVAL '3 minutes'
+               ORDER BY ABS(EXTRACT(EPOCH FROM (s.scan_time-c.evaluated_time)))
+               LIMIT 1
+           ) s ON TRUE
+           WHERE b.source_key IS NULL
+             AND c.evaluated_time >= NOW()-(%s || ' days')::interval
+           ORDER BY c.evaluated_time
+           LIMIT 500""",
+        (str(LOOKBACK_DAYS),), "all"
+    ) or []
+    inserted = 0
+    for row in rows:
+        (
+            source_key,evaluated_time,symbol,direction,decision,core,risk_decision,strategy,
+            btc_weak,macro_conflict,cost_r,selector_score,skip_class,reasons,payload,
+            state,regime,raw,weighted,oi,price
+        ) = row
+        gate_payload = payload if isinstance(payload, dict) else {}
+        gate = dict(gate_payload)
+        gate.update({
+            "decision": decision,
+            "risk_decision": risk_decision,
+            "strategy_consensus": strategy,
+            "btc_weak": bool(btc_weak),
+            "macro_conflict": bool(macro_conflict),
+            "estimated_cost_r": _f(cost_r),
+            "selector_score": _f(selector_score),
+            "reasons": list(reasons or []),
+        })
+        result = {
+            "symbol": symbol, "direction": direction, "best_score": _f(core),
+            "raw_score": _f(raw), "weighted_score": _f(weighted), "oi_score": _f(oi),
+            "signal_state": state or "ENTRY", "regime": regime or "",
+            "price": _f(price), "risk_plan": {},
+        }
+        b = _brain_snapshot(result, gate)
+        b["backfilled_legacy"] = True
+        b["levels"] = {}
+        b["invalidation"] = (
+            "Historical backfill: exact live risk-plan stop was not stored in the challenger row; "
+            "outcome is taken only from the durable paper/missed-audit ledger."
+        )
+        live._db(
+            """INSERT INTO fh_v80_brain(
+                source_key,observed_at,symbol,direction,state,regime,core_score,raw_score,weighted_score,oi_score,
+                selector_score,strategy_consensus,risk_decision,estimated_cost_r,btc_weak,macro_conflict,
+                support_room_r,live_exposure_count,live_decision,skip_class,prob_positive_r,confidence_bucket,
+                thesis,bear_case,invalidation,levels,reasons,notes,payload
+            ) VALUES(
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s
+            ) ON CONFLICT(source_key) DO NOTHING""",
+            (
+                str(source_key),evaluated_time,str(symbol),_norm(direction),b.get("state"),b.get("regime"),
+                _f(b.get("core_score")),_f(b.get("raw_score")),_f(b.get("weighted_score")),_f(b.get("oi_score")),
+                _f(b.get("selector_score")),b.get("strategy_consensus"),b.get("risk_decision"),
+                _f(b.get("estimated_cost_r")),bool(b.get("btc_weak")),bool(b.get("macro_conflict")),
+                _f(b.get("support_room_r"),99.0),_i(b.get("live_exposure_count")),_norm(decision),
+                str(skip_class or "OTHER"),_f(b.get("prob_positive_r")),b.get("confidence_bucket"),
+                b.get("thesis"),b.get("bear_case"),b.get("invalidation"),_json({}),
+                _json(b.get("reasons") or []),_json(b.get("notes") or []),_json(b)
+            )
+        )
+        inserted += 1
+    return inserted
 
 
 def _import_new_rows():
@@ -535,10 +623,13 @@ def _sync_loop():
     while True:
         try:
             if _ensure_schema():
+                backfilled = _backfill_legacy_rows()
                 inserted = _import_new_rows()
                 settled = _sync_outcomes()
-                if inserted or settled:
-                    live._diag(f"V8.0 RESEARCH sync new={inserted} settled={settled}")
+                if backfilled or inserted or settled:
+                    live._diag(
+                        f"V8.0 RESEARCH sync backfilled={backfilled} new={inserted} settled={settled}"
+                    )
                 now = datetime.now(tz)
                 today = now.date()
                 due = (now.hour > REPORT_HOUR) or (now.hour == REPORT_HOUR and now.minute >= REPORT_MINUTE)
@@ -603,7 +694,7 @@ def _patch(main):
         _PATCHED = True
         threading.Thread(target=_sync_loop, name="V800ResearchBrain", daemon=True).start()
         live._diag(
-            f"V8.0 Research Brain armed SHADOW_ONLY=True live_gate_unchanged=True "
+            f"V8.0.1 Research Brain armed SHADOW_ONLY=True live_gate_unchanged=True "
             f"sync={SYNC_SECONDS}s nightly={REPORT_HOUR:02d}:{REPORT_MINUTE:02d} {REPORT_TZ} "
             f"lookback={LOOKBACK_DAYS}d auto_ship=False"
         )
@@ -625,4 +716,4 @@ def _bootstrap():
 
 if ENABLED:
     threading.Thread(target=_bootstrap, name="V800Bootstrap", daemon=True).start()
-    live._diag("V8.0 Research Brain bootstrap armed")
+    live._diag("V8.0.1 Research Brain bootstrap armed")
