@@ -1,4 +1,4 @@
-"""FuturesHunter V8.0.2 Research Brain — SHADOW ONLY.
+"""FuturesHunter V8.0.3 Research Brain — SHADOW ONLY.
 
 Purpose:
 - observe the FINAL live-selector decision after all V7 overlays,
@@ -6,7 +6,7 @@ Purpose:
 - persist exact source-key decisions from fh_v71_challenger,
 - settle against existing paper/missed-trade outcomes,
 - measure calibration (Brier), expectancy and skipped-opportunity cost,
-- produce nightly evidence-based proposals.
+- produce twice-daily evidence-based proposals with blocker attribution.
 
 This module has NO authority to alter eligibility, size, leverage, stops, exits,
 orders, or code. It never auto-ships parameter changes.
@@ -28,8 +28,12 @@ import v794_trust_breakout as v794
 ENABLED = os.getenv("V800_RESEARCH_BRAIN_ENABLED", "true").lower() == "true"
 SHADOW_ONLY = True
 SYNC_SECONDS = max(30, int(os.getenv("V800_SYNC_SECONDS", "90")))
-REPORT_HOUR = max(0, min(23, int(os.getenv("V800_REPORT_HOUR", "3"))))
-REPORT_MINUTE = max(0, min(59, int(os.getenv("V800_REPORT_MINUTE", "15"))))
+REPORT_HOURS = sorted({
+    max(0, min(23, int(x.strip())))
+    for x in os.getenv("V800_REPORT_HOURS", "3,15").split(",")
+    if x.strip()
+})
+REPORT_MINUTE = max(0, min(59, int(os.getenv("V800_REPORT_MINUTE", "0"))))
 REPORT_TZ = os.getenv("V800_REPORT_TZ", "Europe/Madrid")
 REPORT_TELEGRAM = os.getenv("V800_REPORT_TELEGRAM", "true").lower() == "true"
 MIN_FILTER_SAMPLE = max(5, int(os.getenv("V800_MIN_FILTER_SAMPLE", "8")))
@@ -39,7 +43,7 @@ _PATCHED = False
 _SCHEMA_READY = False
 _MAIN = None
 _PATCH_LOCK = threading.RLock()
-_LAST_REPORT_DATE = None
+_LAST_REPORT_SLOT = None
 
 
 def _f(v, default=0.0):
@@ -183,7 +187,7 @@ def _brain_snapshot(result, gate):
     lv = _risk_levels(result)
     p = _research_probability(result, gate)
     return {
-        "version": "8.0.2-shadow-research-brain",
+        "version": "8.0.3-shadow-research-brain",
         "shadow_only": True,
         "symbol": str((result or {}).get("symbol") or ""),
         "direction": _norm((result or {}).get("direction")),
@@ -279,6 +283,26 @@ def _ensure_schema():
                 payload JSONB NOT NULL
             )"""
         )
+        live._db(
+            """CREATE TABLE IF NOT EXISTS fh_v803_reports (
+                report_key TEXT PRIMARY KEY,
+                report_date DATE NOT NULL,
+                report_hour INTEGER NOT NULL,
+                generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                sample_n INTEGER NOT NULL,
+                settled_n INTEGER NOT NULL,
+                brier DOUBLE PRECISION,
+                avg_r DOUBLE PRECISION,
+                allow_avg_r DOUBLE PRECISION,
+                skip_avg_r DOUBLE PRECISION,
+                skip_counterfactual_r DOUBLE PRECISION,
+                live_closed_n INTEGER,
+                live_net_r DOUBLE PRECISION,
+                filter_stats JSONB NOT NULL,
+                proposals JSONB NOT NULL,
+                payload JSONB NOT NULL
+            )"""
+        )
         _SCHEMA_READY = True
         return True
     except Exception as exc:
@@ -320,7 +344,7 @@ def _backfill_legacy_rows():
         )
         bear_case = "; ".join(str(x) for x in reasons_list[:5]) or "No stored selector objection."
         historical_payload = {
-            "version":"8.0.2-legacy-filter-backfill",
+            "version":"8.0.3-legacy-filter-backfill",
             "shadow_only":True,
             "backfilled_legacy":True,
             "calibration_eligible":False,
@@ -448,57 +472,129 @@ def _sync_outcomes():
     return settled
 
 
+def _skip_tags(reasons):
+    """Multi-label attribution from the actual selector reason text.
+
+    Historical audit_skip_class was often OTHER. Re-derive blocker tags from
+    stored reasons so old settled decisions become useful without rewriting
+    or guessing outcomes.
+    """
+    vals = []
+    if isinstance(reasons, (list, tuple)):
+        vals = [str(x or "") for x in reasons]
+    elif reasons:
+        vals = [str(reasons)]
+    text = " ; ".join(vals).lower()
+    tags = []
+
+    def add(tag, *needles):
+        if any(n in text for n in needles) and tag not in tags:
+            tags.append(tag)
+
+    add("STRUCTURE_SR", "major support", "major resistance", "crowded structural path", "structural room")
+    add("CORRELATION", "correlation guard", "same-direction", "same direction")
+    add("EXECUTION_COST", "execution drag", "estimated cost", "cost ")
+    add("DEGRADED_CORE", "degraded-regime core threshold", "core threshold")
+    add("STRATEGY_CONFIRM", "strategy confirmation required", "strategy confirm")
+    add("SELECTOR_THRESHOLD", "selector threshold")
+    add("MACRO_BTC", "weak btc", "btc not aligned", "macro conflict", "crypto regime conflict")
+    add("COOLDOWN_LOSS_CLUSTER", "cooldown", "loss-cluster", "loss cluster", "recent stop")
+    add("EVENT_RISK", "event risk")
+    add("PORTFOLIO_CAPACITY", "portfolio full", "max positions", "position(s) already open")
+    add("ENTRY_CHASE", "entry chase", "drift block", "entry drift")
+    add("LIVE_RISK_BLOCK", "live risk", "risk block", "risk decision block")
+
+    return tags or ["OTHER"]
+
+
 def _filter_stats():
     rows = live._db(
-        """SELECT COALESCE(skip_class,'OTHER'),COUNT(*),AVG(final_r),SUM(final_r),
-                  AVG(CASE WHEN final_r>0 THEN 1.0 ELSE 0.0 END)
+        """SELECT reasons,final_r
            FROM fh_v80_brain
            WHERE live_decision='SKIP' AND final_r IS NOT NULL
-             AND observed_at >= NOW()-(%s || ' days')::interval
-           GROUP BY COALESCE(skip_class,'OTHER')
-           ORDER BY COUNT(*) DESC""",
+             AND observed_at >= NOW()-(%s || ' days')::interval""",
         (str(LOOKBACK_DAYS),), "all"
     ) or []
-    out = {}
-    for cls,n,avg_r,sum_r,win in rows:
-        out[str(cls)] = {
-            "n": _i(n), "avg_r": round(_f(avg_r),4), "sum_r": round(_f(sum_r),4),
-            "positive_rate": round(_f(win),4),
-        }
-    return out
 
+    agg = {}
+    for reasons, final_r in rows:
+        r = _f(final_r)
+        for tag in _skip_tags(reasons):
+            s = agg.setdefault(tag, {"n":0, "sum_r":0.0, "positive_n":0})
+            s["n"] += 1
+            s["sum_r"] += r
+            if r > 0:
+                s["positive_n"] += 1
+
+    out = {}
+    for tag, s in agg.items():
+        n = max(1, _i(s["n"]))
+        out[tag] = {
+            "n": n,
+            "avg_r": round(_f(s["sum_r"]) / n, 4),
+            "sum_r": round(_f(s["sum_r"]), 4),
+            "positive_rate": round(_f(s["positive_n"]) / n, 4),
+            "attribution": "multi_label_reason_text",
+        }
+    return dict(sorted(out.items(), key=lambda kv: (-_i(kv[1].get("n")), kv[0])))
 
 def _proposals(stats):
     proposals = []
     for cls, s in sorted(stats.items()):
         n = _i(s.get("n"))
         avg_r = _f(s.get("avg_r"))
+        sum_r = _f(s.get("sum_r"))
         positive = _f(s.get("positive_rate"))
         if n < MIN_FILTER_SAMPLE:
             continue
-        if avg_r >= 0.20 and positive >= 0.50:
-            proposals.append({
-                "filter": cls, "action": "REVIEW_FOR_LOOSENING", "evidence": {
-                    "n": n, "avg_r": round(avg_r,3), "positive_rate": round(positive,3)
-                },
-                "note": "Skipped counterfactuals are positive; test a narrower relaxation in shadow/backtest before any live change."
-            })
-        elif avg_r <= -0.20 and positive <= 0.40:
-            proposals.append({
-                "filter": cls, "action": "KEEP_OR_STRENGTHEN", "evidence": {
-                    "n": n, "avg_r": round(avg_r,3), "positive_rate": round(positive,3)
-                },
-                "note": "Filter appears to be avoiding negative expectancy; do not loosen without contrary evidence."
-            })
-        else:
-            proposals.append({
-                "filter": cls, "action": "HOLD", "evidence": {
-                    "n": n, "avg_r": round(avg_r,3), "positive_rate": round(positive,3)
-                },
-                "note": "Evidence is mixed; collect more outcomes."
-            })
-    return proposals
 
+        # R-multiple strategies can have positive expectancy with <50% winners,
+        # so expectancy is primary. Positive-rate is descriptive, not a veto.
+        if avg_r >= 0.20 and sum_r > 0:
+            action = "REVIEW_FOR_LOOSENING"
+            note = (
+                "Skipped counterfactual expectancy is materially positive. "
+                "Test a narrow shadow relaxation before any live change."
+            )
+        elif avg_r >= 0.10 and sum_r >= 1.0:
+            action = "WATCH_FOR_LOOSENING"
+            note = (
+                "Skipped expectancy is positive but not yet strong enough for a "
+                "parameter change; collect more category-specific outcomes."
+            )
+        elif avg_r <= -0.20 and sum_r < 0:
+            action = "KEEP_OR_STRENGTHEN"
+            note = "This blocker is avoiding negative expectancy; do not loosen without contrary evidence."
+        else:
+            action = "HOLD"
+            note = "Evidence is mixed; collect more outcomes."
+
+        proposals.append({
+            "filter": cls,
+            "action": action,
+            "evidence": {
+                "n": n,
+                "avg_r": round(avg_r,3),
+                "sum_r": round(sum_r,3),
+                "positive_rate": round(positive,3),
+            },
+            "note": note,
+        })
+
+    priority = {
+        "REVIEW_FOR_LOOSENING": 0,
+        "WATCH_FOR_LOOSENING": 1,
+        "KEEP_OR_STRENGTHEN": 2,
+        "HOLD": 3,
+    }
+    proposals.sort(
+        key=lambda x: (
+            priority.get(x.get("action"), 9),
+            -abs(_f((x.get("evidence") or {}).get("sum_r"))),
+            -_i((x.get("evidence") or {}).get("n")),
+        )
+    )
+    return proposals
 
 def _report_payload():
     row = live._db(
@@ -546,7 +642,7 @@ def _format_report(p):
     skip = "N/A" if p.get("skip_avg_r") is None else f"{p['skip_avg_r']:+.2f}R"
     cf = "N/A" if p.get("skip_counterfactual_r") is None else f"{p['skip_counterfactual_r']:+.2f}R"
     lines = [
-        "🧠 FUTURESHUNTER V8 RESEARCH BRAIN — SHADOW",
+        "🧠 FUTURESHUNTER V8.0.3 RESEARCH BRAIN — SHADOW",
         f"Observed/settled: {p['sample_n']}/{p['settled_n']} | Brier {brier}",
         f"Research expectancy: {avg} | skipped avg {skip} | skipped total {cf}",
         f"Live CORE last 24h: {p['live_24h_closed_n']} closed | {p['live_24h_net_r']:+.2f}R net",
@@ -558,7 +654,8 @@ def _format_report(p):
             e=x.get("evidence") or {}
             lines.append(
                 f"• {x.get('filter')}: {x.get('action')} "
-                f"(n={e.get('n')}, avg={_f(e.get('avg_r')):+.2f}R, positive={100*_f(e.get('positive_rate')):.0f}%)"
+                f"(n={e.get('n')}, avg={_f(e.get('avg_r')):+.2f}R, "
+                f"sum={_f(e.get('sum_r')):+.2f}R, positive={100*_f(e.get('positive_rate')):.0f}%)"
             )
     else:
         lines.append("Evidence proposals: not enough settled samples yet.")
@@ -566,10 +663,51 @@ def _format_report(p):
     return "\n".join(lines)
 
 
-def _save_report(report_date=None):
-    p = _report_payload()
+def _report_slot(now):
+    """Return the latest due report slot (date, hour, key), or None."""
+    due_hours = [h for h in REPORT_HOURS if (now.hour > h or (now.hour == h and now.minute >= REPORT_MINUTE))]
+    if not due_hours:
+        return None
+    hour = max(due_hours)
+    key = f"{now.date().isoformat()}-{hour:02d}"
+    return now.date(), hour, key
+
+
+def _save_report(report_date=None, report_hour=None, report_key=None):
+    now = datetime.now(ZoneInfo(REPORT_TZ))
     if report_date is None:
-        report_date = datetime.now(ZoneInfo(REPORT_TZ)).date()
+        report_date = now.date()
+    if report_hour is None:
+        report_hour = now.hour
+    if report_key is None:
+        report_key = f"{report_date.isoformat()}-{int(report_hour):02d}"
+
+    p = _report_payload()
+    p["report_key"] = report_key
+    p["report_hour"] = int(report_hour)
+    p["report_tz"] = REPORT_TZ
+
+    live._db(
+        """INSERT INTO fh_v803_reports(
+            report_key,report_date,report_hour,sample_n,settled_n,brier,avg_r,
+            allow_avg_r,skip_avg_r,skip_counterfactual_r,live_closed_n,live_net_r,
+            filter_stats,proposals,payload
+        ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(report_key) DO UPDATE SET
+            generated_at=NOW(),sample_n=EXCLUDED.sample_n,settled_n=EXCLUDED.settled_n,
+            brier=EXCLUDED.brier,avg_r=EXCLUDED.avg_r,allow_avg_r=EXCLUDED.allow_avg_r,
+            skip_avg_r=EXCLUDED.skip_avg_r,skip_counterfactual_r=EXCLUDED.skip_counterfactual_r,
+            live_closed_n=EXCLUDED.live_closed_n,live_net_r=EXCLUDED.live_net_r,
+            filter_stats=EXCLUDED.filter_stats,proposals=EXCLUDED.proposals,payload=EXCLUDED.payload""",
+        (
+            report_key,report_date,int(report_hour),p["sample_n"],p["settled_n"],p.get("brier"),
+            p.get("avg_r"),p.get("allow_avg_r"),p.get("skip_avg_r"),p.get("skip_counterfactual_r"),
+            p["live_24h_closed_n"],p["live_24h_net_r"],_json(p["filter_stats"]),
+            _json(p["proposals"]),_json(p)
+        )
+    )
+
+    # Keep legacy daily table updated for backward compatibility with existing tools.
     live._db(
         """INSERT INTO fh_v80_nightly_reports(
             report_date,sample_n,settled_n,brier,avg_r,allow_avg_r,skip_avg_r,skip_counterfactual_r,
@@ -587,18 +725,20 @@ def _save_report(report_date=None):
             _json(p["filter_stats"]),_json(p["proposals"]),_json(p)
         )
     )
+
     msg = _format_report(p)
-    live._diag("V8.0 NIGHTLY " + msg.replace("\n"," | "))
+    label = f"{int(report_hour):02d}:00 {REPORT_TZ}"
+    live._diag("V8.0.3 JOURNAL " + label + " | " + msg.replace("\n"," | "))
     if REPORT_TELEGRAM:
         try:
-            live._msg(msg)
+            live._msg(f"🕒 Research journal {label}\n" + msg)
         except Exception:
             pass
     return p
 
 
 def _sync_loop():
-    global _LAST_REPORT_DATE
+    global _LAST_REPORT_SLOT
     tz = ZoneInfo(REPORT_TZ)
     while True:
         try:
@@ -608,18 +748,23 @@ def _sync_loop():
                 settled = _sync_outcomes()
                 if backfilled or inserted or settled:
                     live._diag(
-                        f"V8.0 RESEARCH sync backfilled={backfilled} new={inserted} settled={settled}"
+                        f"V8.0.3 RESEARCH sync backfilled={backfilled} new={inserted} settled={settled}"
                     )
-                now = datetime.now(tz)
-                today = now.date()
-                due = (now.hour > REPORT_HOUR) or (now.hour == REPORT_HOUR and now.minute >= REPORT_MINUTE)
-                if due and _LAST_REPORT_DATE != today:
-                    _save_report(today)
-                    _LAST_REPORT_DATE = today
-        except Exception as exc:
-            live._diag(f"V8.0 research loop warning: {type(exc).__name__}: {exc}")
-        time.sleep(SYNC_SECONDS)
 
+                now = datetime.now(tz)
+                slot = _report_slot(now)
+                if slot:
+                    report_date, report_hour, report_key = slot
+                    already = live._db(
+                        "SELECT 1 FROM fh_v803_reports WHERE report_key=%s",
+                        (report_key,), "one"
+                    )
+                    if not already and _LAST_REPORT_SLOT != report_key:
+                        _save_report(report_date, report_hour, report_key)
+                        _LAST_REPORT_SLOT = report_key
+        except Exception as exc:
+            live._diag(f"V8.0.3 research loop warning: {type(exc).__name__}: {exc}")
+        time.sleep(SYNC_SECONDS)
 
 def _patch(main):
     global _PATCHED, _MAIN
@@ -674,9 +819,9 @@ def _patch(main):
         _PATCHED = True
         threading.Thread(target=_sync_loop, name="V800ResearchBrain", daemon=True).start()
         live._diag(
-            f"V8.0.2 Research Brain armed SHADOW_ONLY=True live_gate_unchanged=True "
-            f"sync={SYNC_SECONDS}s nightly={REPORT_HOUR:02d}:{REPORT_MINUTE:02d} {REPORT_TZ} "
-            f"lookback={LOOKBACK_DAYS}d auto_ship=False"
+            f"V8.0.3 Research Brain armed SHADOW_ONLY=True live_gate_unchanged=True "
+            f"sync={SYNC_SECONDS}s journals={','.join(f'{h:02d}:{REPORT_MINUTE:02d}' for h in REPORT_HOURS)} {REPORT_TZ} "
+            f"skip_attribution=reason_text_multi_label lookback={LOOKBACK_DAYS}d auto_ship=False"
         )
         return True
 
@@ -696,4 +841,4 @@ def _bootstrap():
 
 if ENABLED:
     threading.Thread(target=_bootstrap, name="V800Bootstrap", daemon=True).start()
-    live._diag("V8.0.2 Research Brain bootstrap armed")
+    live._diag("V8.0.3 Research Brain bootstrap armed")
