@@ -15,7 +15,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-V70_VERSION = "7.8.1-oid-safe-adaptive-recovery"
+V70_VERSION = "7.8.2-rate-limit-safe-reconcile"
 API_BASE = os.getenv("MEXC_FUTURES_API_BASE", "https://api.mexc.com").rstrip("/")
 ACCESS_KEY = os.getenv("MEXC_ACCESS_KEY", "").strip()
 SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
@@ -35,6 +35,10 @@ FILL_TIMEOUT = max(3, int(os.getenv("V70_FILL_TIMEOUT", "15")))
 MAX_ENTRY_DRIFT_R = min(1.0, max(0.0, float(os.getenv("V70_MAX_ENTRY_DRIFT_R", "0.20"))))
 EXPIRY_HOURS = float(os.getenv("V70_EXPIRY_HOURS", "24"))
 RECV_WINDOW = min(30, max(5, int(os.getenv("V70_RECV_WINDOW", "10"))))
+PUBLIC_510_RETRIES = max(1, min(5, int(os.getenv("V70_PUBLIC_510_RETRIES", "4"))))
+PUBLIC_510_BACKOFF_BASE = max(0.25, min(3.0, float(os.getenv("V70_PUBLIC_510_BACKOFF_BASE", "0.75"))))
+CONTRACT_CACHE_SECONDS = max(300, int(os.getenv("V70_CONTRACT_CACHE_SECONDS", "21600")))
+TICKER_CACHE_SECONDS = max(0.5, min(10.0, float(os.getenv("V70_TICKER_CACHE_SECONDS", "2.0"))))
 
 # Live position management. Core entry qualification/risk sizing is unchanged.
 MULTI_TP_ENABLED = os.getenv("V70_MULTI_TP_ENABLED", "true").lower() == "true"
@@ -62,6 +66,9 @@ ADAPTIVE_LOCK_MIN_CURRENT_R = min(2.0, max(0.0, float(os.getenv("V70_ADAPTIVE_LO
 ADAPTIVE_LOCK_R = min(0.75, max(0.0, float(os.getenv("V70_ADAPTIVE_LOCK_R", "0.15"))))
 
 _lock = threading.RLock()
+_public_cache_lock = threading.RLock()
+_contract_cache = {}
+_ticker_cache = {}
 _halted_memory = False
 _halt_reason = ""
 _notify = print
@@ -151,10 +158,47 @@ def _signed(method, path, params=None, timeout=10):
 
 
 def _public(path, params=None):
-    r = requests.get(API_BASE + path, params=_clean_params(params), timeout=10)
-    r.raise_for_status(); p = r.json()
-    if not p.get("success"): raise RuntimeError(f"MEXC public API error: {p.get('code')} {p.get('message')}")
-    return p.get("data")
+    """Read-only MEXC public request with bounded rate-limit recovery.
+
+    Code 510 / HTTP 429 are transport-pressure conditions, not evidence that
+    exchange/ledger state is inconsistent. Retry them with bounded backoff.
+    The caller still fails closed if every attempt is exhausted.
+    """
+    clean = _clean_params(params)
+    last_error = None
+    for attempt in range(PUBLIC_510_RETRIES):
+        try:
+            r = requests.get(API_BASE + path, params=clean, timeout=10)
+            if r.status_code == 429:
+                raise RuntimeError("MEXC public API rate limit: HTTP 429")
+            r.raise_for_status()
+            p = r.json()
+            if p.get("success"):
+                return p.get("data")
+            code = p.get("code")
+            message = str(p.get("message") or "")
+            if str(code) == "510" or "too frequent" in message.lower():
+                raise RuntimeError(f"MEXC public API rate limit: {code} {message}")
+            raise RuntimeError(f"MEXC public API error: {code} {message}")
+        except Exception as exc:
+            last_error = exc
+            text = str(exc).lower()
+            transient = (
+                "code=510" in text
+                or " 510 " in f" {text} "
+                or "too frequent" in text
+                or "rate limit" in text
+                or "http 429" in text
+            )
+            if not transient or attempt >= PUBLIC_510_RETRIES - 1:
+                raise
+            delay = PUBLIC_510_BACKOFF_BASE * (2 ** attempt)
+            _diag(
+                f"MEXC public rate limit on {path}; retry "
+                f"{attempt + 1}/{PUBLIC_510_RETRIES - 1} in {delay:.2f}s"
+            )
+            time.sleep(delay)
+    raise last_error or RuntimeError("MEXC public API request failed")
 
 
 def _db(sql, params=(), fetch=None):
@@ -233,10 +277,16 @@ def _state_set(key, value):
 
 def halt(reason):
     global _halted_memory, _halt_reason
-    _halted_memory = True; _halt_reason = str(reason)[:500]
-    try: _state_set("v70_halt", {"halted": True, "reason": _halt_reason, "ts": time.time()})
-    except Exception: pass
-    _msg(f"🛑 FUTURESHUNTER V7.0 LIVE HALT\n{_halt_reason}")
+    new_reason = str(reason)[:500]
+    duplicate = bool(_halted_memory and _halt_reason == new_reason)
+    _halted_memory = True
+    _halt_reason = new_reason
+    try:
+        _state_set("v70_halt", {"halted": True, "reason": _halt_reason, "ts": time.time()})
+    except Exception:
+        pass
+    if not duplicate:
+        _msg(f"🛑 FUTURESHUNTER V7.0 LIVE HALT\n{_halt_reason}")
 
 
 def halt_status():
@@ -253,7 +303,19 @@ def _is_transient_reconcile_halt(reason):
     r = str(reason or "").lower()
     return (
         r.startswith("reconciliation failure:")
-        and any(x in r for x in ("readtimeout", "connecttimeout", "connectionerror", "timeout"))
+        and any(
+            x in r
+            for x in (
+                "readtimeout",
+                "connecttimeout",
+                "connectionerror",
+                "timeout",
+                "510 requests are too frequent",
+                "public api rate limit",
+                "too frequent",
+                "http 429",
+            )
+        )
     )
 
 
@@ -610,10 +672,18 @@ def asset(): return _signed("GET", "/api/v1/private/account/asset/USDT")
 def positions(symbol=None): return _signed("GET", "/api/v1/private/position/open_positions", {"symbol": symbol}) or []
 
 def contract(symbol):
+    now = time.time()
+    with _public_cache_lock:
+        cached = _contract_cache.get(symbol)
+        if cached and now - cached[0] <= CONTRACT_CACHE_SECONDS:
+            return cached[1]
     data = _public("/api/v1/contract/detail/country", {"symbol": symbol})
     if isinstance(data, list):
         data = next((x for x in data if x.get("symbol") == symbol), None)
-    if not data: raise RuntimeError(f"contract metadata unavailable for {symbol}")
+    if not data:
+        raise RuntimeError(f"contract metadata unavailable for {symbol}")
+    with _public_cache_lock:
+        _contract_cache[symbol] = (now, data)
     return data
 
 
@@ -621,6 +691,11 @@ def order_by_external(symbol, oid): return _signed("GET", f"/api/v1/private/orde
 def open_stops(symbol): return _signed("GET", "/api/v1/private/stoporder/open_orders", {"symbol": symbol}) or []
 
 def _fair_price(symbol):
+    now = time.time()
+    with _public_cache_lock:
+        cached = _ticker_cache.get(symbol)
+        if cached and now - cached[0] <= TICKER_CACHE_SECONDS:
+            return cached[1]
     data = _public("/api/v1/contract/ticker", {"symbol": symbol})
     if isinstance(data, list):
         data = next((x for x in data if x.get("symbol") == symbol), None)
@@ -629,6 +704,8 @@ def _fair_price(symbol):
     px = float(data.get("fairPrice") or data.get("lastPrice") or data.get("indexPrice") or 0)
     if px <= 0:
         raise RuntimeError(f"invalid ticker price for {symbol}")
+    with _public_cache_lock:
+        _ticker_cache[symbol] = (now, px)
     return px
 
 def _active_position(symbol, position_id):
