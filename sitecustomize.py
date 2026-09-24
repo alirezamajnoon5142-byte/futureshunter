@@ -23,3 +23,4 @@ else:
     import v796_smart_retrace_manager  # noqa: F401
     import v800_research_brain  # noqa: F401
     import v810_swing4h_live  # noqa: F401
+    import v820_calibrated_swing_brain  # noqa: F401
