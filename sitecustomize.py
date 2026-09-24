@@ -22,3 +22,4 @@ else:
     import v795_spx_retrace_watch  # noqa: F401
     import v796_smart_retrace_manager  # noqa: F401
     import v800_research_brain  # noqa: F401
+    import v810_swing4h_live  # noqa: F401
