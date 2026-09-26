@@ -330,11 +330,41 @@ def _stats_block(title, trades):
     ), s
 
 
+def _v82_stats_for_telegram():
+    try:
+        if not V68_DB_READY:
+            return ["🧠 V8.2 CALIBRATION", "Database unavailable"]
+        row = _v68_db_execute(
+            """SELECT COUNT(*),
+                      COALESCE(AVG(outcome_r),0),
+                      COALESCE(SUM(outcome_r),0),
+                      COALESCE(AVG(CASE WHEN y_positive=1 THEN 1.0 ELSE 0.0 END),0)
+               FROM fh_v82_swing_judgments
+               WHERE outcome_ts IS NOT NULL""",
+            fetch="one",
+        )
+        if not row:
+            return ["🧠 V8.2 CALIBRATION", "No settled research outcomes yet."]
+        n, avg_r, sum_r, positive = row
+        n = int(n or 0)
+        if n <= 0:
+            return ["🧠 V8.2 CALIBRATION", "No settled research outcomes yet."]
+        return [
+            "🧠 V8.2 CALIBRATION",
+            f"Settled: {n}",
+            f"Positive outcomes: {num(positive)*100:.1f}%",
+            f"Average R: {num(avg_r):+.2f}R",
+            f"Cumulative R: {num(sum_r):+.2f}R",
+            "Research cohort only — sample size matters.",
+        ]
+    except Exception as error:
+        return ["🧠 V8.2 CALIBRATION", f"Unavailable: {type(error).__name__}"]
+
+
 def telegram_stats_message():
     trades = load_json(TRADES_FILE, [])
     stats = calculate_stats(trades)
 
-    # Keep the original all-history figures intact forever.
     lines = [
         "📊 FuturesHunter paper stats",
         "",
@@ -356,38 +386,46 @@ def telegram_stats_message():
             "Awaiting the first evidence-backed 04:00 optimizer patch.",
             "Historical stats above remain the baseline.",
         ]
-        return "\n".join(lines)
+    else:
+        pre = [t for t in trades if 0 < _trade_signal_ts(t) < opt_start]
+        opt = [t for t in trades if _trade_signal_ts(t) >= opt_start]
 
-    pre = [t for t in trades if 0 < _trade_signal_ts(t) < opt_start]
-    opt = [t for t in trades if _trade_signal_ts(t) >= opt_start]
+        pre_block, pre_stats = _stats_block("📚 PRE-OPTIMIZATION BASELINE", pre)
+        opt_block, opt_stats = _stats_block("🧪 OPTIMIZATION ERA", opt)
+        lines += ["", pre_block, "", opt_block]
 
-    pre_block, pre_stats = _stats_block("📚 PRE-OPTIMIZATION BASELINE", pre)
-    opt_block, opt_stats = _stats_block("🧪 OPTIMIZATION ERA", opt)
-    lines += ["", pre_block, "", opt_block]
-
-    if opt_stats["resolved"] > 0 and pre_stats["resolved"] > 0:
-        lines += [
-            "",
-            "Δ OPTIMIZATION ERA VS BASELINE",
-            f"Win rate: {opt_stats['win_rate'] - pre_stats['win_rate']:+.1f} pp",
-            f"Average R: {opt_stats['average_r'] - pre_stats['average_r']:+.2f}R/trade",
-        ]
-
-    # A second, rolling cohort starts at each newly deployed optimizer patch.
-    # This lets us judge the latest patch without deleting the broader optimizer-era history.
-    if patch_start is not None:
-        patch = [t for t in trades if _trade_signal_ts(t) >= patch_start]
-        patch_block, patch_stats = _stats_block(
-            f"🔬 CURRENT PATCH — {STATS_CURRENT_PATCH_LABEL}",
-            patch,
-        )
-        lines += ["", patch_block]
-        if patch_stats["resolved"] > 0 and pre_stats["resolved"] > 0:
+        if opt_stats["resolved"] > 0 and pre_stats["resolved"] > 0:
             lines += [
-                f"Δ win rate vs baseline: {patch_stats['win_rate'] - pre_stats['win_rate']:+.1f} pp",
-                f"Δ avg R vs baseline: {patch_stats['average_r'] - pre_stats['average_r']:+.2f}R/trade",
+                "",
+                "Δ OPTIMIZATION ERA VS BASELINE",
+                f"Win rate: {opt_stats['win_rate'] - pre_stats['win_rate']:+.1f} pp",
+                f"Average R: {opt_stats['average_r'] - pre_stats['average_r']:+.2f}R/trade",
             ]
 
+        if patch_start is not None:
+            patch = [t for t in trades if _trade_signal_ts(t) >= patch_start]
+            patch_block, patch_stats = _stats_block(
+                f"🔬 CURRENT PATCH — {STATS_CURRENT_PATCH_LABEL}",
+                patch,
+            )
+            lines += ["", patch_block]
+            if patch_stats["resolved"] > 0 and pre_stats["resolved"] > 0:
+                lines += [
+                    f"Δ win rate vs baseline: {patch_stats['win_rate'] - pre_stats['win_rate']:+.1f} pp",
+                    f"Δ avg R vs baseline: {patch_stats['average_r'] - pre_stats['average_r']:+.2f}R/trade",
+                ]
+
+    # V8.3 went live on 2026-09-26 10:38:48 UTC. This is an observational
+    # post-deployment cohort, not proof that V8.3 caused any performance change.
+    v83_start = 1790419128.952717
+    v83 = [t for t in trades if _trade_signal_ts(t) >= v83_start]
+    v83_block, v83_stats = _stats_block("🚀 V8.3 POST-DEPLOYMENT COHORT", v83)
+    lines += ["", v83_block]
+    if v83_stats["resolved"] == 0:
+        lines.append("Awaiting resolved trades after V8.3 deployment.")
+    lines.append("Observational cohort — not causal attribution.")
+
+    lines += ["", *_v82_stats_for_telegram()]
     return "\n".join(lines)
 
 
