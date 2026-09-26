@@ -24,3 +24,4 @@ else:
     import v800_research_brain  # noqa: F401
     import v810_swing4h_live  # noqa: F401
     import v820_calibrated_swing_brain  # noqa: F401
+    import v830_selector_challenger  # noqa: F401
