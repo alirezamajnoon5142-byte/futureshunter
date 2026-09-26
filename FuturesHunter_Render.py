@@ -33,6 +33,13 @@ EMERGENCY_CLOSE_SECRET = os.getenv("EMERGENCY_CLOSE_SECRET", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # admin / original subscriber
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://futureshunter-v66.onrender.com")
 
+# Performance cohorts for evidence-based 04:00 optimizer patches.
+# These are intentionally unset until an optimizer patch is actually deployed,
+# so pre-patch trades can never leak into a post-patch cohort.
+STATS_OPTIMIZATION_START_TS = num_opt_start = os.getenv("FH_STATS_OPTIMIZATION_START_TS", "").strip()
+STATS_CURRENT_PATCH_START_TS = num_patch_start = os.getenv("FH_STATS_CURRENT_PATCH_START_TS", "").strip()
+STATS_CURRENT_PATCH_LABEL = os.getenv("FH_STATS_CURRENT_PATCH_LABEL", "current optimizer patch").strip() or "current optimizer patch"
+
 
 # ============================================================
 # SETTINGS
@@ -282,18 +289,106 @@ def telegram_status_message():
     )
 
 
+def _cohort_start_ts(raw):
+    try:
+        value = float(raw)
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
+def _trade_signal_ts(trade):
+    try:
+        value = float(trade.get("signal_time") or 0)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    text = str(trade.get("signal_time_text") or "").strip()
+    if text:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
+def _stats_block(title, trades):
+    s = calculate_stats(trades)
+    if s["resolved"] > 0:
+        wr = f"{s['win_rate']:.1f}%"
+        avg = f"{s['average_r']:+.2f}R"
+    else:
+        wr = "warming"
+        avg = "warming"
+    return (
+        f"{title}\n"
+        f"Signals: {s['total']} | Open: {s['open']} | Resolved: {s['resolved']}\n"
+        f"Win rate: {wr}\n"
+        f"Average R: {avg}\n"
+        f"Cumulative R: {s['cumulative_r']:+.2f}R"
+    ), s
+
+
 def telegram_stats_message():
     trades = load_json(TRADES_FILE, [])
     stats = calculate_stats(trades)
-    return (
-        "📊 FuturesHunter paper stats\n\n"
-        f"Signals: {stats['total']}\n"
-        f"Open: {stats['open']}\n"
-        f"Resolved: {stats['resolved']}\n"
-        f"Win rate: {stats['win_rate']:.1f}%\n"
-        f"Cumulative R: {stats['cumulative_r']:+.2f}R\n"
-        f"Average R: {stats['average_r']:+.2f}R"
-    )
+
+    # Keep the original all-history figures intact forever.
+    lines = [
+        "📊 FuturesHunter paper stats",
+        "",
+        f"Signals: {stats['total']}",
+        f"Open: {stats['open']}",
+        f"Resolved: {stats['resolved']}",
+        f"Win rate: {stats['win_rate']:.1f}%",
+        f"Cumulative R: {stats['cumulative_r']:+.2f}R",
+        f"Average R: {stats['average_r']:+.2f}R",
+    ]
+
+    opt_start = _cohort_start_ts(STATS_OPTIMIZATION_START_TS)
+    patch_start = _cohort_start_ts(STATS_CURRENT_PATCH_START_TS)
+
+    if opt_start is None:
+        lines += [
+            "",
+            "🧪 POST-OPTIMIZATION COHORT",
+            "Awaiting the first evidence-backed 04:00 optimizer patch.",
+            "Historical stats above remain the baseline.",
+        ]
+        return "\n".join(lines)
+
+    pre = [t for t in trades if 0 < _trade_signal_ts(t) < opt_start]
+    opt = [t for t in trades if _trade_signal_ts(t) >= opt_start]
+
+    pre_block, pre_stats = _stats_block("📚 PRE-OPTIMIZATION BASELINE", pre)
+    opt_block, opt_stats = _stats_block("🧪 OPTIMIZATION ERA", opt)
+    lines += ["", pre_block, "", opt_block]
+
+    if opt_stats["resolved"] > 0 and pre_stats["resolved"] > 0:
+        lines += [
+            "",
+            "Δ OPTIMIZATION ERA VS BASELINE",
+            f"Win rate: {opt_stats['win_rate'] - pre_stats['win_rate']:+.1f} pp",
+            f"Average R: {opt_stats['average_r'] - pre_stats['average_r']:+.2f}R/trade",
+        ]
+
+    # A second, rolling cohort starts at each newly deployed optimizer patch.
+    # This lets us judge the latest patch without deleting the broader optimizer-era history.
+    if patch_start is not None:
+        patch = [t for t in trades if _trade_signal_ts(t) >= patch_start]
+        patch_block, patch_stats = _stats_block(
+            f"🔬 CURRENT PATCH — {STATS_CURRENT_PATCH_LABEL}",
+            patch,
+        )
+        lines += ["", patch_block]
+        if patch_stats["resolved"] > 0 and pre_stats["resolved"] > 0:
+            lines += [
+                f"Δ win rate vs baseline: {patch_stats['win_rate'] - pre_stats['win_rate']:+.1f} pp",
+                f"Δ avg R vs baseline: {patch_stats['average_r'] - pre_stats['average_r']:+.2f}R/trade",
+            ]
+
+    return "\n".join(lines)
 
 
 def save_latest_signal(message, result):
