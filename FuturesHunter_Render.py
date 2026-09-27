@@ -404,6 +404,40 @@ def _v82_paired_stats_for_telegram():
         return ["⚖️ V8.2 PAIRED PAPER RESEARCH", f"Unavailable: {type(error).__name__}"]
 
 
+def _v82_execution_paper_stats():
+    """Fresh prospective net-R paper ledger, separate from legacy paper trades."""
+    if not V68_DB_READY:
+        return ["📈 V8.2 EXECUTION-STYLE PAPER", "Database unavailable."]
+    rows=_v68_db_execute(
+        """SELECT arm,COUNT(*),
+                  COUNT(*) FILTER(WHERE status='PENDING'),
+                  COUNT(*) FILTER(WHERE status='OPEN'),
+                  COUNT(*) FILTER(WHERE status='SETTLED'),
+                  COALESCE(AVG(CASE WHEN final_r>0 THEN 1.0 ELSE 0.0 END)
+                    FILTER(WHERE status='SETTLED'),0),
+                  COALESCE(AVG(final_r) FILTER(WHERE status='SETTLED'),0),
+                  COALESCE(SUM(final_r) FILTER(WHERE status='SETTLED'),0)
+           FROM (
+             SELECT 'Qualified control' AS arm,status,final_r FROM fh_v82_execution_paper
+             UNION ALL
+             SELECT 'V8.2 atomic WATCH/TAKE' AS arm,status,final_r
+               FROM fh_v82_execution_paper WHERE atomic_decision IN ('WATCH','TAKE')
+           ) a GROUP BY arm ORDER BY arm""",fetch="all")
+    if rows is None:
+        return ["📈 V8.2 EXECUTION-STYLE PAPER", "Awaiting database schema/observations."]
+    lines=["📈 V8.2 EXECUTION-STYLE PAPER (NEW)"]
+    for arm,total,pending,opened,resolved,win,avg,total_r in rows:
+        lines += [str(arm),f"Signals: {total} | Pending: {pending} | Open: {opened} | Resolved: {resolved}",
+                  f"Net win: {num(win)*100:.1f}% | Avg: {num(avg):+.2f}R | Total: {num(total_r):+.2f}R"
+                  if resolved else "Net win / expectancy: warming"]
+    if not rows:
+        lines.append("Awaiting first new qualified 4H candidate.")
+    lines += ["New prospective 4H next-bar-open simulation, three partial TPs, stop priority.",
+              "Estimated taker fees/slippage; funding estimate configurable (default 0).",
+              "Not actual exchange fills or directly comparable to legacy paper-trade accounting."]
+    return lines
+
+
 def telegram_stats_message():
     trades = load_json(TRADES_FILE, [])
     stats = calculate_stats(trades)
@@ -468,7 +502,7 @@ def telegram_stats_message():
         lines.append("Awaiting resolved trades after V8.3 deployment.")
     lines.append("Observational cohort — not causal attribution.")
 
-    lines += ["", *_v82_stats_for_telegram(), "", *_v82_paired_stats_for_telegram()]
+    lines += ["", *_v82_stats_for_telegram(), "", *_v82_paired_stats_for_telegram(), "", *_v82_execution_paper_stats()]
     return "\n".join(lines)
 
 
