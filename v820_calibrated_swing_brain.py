@@ -364,6 +364,7 @@ def _ensure_schema():
             )"""
         )
         live._db("CREATE INDEX IF NOT EXISTS idx_v82_exec_open ON fh_v82_execution_paper(status,symbol)")
+        live._db("ALTER TABLE fh_v82_execution_paper ADD COLUMN IF NOT EXISTS alerted_at TIMESTAMPTZ")
         _SCHEMA_READY = True
         return True
     except Exception as exc:
@@ -451,6 +452,41 @@ def _state_snapshot(c):
     }
 
 
+
+def _alert_new_4h_candidate(key, decision):
+    """Exactly one initial alert per prospective WATCH/TAKE paper setup."""
+    if decision not in ("WATCH","TAKE"):
+        return
+    # Only announce a successfully persisted paper record, not every repeated scan.
+    row=live._db(
+        """UPDATE fh_v82_execution_paper SET alerted_at=NOW()
+           WHERE source_key=%s AND alerted_at IS NULL
+           RETURNING symbol,direction,reference_entry,stop,tp1,tp2,tp3,
+                     probability,calibration_n,atomic_decision""",
+        (key,),"one")
+    if not row:
+        return
+    symbol,direction,entry,stop,tp1,tp2,tp3,p,n,action=row
+    message=(
+        "🕓 NEW V8.2 4H PAPER SIGNAL (SHADOW ONLY)\n"
+        f"{symbol} {direction} | {action}\n"
+        f"Reference entry: {_f(entry):g} (actual paper entry uses NEXT 4H open)\n"
+        f"Stop: {_f(stop):g}\n"
+        f"TP1: {_f(tp1):g} | TP2: {_f(tp2):g} | TP3: {_f(tp3):g}\n"
+        f"Estimated positive-first-barrier probability: {_f(p)*100:.1f}% "
+        f"(calibration n={int(n or 0)})\n"
+        "Research signal, NOT an executed trade. /4h for latest 4H setups."
+    )
+    try:
+        # Uses existing FuturesHunter Telegram broadcast configured on live executor.
+        live._notify(message)
+        live._diag(f"V8.2 4H Telegram alert queued {key} {action}")
+    except Exception as exc:
+        # Retry next scan rather than permanently losing the alert.
+        live._db("UPDATE fh_v82_execution_paper SET alerted_at=NULL WHERE source_key=%s",(key,))
+        live._diag(f"V8.2 alert retry {key}: {type(exc).__name__}: {exc}")
+
+
 def _observe(c):
     if not ENABLED or not isinstance(c,dict):
         return c
@@ -532,6 +568,7 @@ def _observe(c):
                  _f(plan.get("tp3"),ep+sign*4*risk),
                  decision,calibrated,n)
             )
+        _alert_new_4h_candidate(key,decision)
         c["v820_shadow"]={
             "prob_positive_first_barrier":calibrated,
             "raw_probability":raw,
