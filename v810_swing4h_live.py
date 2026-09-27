@@ -388,7 +388,7 @@ def _signal_id(c):
     return f"s4h_{int(_f(meta.get('candle_ts')))}_{c['symbol']}_{c['direction']}"
 
 
-def _scan_once(main):
+def _scan_once(main, live_allowed=True):
     global _LAST_SCAN_SUMMARY
     candidates=[]
     for row in _universe(main):
@@ -408,6 +408,10 @@ def _scan_once(main):
         ) or "no qualified 4H setup"
         live._diag(f"V8.1 SWING scan qualified={len(candidates)} top={preview}")
 
+    if not live_allowed:
+        # Research candidates have already passed through V8.2 observation.
+        # Never attempt an exchange order while live trading is disabled.
+        return
     opens=_open_context()
     for c in candidates:
         ok,why=_portfolio_allows(c,opens)
@@ -452,18 +456,16 @@ def _scan_once(main):
 
 def _loop(main):
     time.sleep(START_DELAY)
-    live._diag(
-        f"V8.1 4H SWING loop started scan={SCAN_SECONDS}s universe<={MAX_UNIVERSE} "
-        f"risk={RISK_PCT*100:.2f}% max_open={MAX_OPEN_SWINGS}"
-    )
+    live._diag(f"V8.1 4H SWING loop started scan={SCAN_SECONDS}s universe<={MAX_UNIVERSE} risk={RISK_PCT*100:.2f}% max_open={MAX_OPEN_SWINGS}")
     while ENABLED:
         try:
-            if not getattr(live,"ENABLED",False) or not getattr(live,"ARMED",False):
-                time.sleep(SCAN_SECONDS); continue
-            halted,_=live.halt_status()
-            if halted:
-                time.sleep(SCAN_SECONDS); continue
-            _scan_once(main)
+            live_allowed=bool(getattr(live,"ENABLED",False) and getattr(live,"ARMED",False))
+            if live_allowed:
+                halted,_=live.halt_status()
+                live_allowed=not halted
+            # Keep the same 4H qualification and V8.2 shadow paper collection
+            # running without capital; execution remains strictly gated.
+            _scan_once(main,live_allowed=live_allowed)
         except Exception as exc:
             live._diag(f"V8.1 SWING loop warning: {type(exc).__name__}: {exc}")
         time.sleep(SCAN_SECONDS)
