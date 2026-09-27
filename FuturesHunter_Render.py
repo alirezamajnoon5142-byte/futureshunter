@@ -13596,6 +13596,46 @@ def start_health_server():
     print(f"Health endpoint: http://0.0.0.0:{port}/health")
     return server
 
+
+# V8.2 4H paper-signal lookup, independent of legacy /latest.
+def _v82_4h_telegram_text():
+    if not V68_DB_READY:
+        return "🕓 V8.2 4H: paper database unavailable."
+    try:
+        rows=_v68_db_execute(
+            """SELECT symbol,direction,reference_entry,entry,stop,tp1,tp2,tp3,
+                      atomic_decision,probability,calibration_n,status,
+                      final_r,created_at
+               FROM fh_v82_execution_paper
+               ORDER BY created_at DESC LIMIT 5""",fetch="all")
+    except Exception:
+        return "🕓 V8.2 4H: paper ledger not ready yet."
+    if not rows:
+        return "🕓 No prospective V8.2 4H paper setups recorded yet."
+    lines=["🕓 LATEST V8.2 4H PAPER SETUPS (research only)"]
+    for symbol,direction,ref_entry,filled,stop,t1,t2,t3,decision,p,n,status,net_r,created in rows:
+        lines += [
+            f"{symbol} {direction} | {decision} | {status}",
+            f"Reference: {num(ref_entry):g} | Paper fill: {num(filled):g}" if filled else
+                f"Reference: {num(ref_entry):g} | Paper fill: pending next 4H open",
+            f"SL {num(stop):g} | TP {num(t1):g} / {num(t2):g} / {num(t3):g}",
+            f"Positive-first-barrier estimate {num(p)*100:.1f}% (calibration n={int(n or 0)})"
+            + (f" | net {num(net_r):+.2f}R" if net_r is not None else ""),
+            ""
+        ]
+    lines.append("WATCH/TAKE auto-alerted when new; ABSTAIN shown here but never auto-alerted.")
+    return "\\n".join(lines)
+
+
+_v82_previous_telegram_command_handler = handle_telegram_command
+def handle_telegram_command(chat_id, text):
+    command=((text or "").strip().split() or [""])[0].lower().split("@")[0]
+    if command in ("/4h","/swing4h","/v82"):
+        send_to_chat(chat_id,_v82_4h_telegram_text())
+        return
+    return _v82_previous_telegram_command_handler(chat_id,text)
+
+
 # ============================================================
 # START
 # ============================================================
