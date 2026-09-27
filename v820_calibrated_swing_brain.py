@@ -334,6 +334,36 @@ def _ensure_schema():
                 experiment_version TEXT NOT NULL DEFAULT 'v82-paired-first-barrier-v1'
             )"""
         )
+        live._db(
+            """CREATE TABLE IF NOT EXISTS fh_v82_execution_paper (
+                source_key TEXT PRIMARY KEY,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                candle_ts DOUBLE PRECISION NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                reference_entry DOUBLE PRECISION NOT NULL,
+                entry DOUBLE PRECISION,
+                stop DOUBLE PRECISION NOT NULL,
+                tp1 DOUBLE PRECISION NOT NULL,
+                tp2 DOUBLE PRECISION NOT NULL,
+                tp3 DOUBLE PRECISION NOT NULL,
+                atomic_decision TEXT NOT NULL,
+                probability DOUBLE PRECISION,
+                calibration_n INTEGER,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                remaining DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                realized_r DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                fees_r DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                funding_r DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                last_bar_ts DOUBLE PRECISION NOT NULL DEFAULT 0,
+                tp_stage INTEGER NOT NULL DEFAULT 0,
+                final_r DOUBLE PRECISION,
+                exit_reason TEXT,
+                closed_at TIMESTAMPTZ,
+                model_version TEXT NOT NULL DEFAULT 'v82-execution-paper-v1'
+            )"""
+        )
+        live._db("CREATE INDEX IF NOT EXISTS idx_v82_exec_open ON fh_v82_execution_paper(status,symbol)")
         _SCHEMA_READY = True
         return True
     except Exception as exc:
@@ -481,6 +511,25 @@ def _observe(c):
                    ON CONFLICT(source_key) DO NOTHING""",
                 (key,str(c.get("symbol")),_norm(c.get("direction")),
                  _f(c.get("price")),_f(plan.get("stop")),_f(plan.get("tp1")),
+                 decision,calibrated,n)
+            )
+        # Independent, prospective execution-style PAPER ledger. No historical backfill.
+        # Capture frozen decision and three targets; do not place real orders.
+        sign = 1 if _norm(c.get("direction")) == "LONG" else -1
+        ep = _f(c.get("price")); sp = _f(plan.get("stop"))
+        risk = abs(ep-sp)
+        if ep > 0 and risk > 0 and sign*(ep-sp) > 0:
+            live._db(
+                """INSERT INTO fh_v82_execution_paper
+                   (source_key,candle_ts,symbol,direction,reference_entry,stop,
+                    tp1,tp2,tp3,atomic_decision,probability,calibration_n)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(source_key) DO NOTHING""",
+                (key,_f(meta.get("candle_ts")),str(c.get("symbol")),
+                 _norm(c.get("direction")),ep,sp,
+                 _f(plan.get("tp1"),ep+sign*1.5*risk),
+                 _f(plan.get("tp2"),ep+sign*2.5*risk),
+                 _f(plan.get("tp3"),ep+sign*4*risk),
                  decision,calibrated,n)
             )
         c["v820_shadow"]={
@@ -648,6 +697,146 @@ def _paired_paper_report():
     )
 
 
+
+# Separate execution-style paper model: prospective, 4H OHLC, next-bar-open
+# entry, three equal-sized target exits, conservative stop priority and costs.
+# Not an exchange-fill replica. Funding is an explicit configurable estimate.
+PAPER_FEE_BPS = max(0.0,float(os.getenv("V820_PAPER_FEE_BPS","2")))
+PAPER_SLIP_BPS = max(0.0,float(os.getenv("V820_PAPER_SLIP_BPS","3")))
+PAPER_FUNDING_BPS_8H = max(0.0,float(os.getenv("V820_PAPER_FUNDING_BPS_8H","0")))
+PAPER_MAX_HOURS = max(12.0,float(os.getenv("V820_PAPER_MAX_HOURS","48")))
+
+
+def _paper_engine_step(row, bars):
+    """Pure OHLC state transition. Returns updated state and close reason."""
+    state=dict(row)
+    sign=1 if state["direction"]=="LONG" else -1
+    entry=_f(state.get("entry"))
+    risk=abs(entry-_f(state["stop"])) if entry else 0.0
+    for bar in bars:
+        ts=_f(bar["time"])
+        if ts<=_f(state["last_bar_ts"]) or ts<=_f(state["candle_ts"]):
+            continue
+        if state["status"]=="PENDING":
+            # Fill at NEXT closed 4H bar's open, never at signal candle close.
+            reference=_f(bar["open"])
+            entry=reference*(1+sign*PAPER_SLIP_BPS/10000)
+            risk=abs(entry-_f(state["stop"]))
+            if entry<=0 or risk<=0 or sign*(entry-_f(state["stop"]))<=0:
+                state.update(status="CANCELLED",exit_reason="INVALID_NEXT_OPEN",last_bar_ts=ts)
+                break
+            state.update(entry=entry,status="OPEN",last_bar_ts=ts)
+            state["fees_r"]+=entry*PAPER_FEE_BPS/10000/risk
+            # No same-bar TP/stop: the OHLC path after open is unknown.
+            continue
+        if state["status"]!="OPEN":
+            break
+        if risk<=0:
+            break
+        elapsed=max(0.0,(ts-_f(state["last_bar_ts"]))/3600)
+        state["funding_r"]+=entry*PAPER_FUNDING_BPS_8H/10000/risk*elapsed/8*state["remaining"]
+        high=_f(bar["high"]); low=_f(bar["low"]); close=_f(bar["close"])
+        stop=_f(state["stop"])
+        stop_hit=(low<=stop if sign==1 else high>=stop)
+        if stop_hit:
+            # Stop before targets when both touch within same bar; adverse slip.
+            px=stop*(1-sign*PAPER_SLIP_BPS/10000)
+            fraction=state["remaining"]
+            state["realized_r"]+=fraction*sign*(px-entry)/risk
+            state["fees_r"]+=fraction*px*PAPER_FEE_BPS/10000/risk
+            state.update(remaining=0.0,status="SETTLED",exit_reason="STOP_PRIORITY",last_bar_ts=ts)
+            break
+        for stage in range(state["tp_stage"]+1,4):
+            target=_f(state["tp"+str(stage)])
+            touched=(high>=target if sign==1 else low<=target)
+            if not touched:
+                break
+            fraction=min(state["remaining"],1/3)
+            px=target*(1-sign*PAPER_SLIP_BPS/10000)
+            state["realized_r"]+=fraction*sign*(px-entry)/risk
+            state["fees_r"]+=fraction*px*PAPER_FEE_BPS/10000/risk
+            state["remaining"]=max(0.0,state["remaining"]-fraction)
+            state["tp_stage"]=stage
+        state["last_bar_ts"]=ts
+        if state["remaining"]<0.00001:
+            state.update(status="SETTLED",exit_reason="TP3")
+            break
+        if ts-_f(state["candle_ts"])>=PAPER_MAX_HOURS*3600:
+            fraction=state["remaining"]
+            px=close*(1-sign*PAPER_SLIP_BPS/10000)
+            state["realized_r"]+=fraction*sign*(px-entry)/risk
+            state["fees_r"]+=fraction*px*PAPER_FEE_BPS/10000/risk
+            state.update(remaining=0.0,status="SETTLED",exit_reason="HORIZON_CLOSE")
+            break
+    if state["status"]=="SETTLED":
+        state["final_r"]=state["realized_r"]-state["fees_r"]-state["funding_r"]
+    return state
+
+
+def _sync_execution_paper(main):
+    if not _ensure_schema():
+        return 0
+    rows=live._db(
+        """SELECT source_key,candle_ts,symbol,direction,reference_entry,entry,stop,
+                  tp1,tp2,tp3,atomic_decision,status,remaining,realized_r,
+                  fees_r,funding_r,last_bar_ts,tp_stage
+           FROM fh_v82_execution_paper WHERE status IN ('PENDING','OPEN')
+           ORDER BY created_at LIMIT 120""",(),"all"
+    ) or []
+    fields=("source_key","candle_ts","symbol","direction","reference_entry","entry",
+            "stop","tp1","tp2","tp3","atomic_decision","status","remaining",
+            "realized_r","fees_r","funding_r","last_bar_ts","tp_stage")
+    count=0
+    cache={}
+    for row in rows:
+        state=dict(zip(fields,row))
+        symbol=state["symbol"]
+        if symbol not in cache:
+            cache[symbol]=_closed_h4(main,symbol)
+        df=cache[symbol]
+        if df is None or df.empty:
+            continue
+        bars=df[df["time"].astype(float)>_f(state["last_bar_ts"])].to_dict("records")
+        updated=_paper_engine_step(state,bars)
+        if updated==state:
+            continue
+        result=live._db(
+            """UPDATE fh_v82_execution_paper SET entry=%s,status=%s,remaining=%s,
+                 realized_r=%s,fees_r=%s,funding_r=%s,last_bar_ts=%s,
+                 tp_stage=%s,final_r=%s,exit_reason=%s,
+                 closed_at=CASE WHEN %s='SETTLED' THEN NOW() ELSE closed_at END
+               WHERE source_key=%s AND status IN ('PENDING','OPEN')
+                 AND last_bar_ts=%s""",
+            (updated.get("entry"),updated["status"],updated["remaining"],
+             updated["realized_r"],updated["fees_r"],updated["funding_r"],
+             updated["last_bar_ts"],updated["tp_stage"],updated.get("final_r"),
+             updated.get("exit_reason"),updated["status"],updated["source_key"],
+             state["last_bar_ts"])
+        )
+        if result:
+            count+=1
+    return count
+
+
+def _execution_paper_report():
+    rows=live._db(
+        """SELECT arm,COUNT(*),COUNT(*) FILTER(WHERE status='SETTLED'),
+                  AVG(final_r) FILTER(WHERE status='SETTLED'),
+                  SUM(final_r) FILTER(WHERE status='SETTLED'),
+                  AVG(CASE WHEN final_r>0 THEN 1.0 ELSE 0.0 END)
+                    FILTER(WHERE status='SETTLED')
+           FROM (
+             SELECT 'QUALIFIED_CONTROL' AS arm,status,final_r FROM fh_v82_execution_paper
+             UNION ALL
+             SELECT 'ATOMIC_WATCH_TAKE' AS arm,status,final_r
+               FROM fh_v82_execution_paper WHERE atomic_decision IN ('WATCH','TAKE')
+           ) x GROUP BY arm ORDER BY arm""",(),"all"
+    ) or []
+    return " | ".join(f"{arm}: n={int(total)} settled={int(n)} win={_f(win)*100:.1f}% "
+                    f"avg={_f(avg):+.2f}R sum={_f(total_r):+.2f}R"
+                    for arm,total,n,avg,total_r,win in rows)
+
+
 def _metrics(pairs, calibrated=False, a=0.0, b=1.0):
     if not pairs:
         return {"n":0,"brier":None,"log_loss":None,"ece":None}
@@ -733,6 +922,7 @@ def _report(slot):
                 f"sum={s['sum_r']:+.2f}R positive={s['positive_rate']*100:.0f}%"
             )
         pieces.append("PAIRED PAPER (prospective, simulated first barrier, no fees/fills): "+_paired_paper_report())
+        pieces.append("EXECUTION-STYLE PAPER (new cohort): "+_execution_paper_report())
         live._diag(" | ".join(pieces))
     except Exception as exc:
         live._diag(f"V8.2 report warning: {type(exc).__name__}: {exc}")
@@ -754,6 +944,7 @@ def _loop(main):
     time.sleep(35)
     while ENABLED:
         try:
+            _sync_execution_paper(main)
             settled=_sync_outcomes(main)
             if settled:
                 live._diag(f"V8.2 settled {settled} swing research outcome(s)")
