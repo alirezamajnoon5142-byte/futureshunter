@@ -13624,7 +13624,7 @@ def _v82_4h_telegram_text():
             ""
         ]
     lines.append("WATCH/TAKE auto-alerted when new; ABSTAIN shown here but never auto-alerted.")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 _v82_previous_telegram_command_handler = handle_telegram_command
