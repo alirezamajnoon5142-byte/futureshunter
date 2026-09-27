@@ -468,13 +468,13 @@ def _alert_new_4h_candidate(key, decision):
         return
     symbol,direction,entry,stop,tp1,tp2,tp3,p,n,action=row
     message=(
-        "🕓 NEW V8.2 4H PAPER SIGNAL (SHADOW ONLY)\\n"
-        f"{symbol} {direction} | {action}\\n"
-        f"Reference entry: {_f(entry):g} (actual paper entry uses NEXT 4H open)\\n"
-        f"Stop: {_f(stop):g}\\n"
-        f"TP1: {_f(tp1):g} | TP2: {_f(tp2):g} | TP3: {_f(tp3):g}\\n"
+        "🕓 NEW V8.2 4H PAPER SIGNAL (SHADOW ONLY)\n"
+        f"{symbol} {direction} | {action}\n"
+        f"Reference entry: {_f(entry):g} (actual paper entry uses NEXT 4H open)\n"
+        f"Stop: {_f(stop):g}\n"
+        f"TP1: {_f(tp1):g} | TP2: {_f(tp2):g} | TP3: {_f(tp3):g}\n"
         f"Estimated positive-first-barrier probability: {_f(p)*100:.1f}% "
-        f"(calibration n={int(n or 0)})\\n"
+        f"(calibration n={int(n or 0)})\n"
         "Research signal, NOT an executed trade. /4h for latest 4H setups."
     )
     try:
