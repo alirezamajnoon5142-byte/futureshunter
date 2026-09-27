@@ -314,6 +314,26 @@ def _ensure_schema():
                 payload JSONB NOT NULL
             )"""
         )
+        live._db(
+            """CREATE TABLE IF NOT EXISTS fh_v82_paired_paper (
+                source_key TEXT PRIMARY KEY,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                entry DOUBLE PRECISION NOT NULL,
+                stop DOUBLE PRECISION NOT NULL,
+                tp1 DOUBLE PRECISION NOT NULL,
+                baseline_decision TEXT NOT NULL DEFAULT 'TAKE',
+                atomic_decision TEXT NOT NULL,
+                atomic_probability DOUBLE PRECISION,
+                calibration_n INTEGER NOT NULL,
+                paper_status TEXT NOT NULL DEFAULT 'OPEN',
+                outcome_status TEXT,
+                outcome_r DOUBLE PRECISION,
+                settled_at TIMESTAMPTZ,
+                experiment_version TEXT NOT NULL DEFAULT 'v82-paired-first-barrier-v1'
+            )"""
+        )
         _SCHEMA_READY = True
         return True
     except Exception as exc:
@@ -449,6 +469,20 @@ def _observe(c):
                 raw,calibrated,n,dis,conf,decision,_json(judgments),_json(state),_json(payload)
             )
         )
+        # Prospective paired PAPER experiment; never modifies the existing paper ledger.
+        # Baseline = all qualified V8.1 swing candidates; challenger = atomic TAKE only.
+        # Both use the SAME first-barrier settlement, not executable fill accounting.
+        if _f(c.get("price")) > 0 and _f(plan.get("stop")) > 0 and _f(plan.get("tp1")) > 0:
+            live._db(
+                """INSERT INTO fh_v82_paired_paper
+                   (source_key,symbol,direction,entry,stop,tp1,atomic_decision,
+                    atomic_probability,calibration_n)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(source_key) DO NOTHING""",
+                (key,str(c.get("symbol")),_norm(c.get("direction")),
+                 _f(c.get("price")),_f(plan.get("stop")),_f(plan.get("tp1")),
+                 decision,calibrated,n)
+            )
         c["v820_shadow"]={
             "prob_positive_first_barrier":calibrated,
             "raw_probability":raw,
@@ -579,7 +613,39 @@ def _sync_outcomes(main):
         except Exception as exc:
             live._diag(f"V8.2 settle {row[2] if len(row)>2 else '?'} warning: {type(exc).__name__}: {exc}")
         time.sleep(0.04)
+    # Copy identical, already-settled 4H outcomes into both prospective paper arms.
+    # No historical V8.2 outcomes are backfilled: only newly enrolled keys exist here.
+    live._db(
+        """UPDATE fh_v82_paired_paper p
+           SET paper_status='SETTLED',outcome_status=j.outcome_status,
+               outcome_r=j.outcome_r,settled_at=j.outcome_ts
+           FROM fh_v82_swing_judgments j
+           WHERE p.source_key=j.source_key
+             AND p.paper_status='OPEN' AND j.outcome_ts IS NOT NULL"""
+    )
     return n
+
+
+def _paired_paper_report():
+    rows=live._db(
+        """SELECT arm,COUNT(*),COUNT(*) FILTER(WHERE paper_status='SETTLED'),
+                  AVG(outcome_r) FILTER(WHERE paper_status='SETTLED'),
+                  SUM(outcome_r) FILTER(WHERE paper_status='SETTLED'),
+                  AVG(CASE WHEN outcome_r>0 THEN 1.0 ELSE 0.0 END)
+                    FILTER(WHERE paper_status='SETTLED')
+           FROM (
+             SELECT 'BASELINE_V81_QUALIFIED' AS arm,paper_status,outcome_r
+             FROM fh_v82_paired_paper
+             UNION ALL
+             SELECT 'ATOMIC_TAKE' AS arm,paper_status,outcome_r
+             FROM fh_v82_paired_paper WHERE atomic_decision='TAKE'
+           ) arms GROUP BY arm ORDER BY arm""",(),"all"
+    ) or []
+    return " | ".join(
+        f"{arm}: enrolled={int(enrolled)} settled={int(settled)} "
+        f"avg={_f(avg):+.2f}R sum={_f(total):+.2f}R positive={_f(pos)*100:.0f}%"
+        for arm,enrolled,settled,avg,total,pos in rows
+    )
 
 
 def _metrics(pairs, calibrated=False, a=0.0, b=1.0):
@@ -666,6 +732,7 @@ def _report(slot):
                 f"{s['decision']}: n={s['n']} avg={s['avg_r']:+.2f}R "
                 f"sum={s['sum_r']:+.2f}R positive={s['positive_rate']*100:.0f}%"
             )
+        pieces.append("PAIRED PAPER (prospective, simulated first barrier, no fees/fills): "+_paired_paper_report())
         live._diag(" | ".join(pieces))
     except Exception as exc:
         live._diag(f"V8.2 report warning: {type(exc).__name__}: {exc}")
