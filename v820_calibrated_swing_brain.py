@@ -470,7 +470,7 @@ def _observe(c):
             )
         )
         # Prospective paired PAPER experiment; never modifies the existing paper ledger.
-        # Baseline = all qualified V8.1 swing candidates; challenger = atomic TAKE only.
+        # Baseline = all qualified V8.1 swing candidates; challenger = atomic WATCH or TAKE.
         # Both use the SAME first-barrier settlement, not executable fill accounting.
         if _f(c.get("price")) > 0 and _f(plan.get("stop")) > 0 and _f(plan.get("tp1")) > 0:
             live._db(
@@ -637,8 +637,8 @@ def _paired_paper_report():
              SELECT 'BASELINE_V81_QUALIFIED' AS arm,paper_status,outcome_r
              FROM fh_v82_paired_paper
              UNION ALL
-             SELECT 'ATOMIC_TAKE' AS arm,paper_status,outcome_r
-             FROM fh_v82_paired_paper WHERE atomic_decision='TAKE'
+             SELECT 'ATOMIC_NON_ABSTAIN' AS arm,paper_status,outcome_r
+             FROM fh_v82_paired_paper WHERE atomic_decision IN ('WATCH','TAKE')
            ) arms GROUP BY arm ORDER BY arm""",(),"all"
     ) or []
     return " | ".join(
