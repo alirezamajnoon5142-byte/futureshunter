@@ -361,6 +361,49 @@ def _v82_stats_for_telegram():
         return ["🧠 V8.2 CALIBRATION", f"Unavailable: {type(error).__name__}"]
 
 
+def _v82_paired_stats_for_telegram():
+    """Prospective simulated 4H first-barrier experiment; NOT executed paper fills."""
+    try:
+        if not V68_DB_READY:
+            return ["⚖️ V8.2 PAIRED PAPER RESEARCH", "Database unavailable."]
+        rows = _v68_db_execute(
+            """SELECT arm, COUNT(*),
+                      COUNT(*) FILTER (WHERE paper_status='SETTLED'),
+                      COALESCE(AVG(outcome_r) FILTER (WHERE paper_status='SETTLED'),0),
+                      COALESCE(SUM(outcome_r) FILTER (WHERE paper_status='SETTLED'),0),
+                      COALESCE(AVG(CASE WHEN outcome_r>0 THEN 1.0 ELSE 0.0 END)
+                          FILTER (WHERE paper_status='SETTLED'),0)
+               FROM (
+                   SELECT 'Baseline V8.1 qualified' AS arm,paper_status,outcome_r
+                   FROM fh_v82_paired_paper
+                   UNION ALL
+                   SELECT 'Atomic WATCH/TAKE' AS arm,paper_status,outcome_r
+                   FROM fh_v82_paired_paper
+                   WHERE atomic_decision IN ('WATCH','TAKE')
+               ) cohorts
+               GROUP BY arm ORDER BY arm""", fetch="all")
+        if rows is None:
+            return ["⚖️ V8.2 PAIRED PAPER RESEARCH", "Unavailable (check DB/logs)."]
+        lines = ["⚖️ V8.2 PAIRED PAPER RESEARCH (NEW)"]
+        if not rows:
+            lines.append("Awaiting first prospective swing candidate.")
+        for arm,enrolled,settled,avg_r,sum_r,positive in rows:
+            lines += [
+                str(arm),
+                f"Enrolled: {int(enrolled)} | Open: {int(enrolled)-int(settled)} | Resolved: {int(settled)}",
+                f"Positive: {num(positive)*100:.1f}% | Avg: {num(avg_r):+.2f}R | Total: {num(sum_r):+.2f}R"
+                if settled else "Positive/expectancy: warming",
+            ]
+        lines += [
+            "Frozen decisions at enrollment; no historical backfill.",
+            "Simulated 4H first-barrier outcomes, no fills/fees/funding.",
+            "Historical V8.3 paper ledger above uses different accounting: NOT a direct win-rate comparison.",
+        ]
+        return lines
+    except Exception as error:
+        return ["⚖️ V8.2 PAIRED PAPER RESEARCH", f"Unavailable: {type(error).__name__}"]
+
+
 def telegram_stats_message():
     trades = load_json(TRADES_FILE, [])
     stats = calculate_stats(trades)
@@ -425,7 +468,7 @@ def telegram_stats_message():
         lines.append("Awaiting resolved trades after V8.3 deployment.")
     lines.append("Observational cohort — not causal attribution.")
 
-    lines += ["", *_v82_stats_for_telegram()]
+    lines += ["", *_v82_stats_for_telegram(), "", *_v82_paired_stats_for_telegram()]
     return "\n".join(lines)
 
 
@@ -2130,7 +2173,20 @@ def create_paper_trade(
         "closed_time_text": None,
         "final_r": None,
         "last_checked": tracking_start - 1,
-        "result_logged": False
+        "result_logged": False,
+        # Immutable observation at paper-signal creation, when available.
+        # Research annotation only: NEVER a gate or execution instruction.
+        "v820_atomic_rationale": (
+            {
+                "decision": result["v820_shadow"].get("decision"),
+                "probability": result["v820_shadow"].get("prob_positive_first_barrier"),
+                "calibration_n": result["v820_shadow"].get("calibration_n"),
+                "confidence": result["v820_shadow"].get("confidence"),
+                "disagreement": result["v820_shadow"].get("disagreement"),
+                "judgments": result["v820_shadow"].get("judgments"),
+            }
+            if isinstance(result.get("v820_shadow"), dict) else None
+        )
     }
 
     trades.append(
