@@ -36,7 +36,8 @@ REPORT_HOURS = sorted({
 REPORT_MINUTE = max(0, min(59, int(os.getenv("V800_REPORT_MINUTE", "0"))))
 REPORT_TZ = os.getenv("V800_REPORT_TZ", "Europe/Madrid")
 REPORT_TELEGRAM = os.getenv("V800_REPORT_TELEGRAM", "true").lower() == "true"
-MIN_FILTER_SAMPLE = max(5, int(os.getenv("V800_MIN_FILTER_SAMPLE", "8")))
+MIN_FILTER_SAMPLE = max(25, int(os.getenv("V800_MIN_FILTER_SAMPLE", "25")))
+REVIEW_FILTER_SAMPLE = max(MIN_FILTER_SAMPLE, int(os.getenv("V800_REVIEW_FILTER_SAMPLE", "50")))
 LOOKBACK_DAYS = max(3, int(os.getenv("V800_LOOKBACK_DAYS", "30")))
 
 _PATCHED = False
@@ -550,7 +551,7 @@ def _proposals(stats):
 
         # R-multiple strategies can have positive expectancy with <50% winners,
         # so expectancy is primary. Positive-rate is descriptive, not a veto.
-        if avg_r >= 0.20 and sum_r > 0:
+        if n >= REVIEW_FILTER_SAMPLE and avg_r >= 0.20 and sum_r > 0:
             action = "REVIEW_FOR_LOOSENING"
             note = (
                 "Skipped counterfactual expectancy is materially positive. "
@@ -659,7 +660,8 @@ def _format_report(p):
             )
     else:
         lines.append("Evidence proposals: not enough settled samples yet.")
-    lines.append("No live parameter changes were made by V8.")
+    lines.append("Attribution: MULTI-LABEL — cohort sums overlap; DO NOT ADD.")
+    lines.append("Live-change authority: NONE. No live parameter changes were made by V8.")
     return "\n".join(lines)
 
 

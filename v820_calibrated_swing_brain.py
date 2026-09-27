@@ -653,6 +653,7 @@ def _report(slot):
         pieces=[
             f"V8.2 CALIBRATION {slot}",
             f"settled={n} platt={'ACTIVE' if n>=MIN_PLATT_SAMPLE else 'WARMING'} a={a:+.3f} b={b:.3f}",
+            f"readiness={'CALIBRATION_READY' if n>=MIN_PLATT_SAMPLE else 'COLLECT_DATA'} remaining_to_platt={max(0, MIN_PLATT_SAMPLE-n)}",
         ]
         if raw.get("brier") is not None:
             pieces.append(
