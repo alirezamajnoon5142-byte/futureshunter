@@ -12,8 +12,8 @@ import live_executor_v70 as live
 import v810_swing4h_live as swing
 
 ENABLED=os.getenv("V840_ICT_DOL_ENABLED","true").lower()=="true"
-SCAN=max(180,int(os.getenv("V840_ICT_DOL_SCAN_SECONDS","300")))
-MAX_UNIVERSE=max(4,min(24,int(os.getenv("V840_ICT_DOL_MAX_UNIVERSE","12"))))
+SCAN=max(60,int(os.getenv("V840_ICT_DOL_SCAN_SECONDS","60")))
+MAX_UNIVERSE=max(4,min(24,int(os.getenv("V840_ICT_DOL_MAX_UNIVERSE","16"))))
 MIN_RR=max(1.0,float(os.getenv("V840_ICT_DOL_MIN_RR","1.5")))
 HORIZON=max(6.0,float(os.getenv("V840_ICT_DOL_HORIZON_HOURS","24")))
 FEE_BPS=max(0.0,float(os.getenv("V840_ICT_DOL_FEE_BPS","2")))
@@ -124,12 +124,13 @@ def schema():
     if _SCHEMA:return True
     try:
         live._db("""CREATE TABLE IF NOT EXISTS fh_v84_ict_dol_shadow(source_key TEXT PRIMARY KEY,symbol TEXT NOT NULL,direction TEXT NOT NULL,bias_score DOUBLE PRECISION,sweep_ts DOUBLE PRECISION,sweep_level DOUBLE PRECISION,sweep_extreme DOUBLE PRECISION,mss_ts DOUBLE PRECISION,mss_level DOUBLE PRECISION,fvg_ts DOUBLE PRECISION,fvg_low DOUBLE PRECISION,fvg_high DOUBLE PRECISION,entry_ts DOUBLE PRECISION,entry DOUBLE PRECISION,stop DOUBLE PRECISION,dol DOUBLE PRECISION,dol_source TEXT,planned_rr DOUBLE PRECISION,status TEXT NOT NULL DEFAULT 'OPEN',outcome TEXT,exit_price DOUBLE PRECISION,gross_r DOUBLE PRECISION,cost_r DOUBLE PRECISION,final_r DOUBLE PRECISION,settled_at TIMESTAMPTZ,payload JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+        live._db("ALTER TABLE fh_v84_ict_dol_shadow ADD COLUMN IF NOT EXISTS paper_decision TEXT NOT NULL DEFAULT 'TAKE'")
         _SCHEMA=True; return True
     except Exception as ex: live._diag(f"V8.4 schema warning {type(ex).__name__}: {ex}"); return False
 def insert(c):
     if not schema():return False
     e,sw,d=c["e"],c["sweep"],c["dol"]
-    r=live._db("""INSERT INTO fh_v84_ict_dol_shadow(source_key,symbol,direction,bias_score,sweep_ts,sweep_level,sweep_extreme,mss_ts,mss_level,fvg_ts,fvg_low,fvg_high,entry_ts,entry,stop,dol,dol_source,planned_rr,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(source_key) DO NOTHING RETURNING source_key""",(c["key"],c["symbol"],c["direction"],c["bias"],sw["ts"],sw["level"],sw["extreme"],e["mss_ts"],e["mss_level"],e["fvg_ts"],e["fvg_low"],e["fvg_high"],e["entry_ts"],e["entry"],c["stop"],d["price"],d["source"],c["rr"],js({"version":"8.4.0","shadow_only":True,"model":"HTF bias -> DOL -> sweep -> MSS -> FVG retest"})),"one")
+    r=live._db("""INSERT INTO fh_v84_ict_dol_shadow(source_key,symbol,direction,bias_score,sweep_ts,sweep_level,sweep_extreme,mss_ts,mss_level,fvg_ts,fvg_low,fvg_high,entry_ts,entry,stop,dol,dol_source,planned_rr,paper_decision,payload) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(source_key) DO NOTHING RETURNING source_key""",(c["key"],c["symbol"],c["direction"],c["bias"],sw["ts"],sw["level"],sw["extreme"],e["mss_ts"],e["mss_level"],e["fvg_ts"],e["fvg_low"],e["fvg_high"],e["entry_ts"],e["entry"],c["stop"],d["price"],d["source"],c["rr"],"TAKE",js({"version":"8.4.1","shadow_only":True,"paper_decision":"TAKE","model":"HTF bias -> DOL -> sweep -> MSS -> FVG retest"})),"one")
     if r: live._diag(f"V8.4 ICT/DOL NEW {c['symbol']} {c['direction']} entry={e['entry']:.8g} stop={c['stop']:.8g} DOL={d['price']:.8g} rr={c['rr']:.2f}")
     return bool(r)
 def settle(main):
@@ -153,11 +154,11 @@ def settle(main):
     return n
 def stats():
     if not schema():return "🧭 V8.4 ICT/DOL SHADOW\nDatabase unavailable."
-    a=live._db("SELECT COUNT(*),COUNT(*) FILTER(WHERE status='OPEN'),COUNT(*) FILTER(WHERE status='SETTLED'),COUNT(*) FILTER(WHERE outcome='DOL_HIT'),COALESCE(AVG(final_r) FILTER(WHERE status='SETTLED'),0),COALESCE(SUM(final_r) FILTER(WHERE status='SETTLED'),0),MIN(created_at) FROM fh_v84_ict_dol_shadow",(),"one")
+    a=live._db("SELECT COUNT(*),COUNT(*) FILTER(WHERE status='OPEN'),COUNT(*) FILTER(WHERE status='SETTLED'),COUNT(*) FILTER(WHERE outcome='DOL_HIT'),COUNT(*) FILTER(WHERE status='SETTLED' AND final_r>0),COALESCE(AVG(final_r) FILTER(WHERE status='SETTLED'),0),COALESCE(SUM(final_r) FILTER(WHERE status='SETTLED'),0),MIN(created_at) FROM fh_v84_ict_dol_shadow",(),"one")
     latest=live._db("SELECT symbol,direction,entry,stop,dol,planned_rr,status,outcome,final_r FROM fh_v84_ict_dol_shadow ORDER BY created_at DESC LIMIT 3",(),"all") or []
     if not a:return "🧭 V8.4 ICT/DOL SHADOW\nWarming."
-    total,op,res,hit,avg,sr,started=a; total,op,res,hit=map(lambda x:int(x or 0),(total,op,res,hit))
-    lines=["🧭 V8.4 ICT/DOL SHADOW — prospective",f"Signals: {total} | Open: {op} | Resolved: {res}",f"DOL hit: {100*hit/res:.1f}% | Avg: {f(avg):+.2f}R | Total: {f(sr):+.2f}R" if res else "DOL hit / expectancy: warming",f"Cohort: {started}" if started else "Cohort starts with first signal","No backfill. Closed-candle shadow only. Live execution unchanged."]
+    total,op,res,hit,wins,avg,sr,started=a; total,op,res,hit,wins=map(lambda x:int(x or 0),(total,op,res,hit,wins))
+    lines=["🧭 V8.4 ICT/DOL SHADOW — prospective TAKE-ALL",f"Signals: {total} | Open: {op} | Resolved: {res}",f"Net win: {100*wins/res:.1f}% | DOL hit: {100*hit/res:.1f}% | Avg: {f(avg):+.2f}R | Total: {f(sr):+.2f}R" if res else "Net win / DOL hit / expectancy: warming",f"Cohort: {started}" if started else "Cohort starts with first signal",f"Scan: every {SCAN}s | universe <= {MAX_UNIVERSE}","Every fully qualified ICT/DOL setup is paper-TAKEN prospectively. No backfill. Live execution unchanged."]
     for s,d,e,st,t,rr,status_,out,fr in latest: lines.append(f"{s} {d} | E {f(e):.8g} S {f(st):.8g} DOL {f(t):.8g} | {f(rr):.2f}R | {status_}"+(f" {out} {f(fr):+.2f}R" if fr is not None else ""))
     return "\n".join(lines)
 def scan(main):
@@ -192,7 +193,7 @@ def patch(main):
         def smsg():return str(ps()).rstrip()+"\n\n"+stats()
         main.handle_telegram_command=cmd; main.telegram_stats_message=smsg; _PATCHED=True; schema()
         threading.Thread(target=loop,args=(main,),name="V840ICTDOL",daemon=True).start()
-        live._diag(f"V8.4 ICT/DOL armed SHADOW_ONLY=True scan={SCAN}s universe<={MAX_UNIVERSE} min_rr={MIN_RR:.2f} live_gate_unchanged=True no_backfill=True")
+        live._diag(f"V8.4.1 ICT/DOL armed SHADOW_ONLY=True paper_take_all=True scan={SCAN}s universe<={MAX_UNIVERSE} min_rr={MIN_RR:.2f} live_gate_unchanged=True no_backfill=True")
         return True
 def bootstrap():
     end=time.time()+360
