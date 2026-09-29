@@ -62,8 +62,8 @@ def _closed(df):
 
 def _get(main, symbol, interval, n=40):
     try:
-        df = main.get_candles(symbol, interval, n)
-        return _closed(df)
+        df = main.get_candles(symbol, interval)
+        return _closed(df).tail(n)
     except Exception:
         return None
 
@@ -82,7 +82,7 @@ def _fresh_price(main, symbol):
     # Prefer the most recent 5m candle close from MEXC. This is intentionally
     # exchange-native and avoids search/indexed web snapshots.
     try:
-        df = main.get_candles(symbol, "Min5", 4)
+        df = main.get_candles(symbol, "Min5")
         if df is None or len(df) == 0:
             return None
         return _f(df.iloc[-1].get("close"))
