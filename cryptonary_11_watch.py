@@ -16,7 +16,7 @@ ASSETS = {
     "ETH_USDT": {"label": "ETH", "kind": "eth", "level": 2633.0, "targets": [2464.0]},
     "SOL_USDT": {"label": "SOL", "kind": "sol", "level": 120.0, "targets": [122.80, 148.41], "alt": 115.80},
     "HYPE_USDT": {"label": "HYPE", "kind": "hype", "level": 89.96, "targets": [84.89, 75.20], "alt": 86.76},
-    "AURA_USDT": {"label": "AURA", "kind": "aura", "level": 0.0093, "targets": [0.0126, 0.0137, 0.0182]},
+    "AURASOL_USDT": {"label": "AURA", "kind": "aura", "level": 0.0093, "targets": [0.0126, 0.0137, 0.0182]},
     "ZEC_USDT": {"label": "ZEC", "kind": "zec", "level": 1444.0, "targets": [1320.0]},
     "XMR_USDT": {"label": "XMR", "kind": "xmr", "level": 541.0, "targets": [484.30, 449.61], "alt": 548.50},
     "DELTA_USDT": {"label": "DELTA", "kind": "delta", "level": 0.0238, "targets": [0.0380], "alt": 0.0181},
