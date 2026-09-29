@@ -231,42 +231,61 @@ def build_text(main):
 
 
 def patch(main):
-    global _PATCHED
+    """Keep C11 wrapped around the *latest* Telegram handler.
+
+    Runtime overlays can replace handle_telegram_command after sitecustomize
+    imports this module.  A one-shot wrapper therefore captures a stale
+    handler and makes newer commands disappear.  This function is safe to
+    call repeatedly and only wraps when the active handler is not ours.
+    """
+    if not hasattr(main, "get_candles") or not hasattr(main, "handle_telegram_command") or not hasattr(main, "send_to_chat"):
+        return False
+
     with _LOCK:
-        if _PATCHED:
+        current = main.handle_telegram_command
+        if getattr(current, "_cryptonary11_wrapper", False):
             return True
-        if not hasattr(main, "get_candles") or not hasattr(main, "handle_telegram_command") or not hasattr(main, "send_to_chat"):
-            return False
-        prev = main.handle_telegram_command
+
+        prev = current
 
         def cmd(chat_id, text):
             c = (((text or "").strip().split() or [""])[0].lower().split("@")[0])
             if c in {"/cryptonary", "/crypto11", "/c11"}:
-                report = build_text(main)
-                print("[C11 SNAPSHOT]\n" + report, flush=True)
-                main.send_to_chat(chat_id, report)
+                try:
+                    report = build_text(main)
+                    print("[C11 SNAPSHOT]\n" + report, flush=True)
+                    ok = main.send_to_chat(chat_id, report)
+                    print(f"[CRYPTONARY11] reply chat={chat_id} delivered={bool(ok)}", flush=True)
+                except Exception as exc:
+                    print(f"[CRYPTONARY11] command error: {type(exc).__name__}: {exc}", flush=True)
+                    try:
+                        main.send_to_chat(chat_id, "C11 error while building the snapshot. Check Render logs.")
+                    except Exception:
+                        pass
                 return
             return prev(chat_id, text)
 
+        cmd._cryptonary11_wrapper = True
+        cmd._cryptonary11_prev = prev
         main.handle_telegram_command = cmd
-        _PATCHED = True
-        try:
-            print("[CRYPTONARY11] read-only MEXC candle command armed: /cryptonary /crypto11 /c11", flush=True)
-        except Exception:
-            pass
+        print("[CRYPTONARY11] command wrapper attached to latest Telegram handler", flush=True)
         return True
 
 
 def bootstrap():
-    end = time.time() + 360
-    while time.time() < end:
+    # Overlays load asynchronously and some of them replace the Telegram
+    # command handler after startup.  Keep re-attaching C11 to the newest
+    # handler instead of freezing a stale predecessor.
+    announced = False
+    while True:
         try:
             main = sys.modules.get("__main__")
-            if main is not None and patch(main):
-                return
-        except Exception:
-            pass
-        time.sleep(0.5)
+            if main is not None and patch(main) and not announced:
+                print("[CRYPTONARY11] read-only MEXC candle command armed: /cryptonary /crypto11 /c11", flush=True)
+                announced = True
+        except Exception as exc:
+            print(f"[CRYPTONARY11] bootstrap error: {type(exc).__name__}: {exc}", flush=True)
+        time.sleep(2.0)
 
 
 threading.Thread(target=bootstrap, name="Cryptonary11Bootstrap", daemon=True).start()
