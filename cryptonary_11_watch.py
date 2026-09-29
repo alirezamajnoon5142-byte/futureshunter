@@ -242,7 +242,9 @@ def patch(main):
         def cmd(chat_id, text):
             c = (((text or "").strip().split() or [""])[0].lower().split("@")[0])
             if c in {"/cryptonary", "/crypto11", "/c11"}:
-                main.send_to_chat(chat_id, build_text(main))
+                report = build_text(main)
+                print("[C11 SNAPSHOT]\n" + report, flush=True)
+                main.send_to_chat(chat_id, report)
                 return
             return prev(chat_id, text)
 
