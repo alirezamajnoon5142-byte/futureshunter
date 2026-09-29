@@ -13636,6 +13636,18 @@ def handle_telegram_command(chat_id, text):
     return _v82_previous_telegram_command_handler(chat_id,text)
 
 
+# Cryptonary 11 command is installed here, after every later command wrapper
+# has been defined and immediately before the Telegram listener starts.  The
+# earlier sitecustomize bootstrap can run too early and then be overwritten by
+# later /4h and other command wrappers.
+try:
+    import cryptonary_11_watch as _cryptonary_11_watch
+    _cryptonary_11_watch._PATCHED = False
+    _cryptonary_11_watch.patch(__import__("sys").modules[__name__])
+except Exception as _cryptonary_command_error:
+    print(f"[CRYPTONARY11] final command hook failed: {type(_cryptonary_command_error).__name__}: {_cryptonary_command_error}", flush=True)
+
+
 # ============================================================
 # START
 # ============================================================
