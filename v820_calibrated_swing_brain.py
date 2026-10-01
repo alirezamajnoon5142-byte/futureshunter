@@ -31,6 +31,8 @@ SHADOW_ONLY = True
 SYNC_SECONDS = max(120, int(os.getenv("V820_SYNC_SECONDS", "600")))
 HORIZON_HOURS = max(12.0, min(120.0, float(os.getenv("V820_HORIZON_HOURS", "48"))))
 MIN_PLATT_SAMPLE = max(20, int(os.getenv("V820_MIN_PLATT_SAMPLE", "30")))
+CALIBRATION_MATURE_N = max(MIN_PLATT_SAMPLE, int(os.getenv("V820_CALIBRATION_MATURE_N", "100")))
+EXECUTION_EVIDENCE_MIN_PER_ARM = max(20, int(os.getenv("V820_EXECUTION_EVIDENCE_MIN_PER_ARM", "30")))
 TAKE_PROB = min(0.80, max(0.50, float(os.getenv("V820_TAKE_PROB", "0.60"))))
 WATCH_PROB = min(TAKE_PROB, max(0.45, float(os.getenv("V820_WATCH_PROB", "0.52"))))
 MAX_TAKE_DISAGREEMENT = min(0.40, max(0.05, float(os.getenv("V820_MAX_TAKE_DISAGREEMENT", "0.20"))))
@@ -365,6 +367,7 @@ def _ensure_schema():
         )
         live._db("CREATE INDEX IF NOT EXISTS idx_v82_exec_open ON fh_v82_execution_paper(status,symbol)")
         live._db("ALTER TABLE fh_v82_execution_paper ADD COLUMN IF NOT EXISTS alerted_at TIMESTAMPTZ")
+        live._db("ALTER TABLE fh_v82_execution_paper ADD COLUMN IF NOT EXISTS alert_claimed_at TIMESTAMPTZ")
         _SCHEMA_READY = True
         return True
     except Exception as exc:
@@ -454,13 +457,18 @@ def _state_snapshot(c):
 
 
 def _alert_new_4h_candidate(key, decision):
-    """Exactly one initial alert per prospective WATCH/TAKE paper setup."""
+    """Exactly one initial alert per prospective WATCH/TAKE paper setup.
+
+    Delivery accounting is deliberately separate from the short claim lease:
+    alerted_at means at least one notifier accepted delivery, never merely attempted.
+    """
     if decision not in ("WATCH","TAKE"):
         return
-    # Only announce a successfully persisted paper record, not every repeated scan.
     row=live._db(
-        """UPDATE fh_v82_execution_paper SET alerted_at=NOW()
+        """UPDATE fh_v82_execution_paper
+           SET alert_claimed_at=NOW()
            WHERE source_key=%s AND alerted_at IS NULL
+             AND (alert_claimed_at IS NULL OR alert_claimed_at < NOW()-INTERVAL '10 minutes')
            RETURNING symbol,direction,reference_entry,stop,tp1,tp2,tp3,
                      probability,calibration_n,atomic_decision""",
         (key,),"one")
@@ -478,14 +486,27 @@ def _alert_new_4h_candidate(key, decision):
         "Research signal, NOT an executed trade. /4h for latest 4H setups."
     )
     try:
-        # Uses existing FuturesHunter Telegram broadcast configured on live executor.
-        live._notify(message)
-        live._diag(f"V8.2 4H Telegram alert queued {key} {action}")
+        delivered=bool(live._notify(message))
+        if delivered:
+            live._db(
+                """UPDATE fh_v82_execution_paper
+                   SET alerted_at=NOW(),alert_claimed_at=NULL
+                   WHERE source_key=%s AND alerted_at IS NULL""",
+                (key,)
+            )
+            live._diag(f"V8.2 4H Telegram alert delivered {key} {action}")
+        else:
+            live._db(
+                "UPDATE fh_v82_execution_paper SET alert_claimed_at=NULL WHERE source_key=%s AND alerted_at IS NULL",
+                (key,)
+            )
+            live._diag(f"V8.2 4H Telegram alert failed; retry eligible {key} {action}")
     except Exception as exc:
-        # Retry next scan rather than permanently losing the alert.
-        live._db("UPDATE fh_v82_execution_paper SET alerted_at=NULL WHERE source_key=%s",(key,))
+        live._db(
+            "UPDATE fh_v82_execution_paper SET alert_claimed_at=NULL WHERE source_key=%s AND alerted_at IS NULL",
+            (key,)
+        )
         live._diag(f"V8.2 alert retry {key}: {type(exc).__name__}: {exc}")
-
 
 def _observe(c):
     if not ENABLED or not isinstance(c,dict):
@@ -855,7 +876,7 @@ def _sync_execution_paper(main):
     return count
 
 
-def _execution_paper_report():
+def _execution_paper_stats():
     rows=live._db(
         """SELECT arm,COUNT(*),COUNT(*) FILTER(WHERE status='SETTLED'),
                   AVG(final_r) FILTER(WHERE status='SETTLED'),
@@ -867,11 +888,36 @@ def _execution_paper_report():
              UNION ALL
              SELECT 'ATOMIC_WATCH_TAKE' AS arm,status,final_r
                FROM fh_v82_execution_paper WHERE atomic_decision IN ('WATCH','TAKE')
+             UNION ALL
+             SELECT 'ATOMIC_WATCH' AS arm,status,final_r
+               FROM fh_v82_execution_paper WHERE atomic_decision='WATCH'
+             UNION ALL
+             SELECT 'ATOMIC_TAKE' AS arm,status,final_r
+               FROM fh_v82_execution_paper WHERE atomic_decision='TAKE'
            ) x GROUP BY arm ORDER BY arm""",(),"all"
     ) or []
-    return " | ".join(f"{arm}: n={int(total)} settled={int(n)} win={_f(win)*100:.1f}% "
-                    f"avg={_f(avg):+.2f}R sum={_f(total_r):+.2f}R"
-                    for arm,total,n,avg,total_r,win in rows)
+    return {str(arm):{"enrolled":int(total or 0),"settled":int(n or 0),
+                      "avg_r":_f(avg),"sum_r":_f(total_r),"win":_f(win)}
+            for arm,total,n,avg,total_r,win in rows}
+
+
+def _execution_paper_report():
+    stats=_execution_paper_stats()
+    parts=[]
+    for arm in ("QUALIFIED_CONTROL","ATOMIC_WATCH","ATOMIC_TAKE","ATOMIC_WATCH_TAKE"):
+        s=stats.get(arm)
+        if s:
+            parts.append(f"{arm}: n={s['enrolled']} settled={s['settled']} win={s['win']*100:.1f}% "
+                         f"avg={s['avg_r']:+.2f}R sum={s['sum_r']:+.2f}R")
+    control=stats.get("QUALIFIED_CONTROL",{})
+    selected=stats.get("ATOMIC_WATCH_TAKE",{})
+    delta=_f(selected.get("avg_r"))-_f(control.get("avg_r"))
+    ready=(int(control.get("settled",0))>=EXECUTION_EVIDENCE_MIN_PER_ARM and
+           int(selected.get("settled",0))>=EXECUTION_EVIDENCE_MIN_PER_ARM)
+    parts.append(f"selected-control delta={delta:+.2f}R | execution_readiness="
+                 f"{'REVIEW' if ready else 'COLLECT_DATA'} "
+                 f"(min {EXECUTION_EVIDENCE_MIN_PER_ARM} settled/arm)")
+    return " | ".join(parts)
 
 
 def _metrics(pairs, calibrated=False, a=0.0, b=1.0):
@@ -945,7 +991,8 @@ def _report(slot):
         pieces=[
             f"V8.2 CALIBRATION {slot}",
             f"settled={n} platt={'ACTIVE' if n>=MIN_PLATT_SAMPLE else 'WARMING'} a={a:+.3f} b={b:.3f}",
-            f"readiness={'CALIBRATION_READY' if n>=MIN_PLATT_SAMPLE else 'COLLECT_DATA'} remaining_to_platt={max(0, MIN_PLATT_SAMPLE-n)}",
+            f"calibration_state={'MATURE' if n>=CALIBRATION_MATURE_N else ('ACTIVE_EARLY' if n>=MIN_PLATT_SAMPLE else 'WARMING')} "
+            f"remaining_to_platt={max(0, MIN_PLATT_SAMPLE-n)} mature_at={CALIBRATION_MATURE_N}",
         ]
         if raw.get("brier") is not None:
             pieces.append(
