@@ -26,4 +26,5 @@ else:
     import v820_calibrated_swing_brain  # noqa: F401
     import v830_selector_challenger  # noqa: F401
     import v840_ict_dol_shadow  # noqa: F401
+    import v850_macro_btc_challenger  # noqa: F401
     import cryptonary_11_watch  # noqa: F401
