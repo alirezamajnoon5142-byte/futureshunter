@@ -984,6 +984,48 @@ def _decision_stats():
     ]
 
 
+def _v81_vs_atomic_diagnostic():
+    """Research-only attribution: which atomic decisions add/remove expectancy
+    relative to the same frozen V8.1-qualified baseline cohort.
+    """
+    rows=live._db(
+        """SELECT atomic_decision,
+                  COUNT(*) FILTER(WHERE paper_status='SETTLED') AS settled,
+                  AVG(outcome_r) FILTER(WHERE paper_status='SETTLED') AS avg_r,
+                  SUM(outcome_r) FILTER(WHERE paper_status='SETTLED') AS total_r,
+                  AVG(CASE WHEN outcome_r>0 THEN 1.0 ELSE 0.0 END)
+                    FILTER(WHERE paper_status='SETTLED') AS positive
+           FROM fh_v82_paired_paper
+           GROUP BY atomic_decision ORDER BY atomic_decision""",(),"all"
+    ) or []
+    parts=[]
+    for decision,n,avg_r,total_r,pos in rows:
+        parts.append(
+            f"{decision}: settled={int(n or 0)} avg={_f(avg_r):+.2f}R "
+            f"sum={_f(total_r):+.2f}R positive={_f(pos)*100:.1f}%"
+        )
+    baseline=live._db(
+        """SELECT COUNT(*) FILTER(WHERE paper_status='SETTLED'),
+                  AVG(outcome_r) FILTER(WHERE paper_status='SETTLED'),
+                  SUM(outcome_r) FILTER(WHERE paper_status='SETTLED')
+           FROM fh_v82_paired_paper""",(),"one")
+    selected=live._db(
+        """SELECT COUNT(*) FILTER(WHERE paper_status='SETTLED'),
+                  AVG(outcome_r) FILTER(WHERE paper_status='SETTLED'),
+                  SUM(outcome_r) FILTER(WHERE paper_status='SETTLED')
+           FROM fh_v82_paired_paper
+           WHERE atomic_decision IN ('WATCH','TAKE')""",(),"one")
+    b_n,b_avg,b_sum=(baseline or (0,None,None))
+    s_n,s_avg,s_sum=(selected or (0,None,None))
+    delta=_f(s_avg)-_f(b_avg)
+    parts.append(
+        f"selector_vs_v81_baseline: baseline_n={int(b_n or 0)} selected_n={int(s_n or 0)} "
+        f"avg_delta={delta:+.2f}R baseline_sum={_f(b_sum):+.2f}R "
+        f"selected_sum={_f(s_sum):+.2f}R"
+    )
+    return " | ".join(parts)
+
+
 def _report(slot):
     try:
         a,b,n,raw,cal=_save_calibration()
@@ -1006,6 +1048,7 @@ def _report(slot):
                 f"sum={s['sum_r']:+.2f}R positive={s['positive_rate']*100:.0f}%"
             )
         pieces.append("PAIRED PAPER (prospective, simulated first barrier, no fees/fills): "+_paired_paper_report())
+        pieces.append("V8.1 QUALIFIED vs ATOMIC ATTRIBUTION (research only): "+_v81_vs_atomic_diagnostic())
         pieces.append("EXECUTION-STYLE PAPER (new cohort): "+_execution_paper_report())
         live._diag(" | ".join(pieces))
     except Exception as exc:
