@@ -1026,6 +1026,62 @@ def _v81_vs_atomic_diagnostic():
     return " | ".join(parts)
 
 
+
+def _probability_bucket_diagnostic():
+    """Prospective settled calibration buckets. Observational only; never changes policy."""
+    rows=live._db(
+        """SELECT bucket,COUNT(*),AVG(outcome_r),
+                  AVG(CASE WHEN y_positive=1 THEN 1.0 ELSE 0.0 END)
+           FROM (
+             SELECT CASE
+               WHEN calibrated_probability < 0.30 THEN '<0.30'
+               WHEN calibrated_probability < 0.35 THEN '0.30-0.35'
+               WHEN calibrated_probability < 0.40 THEN '0.35-0.40'
+               WHEN calibrated_probability < 0.45 THEN '0.40-0.45'
+               WHEN calibrated_probability < 0.52 THEN '0.45-0.52'
+               ELSE '>=0.52' END AS bucket,
+               outcome_r,y_positive
+             FROM fh_v82_swing_judgments
+             WHERE outcome_ts IS NOT NULL AND calibrated_probability IS NOT NULL
+           ) q GROUP BY bucket""",(),"all"
+    ) or []
+    order={'<0.30':0,'0.30-0.35':1,'0.35-0.40':2,'0.40-0.45':3,'0.45-0.52':4,'>=0.52':5}
+    rows=sorted(rows,key=lambda r:order.get(str(r[0]),99))
+    return " | ".join(
+        f"{bucket}: n={int(n or 0)} avg={_f(avg_r):+.2f}R positive={_f(pos)*100:.1f}%"
+        for bucket,n,avg_r,pos in rows
+    ) or "no settled bucket evidence"
+
+
+def _edge_readiness_diagnostic():
+    stats=_execution_paper_stats()
+    control=stats.get("QUALIFIED_CONTROL",{})
+    selected=stats.get("ATOMIC_WATCH_TAKE",{})
+    sn=int(selected.get("settled",0)); cn=int(control.get("settled",0))
+    savg=_f(selected.get("avg_r")); cavg=_f(control.get("avg_r"))
+    delta=savg-cavg
+    if savg <= 0:
+        state="NO_EDGE"
+    elif sn >= 100 and delta > 0:
+        state="EVIDENCE_READY"
+    elif sn >= EXECUTION_EVIDENCE_MIN_PER_ARM and delta > 0:
+        state="PROMISING"
+    else:
+        state="COLLECT_DATA"
+    enrolled=int(selected.get("enrolled",0))
+    control_enrolled=int(control.get("enrolled",0))
+    selection_rate=(enrolled/control_enrolled if control_enrolled else 0.0)
+    funding_note=("FUNDING_NOT_MODELED_EXPECTANCY_MAY_BE_OPTIMISTIC"
+                  if PAPER_FUNDING_BPS_8H == 0 else f"funding_bps_8h={PAPER_FUNDING_BPS_8H:g}")
+    return (
+        f"edge_state={state} selected_n={sn} control_n={cn} "
+        f"selected_avg={savg:+.2f}R control_avg={cavg:+.2f}R "
+        f"selector_delta={delta:+.2f}R selection_rate={selection_rate*100:.1f}% "
+        f"{funding_note} | GOOD_CALIBRATION != POSITIVE_TRADING_EDGE"
+    )
+
+
+
 def _report(slot):
     try:
         a,b,n,raw,cal=_save_calibration()
@@ -1050,6 +1106,8 @@ def _report(slot):
         pieces.append("PAIRED PAPER (prospective, simulated first barrier, no fees/fills): "+_paired_paper_report())
         pieces.append("V8.1 QUALIFIED vs ATOMIC ATTRIBUTION (research only): "+_v81_vs_atomic_diagnostic())
         pieces.append("EXECUTION-STYLE PAPER (new cohort): "+_execution_paper_report())
+        pieces.append("EDGE READINESS: "+_edge_readiness_diagnostic())
+        pieces.append("CALIBRATED PROBABILITY BUCKETS (research only): "+_probability_bucket_diagnostic())
         live._diag(" | ".join(pieces))
     except Exception as exc:
         live._diag(f"V8.2 report warning: {type(exc).__name__}: {exc}")
