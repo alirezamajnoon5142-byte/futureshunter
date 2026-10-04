@@ -200,6 +200,11 @@ def save_subscribers(subscribers):
 
 SUBSCRIBERS = load_subscribers()
 
+# Operational-only health state. Never changes trading eligibility or execution.
+TELEGRAM_FAILURES = {}
+TELEGRAM_QUARANTINED = set()
+CANDLE_FAILURES = {}
+
 
 def _safe_error(error):
     value = str(error)
@@ -211,6 +216,9 @@ def _safe_error(error):
 def send_to_chat(chat_id, message):
     if not telegram_ready():
         print("Telegram bot token missing.")
+        return False
+
+    if chat_id in TELEGRAM_QUARANTINED:
         return False
 
     url = (
@@ -228,10 +236,24 @@ def send_to_chat(chat_id, message):
             },
             timeout=15
         )
+        if response.status_code == 403:
+            failures = int(TELEGRAM_FAILURES.get(chat_id, 0)) + 1
+            TELEGRAM_FAILURES[chat_id] = failures
+            if failures >= 3:
+                TELEGRAM_QUARANTINED.add(chat_id)
+                print(f"Telegram subscriber quarantined after persistent 403 ({chat_id}); quarantined_count={len(TELEGRAM_QUARANTINED)}")
+            else:
+                print(f"Telegram send 403 ({chat_id}); consecutive_failures={failures}")
+            return False
         response.raise_for_status()
-        return bool(response.json().get("ok"))
+        ok = bool(response.json().get("ok"))
+        if ok:
+            TELEGRAM_FAILURES[chat_id] = 0
+            TELEGRAM_QUARANTINED.discard(chat_id)
+        return ok
 
     except Exception as error:
+        # Transient/non-403 failures remain retryable and never quarantine a subscriber.
         print(f"Telegram send error ({chat_id}): {_safe_error(error)}")
         return False
 
@@ -282,6 +304,7 @@ def telegram_status_message():
     return (
         "✅ FuturesHunter V6 is online.\n\n"
         f"Subscribers: {subscriber_count}\n"
+        f"Telegram quarantined: {len(TELEGRAM_QUARANTINED)}\n"
         f"Universe: top {TOP_N} liquid MEXC USDT perpetuals\n"
         f"Scan interval: {FULL_SCAN_INTERVAL // 60} min\n"
         f"Scoring model: 50 factors\n"
@@ -1034,11 +1057,16 @@ def get_candles(
 
         except Exception as error:
             if attempt == 2:
+                key = f"{symbol}:{interval}"
+                state = CANDLE_FAILURES.get(key, {"count": 0})
+                state["count"] = int(state.get("count", 0)) + 1
+                state["last_failure"] = datetime.now(timezone.utc).isoformat()
+                state["last_error"] = _safe_error(error)
+                CANDLE_FAILURES[key] = state
                 print(
-                    f"Candle error "
-                    f"{symbol} "
-                    f"{interval}: "
-                    f"{error}"
+                    f"Candle error {symbol} {interval}: {error} "
+                    f"| persistent_count={state['count']} "
+                    f"| last_failure={state['last_failure']}"
                 )
 
                 return None
