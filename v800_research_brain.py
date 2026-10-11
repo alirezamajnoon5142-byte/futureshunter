@@ -552,13 +552,13 @@ def _proposals(stats):
         # R-multiple strategies can have positive expectancy with <50% winners,
         # so expectancy is primary. Positive-rate is descriptive, not a veto.
         if n >= REVIEW_FILTER_SAMPLE and avg_r >= 0.20 and sum_r > 0:
-            action = "REVIEW_FOR_LOOSENING"
+            action = "HISTORICAL_MULTI_LABEL_HYPOTHESIS"
             note = (
                 "Skipped counterfactual expectancy is materially positive. "
                 "Test a narrow shadow relaxation before any live change."
             )
         elif avg_r >= 0.10 and sum_r >= 1.0:
-            action = "WATCH_FOR_LOOSENING"
+            action = "HISTORICAL_MULTI_LABEL_WATCH"
             note = (
                 "Skipped expectancy is positive but not yet strong enough for a "
                 "parameter change; collect more category-specific outcomes."
@@ -583,8 +583,8 @@ def _proposals(stats):
         })
 
     priority = {
-        "REVIEW_FOR_LOOSENING": 0,
-        "WATCH_FOR_LOOSENING": 1,
+        "HISTORICAL_MULTI_LABEL_HYPOTHESIS": 0,
+        "HISTORICAL_MULTI_LABEL_WATCH": 1,
         "KEEP_OR_STRENGTHEN": 2,
         "HOLD": 3,
     }
