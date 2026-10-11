@@ -1121,6 +1121,8 @@ def _report(slot):
         pieces.append("PAIRED PAPER (prospective, simulated first barrier, no fees/fills): "+_paired_paper_report())
         pieces.append("V8.1 QUALIFIED vs ATOMIC ATTRIBUTION (research only): "+_v81_vs_atomic_diagnostic())
         pieces.append("EXECUTION-STYLE PAPER (new cohort): "+_execution_paper_report())
+        pieces.append("EXECUTION PROBABILITY BUCKETS (frozen, net simulation): "+str(_execution_probability_bucket_report()))
+        pieces.append("CALIBRATION VALIDATION: fitted metrics IN_SAMPLE; independent prospective validation not yet established")
         pieces.append("EDGE READINESS: "+_edge_readiness_diagnostic())
         pieces.append("CALIBRATED PROBABILITY BUCKETS (research only): "+_probability_bucket_diagnostic())
         live._diag(" | ".join(pieces))
