@@ -538,17 +538,7 @@ def _observe(c):
                 entry,stop,tp1,raw_probability,calibrated_probability,calibration_n,
                 disagreement,confidence,shadow_decision,judgments,state_snapshot,payload
             ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT(source_key) DO UPDATE SET
-                raw_probability=EXCLUDED.raw_probability,
-                calibrated_probability=EXCLUDED.calibrated_probability,
-                calibration_n=EXCLUDED.calibration_n,
-                disagreement=EXCLUDED.disagreement,
-                confidence=EXCLUDED.confidence,
-                shadow_decision=EXCLUDED.shadow_decision,
-                judgments=EXCLUDED.judgments,
-                state_snapshot=EXCLUDED.state_snapshot,
-                payload=EXCLUDED.payload,
-                updated_at=NOW()""",
+            ON CONFLICT(source_key) DO NOTHING""",
             (
                 key,_f(meta.get("candle_ts")),str(c.get("symbol")),_norm(c.get("direction")),
                 _norm(meta.get("setup")),_norm(meta.get("bucket")),_f(c.get("best_score")),
@@ -947,7 +937,7 @@ def _save_calibration():
     a,b,n=_platt_fit(pairs)
     raw=_metrics(pairs)
     cal=_metrics(pairs,True,a,b)
-    payload={"version":"8.2.0","method":"Platt(logit(raw_p))","min_sample":MIN_PLATT_SAMPLE}
+    payload={"version":"8.2.0","method":"Platt(logit(raw_p))","min_sample":MIN_PLATT_SAMPLE,"evaluation":"IN_SAMPLE","independently_validated":False}
     live._db(
         """INSERT INTO fh_v82_calibration(
              calibration_key,sample_n,intercept,slope,brier_raw,brier_calibrated,
