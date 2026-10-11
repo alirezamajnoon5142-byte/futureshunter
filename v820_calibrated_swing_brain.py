@@ -891,6 +891,31 @@ def _execution_paper_stats():
             for arm,total,n,avg,total_r,win in rows}
 
 
+def _execution_probability_bucket_report():
+    """Diagnostic only: frozen enrollment probabilities, net execution-paper returns."""
+    rows=live._db(
+        """SELECT CASE
+             WHEN probability<0.30 THEN '<0.30'
+             WHEN probability<0.35 THEN '0.30-0.35'
+             WHEN probability<0.40 THEN '0.35-0.40'
+             WHEN probability<0.45 THEN '0.40-0.45'
+             WHEN probability<0.52 THEN '0.45-0.52'
+             ELSE '>=0.52' END AS bucket,
+           direction, COUNT(*),
+           COUNT(*) FILTER(WHERE status='SETTLED'),
+           AVG(final_r) FILTER(WHERE status='SETTLED'),
+           SUM(final_r) FILTER(WHERE status='SETTLED'),
+           SUM(fees_r) FILTER(WHERE status='SETTLED'),
+           SUM(funding_r) FILTER(WHERE status='SETTLED')
+           FROM fh_v82_execution_paper WHERE probability IS NOT NULL
+           GROUP BY bucket,direction ORDER BY bucket,direction""",(),"all"
+    ) or []
+    return [{"bucket":str(bucket),"direction":str(direction),"enrolled":int(total or 0),
+             "settled":int(settled or 0),"net_avg_r":_f(avg),
+             "net_total_r":_f(net),"fees_r":_f(fees),"funding_r":_f(funding)}
+            for bucket,direction,total,settled,avg,net,fees,funding in rows]
+
+
 def _execution_paper_report():
     stats=_execution_paper_stats()
     parts=[]
