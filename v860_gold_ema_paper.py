@@ -11,6 +11,7 @@ FEE_BPS=max(0,float(os.getenv("V860_GOLD_FEE_BPS","4")))
 SLIP_BPS=max(0,float(os.getenv("V860_GOLD_SLIPPAGE_BPS","4")))
 _LOCK=threading.Lock()
 _PATCHED=False
+_LAST_SCAN_LOG=0.0
 SYMBOL="XAU_USDT"
 
 def db(sql,args=(),mode=None):
@@ -79,11 +80,18 @@ def stats():
     total,n,avg,totalr,win=row
     return ("🥇 GOLD EMA50/200 H1 PULLBACK — PAPER ONLY\n"
             f"Signals: {int(total or 0)} | Settled: {int(n or 0)} | Open: {int(total or 0)-int(n or 0)}\n"
-            + (f"Net expectancy: {float(avg):+.3f}R | Total: {float(totalr):+.2f}R | Win: {float(win)*100:.1f}%" if n else "Net expectancy: awaiting prospective settlements")
-            +"\nStop-first ambiguous bars; approximate fees/slippage; no funding. NOT live fills.")
+            + (f"Simulated avg: {float(avg):+.3f}R | Total: {float(totalr):+.2f}R | Win: {float(win)*100:.1f}%" if n else "Simulated avg: awaiting prospective settlements")
+            +"\nReference-close entries, stop-first OHLC, estimated fees/slippage; funding not charged; NOT exchange fills.")
 
 def scan(main):
+    global _LAST_SCAN_LOG
     d=candles(main)
+    if time.time()-_LAST_SCAN_LOG>=21600:
+        try:
+            live._diag(f"V8.6 GOLD PAPER candle_health: {'unavailable/short (<215 raw)' if d is None else str(len(d))+' closed H1 bars'}")
+        except Exception:
+            pass
+        _LAST_SCAN_LOG=time.time()
     if d is None:return
     settle(main,d)
     item=candidate(d)
