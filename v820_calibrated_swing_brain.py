@@ -957,6 +957,47 @@ def _metrics(pairs, calibrated=False, a=0.0, b=1.0):
     return {"n":len(obs),"brier":brier,"log_loss":ll,"ece":ece}
 
 
+def _frozen_probability_audit():
+    """Read-only audit of probabilities stored BEFORE outcome settlement.
+
+    Observational only; no trading decisions depend on these metrics.
+    """
+    rows=live._db(
+        """SELECT raw_probability,calibrated_probability,y_positive,symbol,observed_at,outcome_source
+           FROM fh_v82_swing_judgments
+           WHERE observed_at IS NOT NULL AND outcome_ts>observed_at
+             AND calibration_n >= %s
+             AND raw_probability BETWEEN 0 AND 1
+             AND calibrated_probability BETWEEN 0 AND 1
+             AND y_positive IN (0,1)""",
+        (CALIBRATION_MATURE_N,),"all"
+    )
+    if rows is None:
+        return "UNAVAILABLE (database query failed)"
+    n=len(rows)
+    if n<30:
+        return f"INSUFFICIENT_DATA n={n}/30 (calibration_n>={CALIBRATION_MATURE_N})"
+    by_symbol={}
+    by_source={}
+    unique_days=set()
+    for _raw,_cal,_y,symbol,observed_at,outcome_source in rows:
+        by_symbol[symbol]=by_symbol.get(symbol,0)+1
+        by_source[outcome_source]=by_source.get(outcome_source,0)+1
+        if observed_at is not None:
+            unique_days.add(observed_at.date())
+    top_share=max(by_symbol.values())/n if by_symbol else 0.0
+    raw=_metrics([(_f(r),int(y)) for r,c,y,s,t,src in rows])
+    frozen=_metrics([(_f(c),int(y)) for r,c,y,s,t,src in rows])
+    return (f"n={n} raw/frozen Brier={raw['brier']:.3f}/{frozen['brier']:.3f} "
+            f"logloss={raw['log_loss']:.3f}/{frozen['log_loss']:.3f} "
+            f"ECE={raw['ece']:.3f}/{frozen['ece']:.3f} "
+            f"coverage={len(by_symbol)} symbols/{len(unique_days)} days "
+            f"largest_symbol_share={top_share:.1%} "
+            f"barrier={by_source.get('CLOSED_4H_FIRST_BARRIER',0)} "
+            f"horizon_mark={by_source.get('CLOSED_4H_HORIZON_MARK',0)} "
+            "OBSERVATIONAL; repeated setups and selection bias possible")
+
+
 def _save_calibration():
     pairs=_settled_pairs()
     a,b,n=_platt_fit(pairs)
@@ -1122,6 +1163,8 @@ def _report(slot):
         pieces.append("V8.1 QUALIFIED vs ATOMIC ATTRIBUTION (research only): "+_v81_vs_atomic_diagnostic())
         pieces.append("EXECUTION-STYLE PAPER (new cohort): "+_execution_paper_report())
         pieces.append("EXECUTION PROBABILITY BUCKETS (frozen, net simulation): "+str(_execution_probability_bucket_report()))
+        pieces.append("FROZEN PROBABILITY AUDIT: "+_frozen_probability_audit())
+        pieces.append("SELECTOR COMPARISON: descriptive; selected is a subset of control, not randomized")
         pieces.append("CALIBRATION VALIDATION: fitted metrics IN_SAMPLE; independent prospective validation not yet established")
         pieces.append("EDGE READINESS: "+_edge_readiness_diagnostic())
         pieces.append("CALIBRATED PROBABILITY BUCKETS (research only): "+_probability_bucket_diagnostic())
