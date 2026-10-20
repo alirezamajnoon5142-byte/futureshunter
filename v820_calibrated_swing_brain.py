@@ -988,6 +988,22 @@ def _frozen_probability_audit():
     top_share=max(by_symbol.values())/n if by_symbol else 0.0
     raw=_metrics([(_f(r),int(y)) for r,c,y,s,t,src in rows])
     frozen=_metrics([(_f(c),int(y)) for r,c,y,s,t,src in rows])
+    # Read-only source-stratified calibration; trading decisions are unaffected.
+    per_source=[]
+    for source in sorted(by_source, key=str):
+        group=[row for row in rows if row[5]==source]
+        if len(group)<30:
+            per_source.append(f"{source}:n={len(group)} INSUFFICIENT_DATA")
+            continue
+        m_raw=_metrics([(_f(row[0]),int(row[2])) for row in group])
+        m_frozen=_metrics([(_f(row[1]),int(row[2])) for row in group])
+        positive=sum(int(row[2]) for row in group)/len(group)
+        per_source.append(
+            f"{source}:n={len(group)} positive={positive:.1%} "
+            f"Brier={m_raw['brier']:.3f}/{m_frozen['brier']:.3f} "
+            f"logloss={m_raw['log_loss']:.3f}/{m_frozen['log_loss']:.3f} "
+            f"ECE={m_raw['ece']:.3f}/{m_frozen['ece']:.3f}"
+        )
     return (f"n={n} raw/frozen Brier={raw['brier']:.3f}/{frozen['brier']:.3f} "
             f"logloss={raw['log_loss']:.3f}/{frozen['log_loss']:.3f} "
             f"ECE={raw['ece']:.3f}/{frozen['ece']:.3f} "
@@ -995,7 +1011,7 @@ def _frozen_probability_audit():
             f"largest_symbol_share={top_share:.1%} "
             f"barrier={by_source.get('CLOSED_4H_FIRST_BARRIER',0)} "
             f"horizon_mark={by_source.get('CLOSED_4H_HORIZON_MARK',0)} "
-            "OBSERVATIONAL; repeated setups and selection bias possible")
+            f"source_strata=[{' | '.join(per_source)}] " "POOLED_METRICS_MIX_OUTCOME_LABELS; observational, noncausal")
 
 
 def _save_calibration():
