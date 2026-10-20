@@ -88,7 +88,7 @@ def scan(main):
     d=candles(main)
     if time.time()-_LAST_SCAN_LOG>=21600:
         try:
-            live._diag(f"V8.6 GOLD PAPER candle_health: {'unavailable/short (<215 raw)' if d is None else str(len(d))+' closed H1 bars'}")
+            live._diag(f"V8.6 GOLD PAPER candle_health: {'unavailable/short (<215 raw)' if d is None else str(len(d))+' closed H1 bars; last_closed_time='+str(d.time.iloc[-1])}")
         except Exception:
             pass
         _LAST_SCAN_LOG=time.time()
