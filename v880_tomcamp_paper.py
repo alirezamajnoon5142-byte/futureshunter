@@ -151,7 +151,7 @@ def stats(detail=False):
         lines.append("Paper-only and non-exchange fills. No historical setup backfill; wait for settled samples.")
     else:
         lines.append("Detailed four-target comparison: /tomcamp")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 def patch(main):
     global _PATCHED
     with _LOCK:
