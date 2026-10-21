@@ -1,0 +1,21 @@
+name: V8.8 paper engine smoke tests
+on:
+  push:
+    branches: [research/v880-tomcamp-paper]
+  pull_request:
+    branches: [main]
+jobs:
+  paper-only-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --disable-pip-version-check pandas
+      - name: Syntax validation, isolated from sitecustomize startup
+        run: python -I -m py_compile v880_tomcamp_paper.py FuturesHunter_Render.py sitecustomize.py
+      - name: Paper-only tests
+        run: python -I -m unittest discover -s tests -p test_v880_paper.py -v

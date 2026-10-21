@@ -25,7 +25,8 @@ else:
     import v810_swing4h_live  # noqa: F401
     import v820_calibrated_swing_brain  # noqa: F401
     import v830_selector_challenger  # noqa: F401
-    import v840_ict_dol_shadow  # noqa: F401
+    # V8.4 ICT/DOL retired from bootstrap: historical paper database preserved.
+    # V8.8 4H Tom Camp research is installed by FuturesHunter_Render.py.
     import v850_macro_btc_challenger  # noqa: F401
     import v860_gold_ema_paper  # noqa: F401
     import v870_btc_ema_funding_paper  # noqa: F401

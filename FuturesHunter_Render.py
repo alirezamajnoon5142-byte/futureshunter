@@ -13676,6 +13676,12 @@ except Exception as _cryptonary_command_error:
     print(f"[CRYPTONARY11] final command hook failed: {type(_cryptonary_command_error).__name__}: {_cryptonary_command_error}", flush=True)
 
 
+# V8.8 isolated paper-only research hook; no exchange orders or live-risk changes.
+try:
+    import v880_tomcamp_paper as _v880_tomcamp_paper
+except Exception as _v880_import_error:
+    print(f"[V880] research import failed: {type(_v880_import_error).__name__}: {_v880_import_error}",flush=True)
+
 # ============================================================
 # START
 # ============================================================
