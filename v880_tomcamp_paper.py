@@ -162,6 +162,12 @@ def patch(main):
         def report():return str(old_stats()).rstrip()+"\n\n"+stats(detail=False)
         def command(chat,text):
             cmd=((text or "").strip().split() or [""])[0].lower().split("@")[0]
+            if cmd=="/stats":
+                # Telegram rejects >4096-character messages; keep legacy stats and
+                # the required all-symbol 4H summary as TWO independent messages.
+                main.send_to_chat(chat,str(old_stats()))
+                main.send_to_chat(chat,stats(detail=False))
+                return
             if cmd in ("/tomcamp","/v88"):main.send_to_chat(chat,stats(detail=True));return
             # Retired ICT commands explicitly point to the replacement paper research.
             if cmd in ("/ict","/dol","/v84","/biasbeacon"):
