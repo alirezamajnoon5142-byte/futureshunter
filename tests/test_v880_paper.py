@@ -87,4 +87,50 @@ class V880PaperTests(unittest.TestCase):
         self.assertNotIn("    import v840_ict_dol_shadow  # noqa",text)
         self.assertTrue((ROOT/"v840_ict_dol_shadow.py").exists())
 
+
+    def test_bullish_structure_sweep_engulfing_candidate(self):
+        import math
+        m=self.mod
+        bars=[]
+        for i in range(78):
+            close=100+.15*i+3*math.sin(i*2*math.pi/10)
+            bars.append(dict(time=i*14400.,open=close-.2,high=close+.7,
+                             low=close-.7,close=close))
+        base=pd.DataFrame(bars)
+        pclose=float(base.close.iloc[-1])+1
+        p=dict(time=78*14400.,open=pclose+1,high=pclose+1.6,
+               low=float(base.low.min())-5,close=pclose)
+        c=dict(time=79*14400.,open=pclose-.5,high=p["high"]+1.5,
+               low=pclose-1,close=p["high"]+1)
+        d=pd.concat([base,pd.DataFrame([p,c])],ignore_index=True)
+        result=m.candidate(d)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0],"LONG")
+        self.assertLess(result[2],result[1])
+        self.assertEqual(result[-1],c["time"])
+
+    def test_ambiguous_ohlc_bar_settles_stop_first(self):
+        m=self.mod
+        original=(m.candles,m.db,m.candidate)
+        old_time=(int(time.time())//m.BAR_SECONDS)*m.BAR_SECONDS-20*m.BAR_SECONDS
+        d=pd.DataFrame([dict(time=old_time,open=100.,high=100.5,low=99.5,close=100.),
+                        dict(time=old_time+m.BAR_SECONDS,open=100.,high=103.,low=97.,close=101.)])
+        seen=[]
+        def fake_db(sql,args=(),mode=None):
+            if "SELECT s.key,s.bar_ts" in sql:
+                return [("BTC-test",old_time,"LONG",100.,99.,tp) for tp in m.TARGETS]
+            seen.append((sql,args))
+            return None
+        try:
+            m.candles=lambda main,sym:d if sym=="BTC_USDT" else None
+            m.db=fake_db
+            m.candidate=lambda _:None
+            m.scan(types.SimpleNamespace())
+            settled=[args for sql,args in seen if "UPDATE fh_v880_exits" in sql]
+            self.assertEqual(len(settled),4)
+            self.assertTrue(all(float(x[0])<-1.0 for x in settled))
+            self.assertEqual({float(x[3]) for x in settled},set(m.TARGETS))
+        finally:
+            m.candles,m.db,m.candidate=original
+
 if __name__=="__main__":unittest.main()
